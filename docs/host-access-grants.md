@@ -78,8 +78,11 @@ are not changed; pre-existing unmanaged grants may independently permit sudo.
 Account creation uses the existing SSH host-bundle implementation and locks
 passwords on newly created accounts only.
 
-PAM uses the distribution's `pam_access.so`, prepended as an account check to
-`sshd`/`sudo`. Authentication stacks, passwords and password rotation are not
+PAM uses the distribution's `pam_exec.so` to call the fixed root bootstrap's
+offline `pam-check` account action for `sshd`/`sudo`. Retained signatures,
+revocations and current-time validity are rechecked at each account evaluation.
+Managed sudo rules have five-minute `NOTAFTER` leases clamped to grant expiry.
+Authentication stacks, passwords and password rotation are not
 modified. Original PAM stacks are retained as `.mycelium-pre` files. Sudo
 candidates are validated before installation. Apply failures are reported;
 this is a multi-file reconciliation, not a transaction across Linux account
@@ -90,6 +93,10 @@ stack from its root-owned `.mycelium-pre` backup and use the SSH host-apply
 rollback copy if needed. Do not delete user homes or replace trusted issuers
 as a troubleshooting shortcut. Certificate renewal and grant lifetime are
 separate: renewing a certificate does not extend an expired access grant.
+
+See [signed renewal and worker rollout](ssh-renewal-gossip.md) for automatic
+credential renewal, identity-bound principals and the fixed bootstrap's
+gossip-delivered worker updates.
 
 The legacy SSH-only timer now refuses user-owned executable/home/policy paths.
 Use the host-access timer for a user-run daemon. Existing fleet timers need an
