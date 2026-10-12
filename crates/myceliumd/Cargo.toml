@@ -42,6 +42,7 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 ed25519-dalek.workspace = true
 rand_core.workspace = true
+ssh-key = { version = "=0.7.0-rc.11", features = ["crypto"] }
 
 [dev-dependencies]
 rcgen = "0.13"

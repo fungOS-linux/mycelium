@@ -60,7 +60,7 @@ pub enum Readiness {
 
 /// Narrow lifecycle boundary. Tests and future native adapters use the same
 /// stop/start/verify transaction without changing artifact verification.
-pub(crate) trait Lifecycle {
+pub trait Lifecycle {
     fn preflight(&self, executable: &Path) -> Result<(), Error>;
     fn stop(&self) -> Result<(), Error>;
     fn start(&self) -> Result<(), Error>;

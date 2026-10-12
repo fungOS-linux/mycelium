@@ -10,6 +10,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const MAX_SSH_RENEWAL_DELIVERIES: usize = 32;
+
+/// Stable, presentation-independent SSH principal. Roles alone are not human
+/// identity: two operators must not impersonate each other's Unix accounts.
+pub fn ssh_role_principal(principal: &str, role: &str) -> String {
+    format!("mycelium-principal-{}-{role}",sha256_hex(principal.as_bytes()))
+}
 
 /// The Rust target of the currently running binary. Publication uses this
 /// when the build pipeline does not provide an explicit target.
@@ -155,6 +162,8 @@ pub enum PeerEvent {
     Endpoint(PeerEndpointObservation),
     Egress(EgressObservation),
     Access(AccessRecord),
+    SshCredentialRequest(SshRenewalRequest),
+    SshCredentialResponses(Vec<SshRenewalDelivery>),
     Transport(TransportCredentialBinding),
     WireGuard(WireGuardBinding),
     Hardware(HardwareSnapshot),
@@ -178,6 +187,8 @@ enum KnownPeerEvent {
     Endpoint(PeerEndpointObservation),
     Egress(EgressObservation),
     Access(AccessRecord),
+    SshCredentialRequest(SshRenewalRequest),
+    SshCredentialResponses(Vec<SshRenewalDelivery>),
     Transport(TransportCredentialBinding),
     WireGuard(WireGuardBinding),
     Hardware(HardwareSnapshot),
@@ -204,6 +215,8 @@ impl<'de> Deserialize<'de> for PeerEvent {
                     | "endpoint"
                     | "egress"
                     | "access"
+                    | "ssh_credential_request"
+                    | "ssh_credential_responses"
                     | "transport"
                     | "wire_guard"
                     | "hardware"
@@ -227,6 +240,8 @@ impl<'de> Deserialize<'de> for PeerEvent {
             KnownPeerEvent::Endpoint(value) => Self::Endpoint(value),
             KnownPeerEvent::Egress(value) => Self::Egress(value),
             KnownPeerEvent::Access(value) => Self::Access(value),
+            KnownPeerEvent::SshCredentialRequest(value) => Self::SshCredentialRequest(value),
+            KnownPeerEvent::SshCredentialResponses(value) => Self::SshCredentialResponses(value),
             KnownPeerEvent::Transport(value) => Self::Transport(value),
             KnownPeerEvent::WireGuard(value) => Self::WireGuard(value),
             KnownPeerEvent::Hardware(value) => Self::Hardware(value),
@@ -1059,6 +1074,13 @@ pub struct SshRenewalResponse {
     pub certificate: Option<String>,
     pub expires_at: Option<u64>,
     pub error: Option<String>,
+}
+
+/// Bounded public credential deliveries. Private keys never enter gossip.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshRenewalDelivery {
+    pub node_id: String,
+    pub response: SshRenewalResponse,
 }
 
 fn renewal_signing_bytes(

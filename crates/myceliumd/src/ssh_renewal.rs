@@ -1,23 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use mycelium_peer_protocol::{SshRenewalRequest, SshRenewalResponse};
+use mycelium_peer_protocol::{AccessStatement, SshRenewalRequest, SshRenewalResponse};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RenewalBinding {
-    pub node_id: String,
-    pub unix_users: Vec<String>,
-    pub roles: Vec<String>,
-    pub credential_ttl: u64,
-    #[serde(default)]
-    pub revoked: bool,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct RenewalBindings {
-    bindings: Vec<RenewalBinding>,
+#[derive(Clone, Debug)]
+struct RenewalBinding {
+    principal: String,
+    roles: Vec<String>,
+    credential_ttl: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -26,51 +17,17 @@ struct RenewalState {
     renew_after: u64,
 }
 
-pub fn bindings_path() -> PathBuf {
-    crate::home_dir().join("ssh/renewal-bindings.json")
-}
-
-pub fn authorize(binding: RenewalBinding) -> Result<(), String> {
-    if binding.node_id.len() != 64 || !binding.node_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err("renewal node ID must be a 32-byte hexadecimal peer identity".into());
-    }
-    if binding.unix_users.is_empty() || binding.roles.is_empty() {
-        return Err("renewal authorization needs at least one Unix user and role".into());
-    }
-    if binding
-        .unix_users
-        .iter()
-        .chain(&binding.roles)
-        .any(|value| !safe_atom(value))
-    {
-        return Err("renewal Unix users and roles must be safe account-name atoms".into());
-    }
-    if binding.credential_ttl == 0 || binding.credential_ttl > 30 * 24 * 60 * 60 {
-        return Err("renewal credential TTL must be between 1 second and 30 days".into());
-    }
-    let path = bindings_path();
-    let mut store = load_bindings(&path)?;
-    store
-        .bindings
-        .retain(|entry| entry.node_id != binding.node_id);
-    store.bindings.push(binding);
-    store
-        .bindings
-        .sort_by(|left, right| left.node_id.cmp(&right.node_id));
-    atomic_write(
-        &path,
-        &serde_json::to_vec_pretty(&store).map_err(|e| e.to_string())?,
-    )
-}
-
-pub fn issue(request: &SshRenewalRequest, now: u64) -> Option<SshRenewalResponse> {
+pub fn issue(
+    request: &SshRenewalRequest,
+    now: u64,
+    access: &crate::peer::AccessStateView,
+) -> Option<SshRenewalResponse> {
     let ca = crate::home_dir().join("ssh/user_ca");
     if !ca.is_file() {
         return None;
     }
     Some(
-        issue_inner(request, now, &ca).unwrap_or_else(|error| SshRenewalResponse {
+        issue_inner(request, now, &ca, access).unwrap_or_else(|error| SshRenewalResponse {
             request_id: request.request_id.clone(),
             certificate: None,
             expires_at: None,
@@ -83,6 +40,7 @@ fn issue_inner(
     request: &SshRenewalRequest,
     now: u64,
     ca: &Path,
+    access: &crate::peer::AccessStateView,
 ) -> Result<SshRenewalResponse, String> {
     request
         .verify()
@@ -90,72 +48,176 @@ fn issue_inner(
     if request.requested_at.abs_diff(now) > 300 {
         return Err("renewal request clock is outside the five-minute acceptance window".into());
     }
-    if request.public_key.len() > 16 * 1024 || !request.public_key.starts_with("ssh-") {
+    if !safe_atom(&request.request_id) {
+        return Err("invalid renewal request ID".into());
+    }
+    if request.public_key.len() > 16 * 1024 || request.public_key.trim().contains(['\n', '\r']) {
         return Err("renewal request contains an invalid SSH public key".into());
     }
-    let store = load_bindings(&bindings_path())?;
-    let binding = store
-        .bindings
-        .iter()
-        .find(|entry| entry.node_id == request.node_id && !entry.revoked)
-        .ok_or("peer has no active SSH renewal authorization")?;
-    let certificate = sign_certificate(request, binding, ca)?;
+    let (binding, serial) = grant_authorization(request, access, now)?;
+    let certificate = sign_certificate(request, &binding, serial, now, ca)?;
+    let expires_at = ssh_key::Certificate::from_openssh(&certificate)
+        .map_err(|e| e.to_string())?
+        .valid_before();
     Ok(SshRenewalResponse {
         request_id: request.request_id.clone(),
         certificate: Some(certificate),
-        expires_at: Some(now.saturating_add(binding.credential_ttl)),
+        // Use the actual certificate validity, not the time before ssh-keygen
+        // started. These clocks can differ on a busy authority.
+        expires_at: Some(expires_at),
         error: None,
     })
+}
+
+/// Existing signed access scopes carry the renewal lease; roles, users and
+/// keys remain single-source grant fields rather than a second ACL database.
+pub fn scope(node_id: &str, ttl: u64) -> Result<String, String> {
+    if node_id.len() != 64
+        || !node_id.bytes().all(|b| b.is_ascii_hexdigit())
+        || !(1..=30 * 86400).contains(&ttl)
+    {
+        return Err(
+            "renewal scope requires a peer ID and a 1-second..30-day credential TTL".into(),
+        );
+    }
+    Ok(format!(
+        "ssh-renewal:{}:{ttl}",
+        node_id.to_ascii_lowercase()
+    ))
+}
+
+fn key_material(public: &str) -> Result<ssh_key::public::KeyData, String> {
+    ssh_key::PublicKey::from_openssh(public.trim())
+        .map(|key| key.key_data().clone())
+        .map_err(|e| format!("invalid SSH key: {e}"))
+}
+
+fn grant_authorization(
+    request: &SshRenewalRequest,
+    access: &crate::peer::AccessStateView,
+    now: u64,
+) -> Result<(RenewalBinding, u64), String> {
+    let material = key_material(&request.public_key)?;
+    let prefix = format!("ssh-renewal:{}:", request.node_id);
+    let mut eligible = Vec::new();
+    let mut identities = std::collections::BTreeSet::new();
+    for entry in &access.grants {
+        entry
+            .record
+            .verify()
+            .map_err(|e| format!("invalid access signature: {e}"))?;
+        let AccessStatement::Grant {
+            principal,
+            roles,
+            unix_users,
+            ssh_public_keys,
+            scopes,
+            serial,
+            not_before,
+            not_after,
+            ..
+        } = &entry.record.statement
+        else {
+            continue;
+        };
+        if now < *not_before || now >= *not_after || roles.is_empty() || unix_users.is_empty() {
+            continue;
+        }
+        if access.revocations.iter().any(|r| r.verify().is_ok() && matches!(&r.statement,AccessStatement::Revoke{revoked_at,..} if *revoked_at <= now) && r.statement.revokes(&entry.record.statement)) {continue;}
+        if !ssh_public_keys
+            .iter()
+            .any(|key| key_material(key).is_ok_and(|key| key == material))
+        {
+            continue;
+        }
+        let ttl = scopes
+            .iter()
+            .filter_map(|scope| scope.strip_prefix(&prefix)?.parse::<u64>().ok())
+            .filter(|ttl| (1..=30 * 86400).contains(ttl))
+            .max();
+        let Some(ttl) = ttl else {
+            continue;
+        };
+        if roles
+            .iter()
+            .chain(unix_users)
+            .any(|v| !safe_atom(v) || v == "root")
+        {
+            return Err("renewal grant contains an unsafe account or role".into());
+        }
+        identities.insert(principal);
+        eligible.push((
+            *not_before,
+            *not_after,
+            *serial,
+            RenewalBinding {
+                principal: principal.clone(),
+                roles: roles.clone(),
+                credential_ttl: ttl.min(not_after.saturating_sub(now)),
+            },
+        ));
+    }
+    if identities.len() > 1 {
+        return Err("SSH key has ambiguous renewal principals; revoke conflicting grants".into());
+    }
+    eligible.sort_by_key(|(before, after, serial, _)| (*before, *after, *serial));
+    eligible
+        .pop()
+        .map(|(_, _, serial, binding)| (binding, serial))
+        .ok_or_else(|| "no active signed grant authorizes this peer and SSH key to renew".into())
 }
 
 fn sign_certificate(
     request: &SshRenewalRequest,
     binding: &RenewalBinding,
+    serial: u64,
+    now: u64,
     ca: &Path,
 ) -> Result<String, String> {
-    let root = crate::home_dir().join("ssh/renewal-staging");
-    fs::create_dir_all(&root).map_err(|error| format!("create renewal staging: {error}"))?;
-    let stem = root.join(&request.request_id);
-    let public = stem.with_extension("pub");
-    fs::write(&public, &request.public_key).map_err(|error| format!("stage SSH key: {error}"))?;
-    let principals = binding
-        .roles
-        .iter()
-        .map(|role| format!("mycelium-role-{role}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let validity = format!("+0s:+{}s", binding.credential_ttl);
-    let identity = format!("mycelium:renew:{}", request.node_id);
-    let serial = crate::peer::now().wrapping_mul(1_000_003);
-    let output = Command::new("ssh-keygen")
-        .args(["-q", "-s"])
-        .arg(ca)
-        .args([
-            "-I",
-            &identity,
-            "-n",
-            &principals,
-            "-V",
-            &validity,
-            "-z",
-            &serial.to_string(),
-        ])
-        .arg(&public)
-        .output()
-        .map_err(|error| format!("run ssh-keygen: {error}"))?;
-    let certificate = PathBuf::from(format!("{}-cert.pub", stem.display()));
-    let result = if output.status.success() {
-        fs::read_to_string(&certificate)
-            .map_err(|error| format!("read renewed certificate: {error}"))
-    } else {
-        Err(format!(
-            "ssh-keygen failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    };
-    let _ = fs::remove_file(public);
-    let _ = fs::remove_file(certificate);
-    result
+    let ca = ssh_key::PrivateKey::from_openssh(fs::read(ca).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let nonce = mycelium_peer_protocol::decode_hex(&request.signature)?;
+    let mut builder = ssh_key::certificate::Builder::new(
+        nonce,
+        key_material(&request.public_key)?,
+        now.saturating_sub(30),
+        now.saturating_add(binding.credential_ttl),
+    )
+    .map_err(|e| e.to_string())?;
+    builder.serial(serial).map_err(|e| e.to_string())?;
+    builder
+        .cert_type(ssh_key::certificate::CertType::User)
+        .map_err(|e| e.to_string())?;
+    builder
+        .key_id(format!("mycelium:renew:{}", request.node_id))
+        .map_err(|e| e.to_string())?;
+    for role in &binding.roles {
+        builder
+            .valid_principal(format!("mycelium-role-{role}"))
+            .map_err(|e| e.to_string())?;
+        builder
+            .valid_principal(mycelium_peer_protocol::ssh_role_principal(
+                &binding.principal,
+                role,
+            ))
+            .map_err(|e| e.to_string())?;
+    }
+    for extension in [
+        "permit-X11-forwarding",
+        "permit-agent-forwarding",
+        "permit-port-forwarding",
+        "permit-pty",
+        "permit-user-rc",
+    ] {
+        builder
+            .extension(extension, "")
+            .map_err(|e| e.to_string())?;
+    }
+    builder
+        .sign(&ca)
+        .map_err(|e| e.to_string())?
+        .to_openssh()
+        .map_err(|e| e.to_string())
 }
 
 pub fn renewal_request(
@@ -180,7 +242,25 @@ pub fn renewal_request(
         "{}-{now}",
         &mycelium_peer_protocol::encode_hex(key.verifying_key().as_bytes())[..16]
     );
-    SshRenewalRequest::sign(request_id, now, material, key).map(Some)
+    let pending = home.join("ssh/renewal-pending.json");
+    if let Ok(bytes) = fs::read(&pending) {
+        let request: SshRenewalRequest =
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid pending renewal: {e}"))?;
+        if now >= request.requested_at
+            && now - request.requested_at < 240
+            && request.node_id == mycelium_peer_protocol::encode_hex(key.verifying_key().as_bytes())
+            && request.public_key == material
+        {
+            request.verify()?;
+            return Ok(Some(request));
+        }
+    }
+    let request = SshRenewalRequest::sign(request_id, now, material, key)?;
+    atomic_write(
+        &pending,
+        &serde_json::to_vec(&request).map_err(|e| e.to_string())?,
+    )?;
+    Ok(Some(request))
 }
 
 pub fn install(response: &SshRenewalResponse, now: u64) -> Result<(), String> {
@@ -206,7 +286,7 @@ pub fn install(response: &SshRenewalResponse, now: u64) -> Result<(), String> {
     let staged = directory.join("user-cert.renewal-staging.pub");
     fs::write(&staged, certificate)
         .map_err(|error| format!("stage renewed certificate: {error}"))?;
-    let validation = validate_replacement(&installed, &staged);
+    let validation = validate_replacement(&installed, &staged, now, expires_at);
     if let Err(error) = validation {
         let _ = fs::remove_file(&staged);
         return Err(error);
@@ -224,34 +304,33 @@ pub fn install(response: &SshRenewalResponse, now: u64) -> Result<(), String> {
     )
 }
 
-fn validate_replacement(installed: &Path, staged: &Path) -> Result<(), String> {
-    let inspect = |path: &Path| -> Result<String, String> {
-        let output = Command::new("ssh-keygen")
-            .args(["-L", "-f"])
-            .arg(path)
-            .output()
-            .map_err(|error| format!("inspect SSH certificate: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "invalid renewed SSH certificate: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    };
-    let old = inspect(installed)?;
-    let new = inspect(staged)?;
-    for label in ["Signing CA:", "Public key:"] {
-        let field = |text: &str| {
-            text.lines()
-                .find(|line| line.trim_start().starts_with(label))
-                .map(|line| line.trim().to_owned())
-        };
-        if field(&old).is_none() || field(&old) != field(&new) {
-            return Err(format!(
-                "renewed SSH certificate changed its {label} binding"
-            ));
-        }
+fn validate_replacement(
+    installed: &Path,
+    staged: &Path,
+    now: u64,
+    expires_at: u64,
+) -> Result<(), String> {
+    let old = ssh_key::Certificate::from_openssh(
+        &fs::read_to_string(installed).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    old.verify_signature()
+        .map_err(|e| format!("invalid existing CA pin: {e}"))?;
+    let new =
+        ssh_key::Certificate::from_openssh(&fs::read_to_string(staged).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    new.validate_at(
+        now,
+        [&old.signature_key().fingerprint(ssh_key::HashAlg::Sha256)],
+    )
+    .map_err(|e| format!("invalid renewed certificate signature/validity: {e}"))?;
+    if new.public_key() != old.public_key()
+        || new.cert_type() != ssh_key::certificate::CertType::User
+        || new.valid_before() != expires_at
+        || !new.critical_options().is_empty()
+        || new.valid_principals().is_empty()
+    {
+        return Err("renewed certificate changed key/type, has unsupported options, empty principals or inconsistent expiry".into());
     }
     Ok(())
 }
@@ -274,17 +353,6 @@ fn dirs_public_key() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".ssh/id_ed25519.pub")
-}
-
-fn load_bindings(path: &Path) -> Result<RenewalBindings, String> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| format!("read {}: {error}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(RenewalBindings::default())
-        }
-        Err(error) => Err(format!("read {}: {error}", path.display())),
-    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -319,5 +387,180 @@ mod tests {
         assert!(request.verify().is_ok());
         request.requested_at += 1;
         assert!(request.verify().is_err());
+    }
+    fn fixture() -> (SshRenewalRequest, crate::peer::AccessStateView) {
+        let peer = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let subject = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[11; 32]).into(),
+            "test",
+        )
+        .unwrap();
+        let request = SshRenewalRequest::sign(
+            "request-1".into(),
+            100,
+            subject.public_key().to_openssh().unwrap(),
+            &peer,
+        )
+        .unwrap();
+        let grant = mycelium_peer_protocol::AccessRecord::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            AccessStatement::Grant {
+                grant_id: "test".into(),
+                principal: "james".into(),
+                serial: 42,
+                roles: vec!["home-operator".into()],
+                scopes: vec![scope(&request.node_id, 3600).unwrap()],
+                unix_users: vec!["mames".into()],
+                ssh_public_keys: vec![request.public_key.clone()],
+                oidc_audiences: vec![],
+                oidc_ssh_key_exchange: false,
+                not_before: 50,
+                not_after: 200,
+            },
+        )
+        .unwrap();
+        (
+            request,
+            crate::peer::AccessStateView {
+                grants: vec![crate::peer::AccessGrantView {
+                    record: grant,
+                    active: false,
+                    revoked_by: vec![],
+                }],
+                revocations: vec![],
+            },
+        )
+    }
+    #[test]
+    fn signed_grant_binds_peer_key_roles_and_expiry() {
+        let (request, state) = fixture();
+        let (binding, serial) = grant_authorization(&request, &state, 100).unwrap();
+        assert_eq!(binding.roles, vec!["home-operator"]);
+        assert_eq!(binding.credential_ttl, 100);
+        assert_eq!(serial, 42);
+        assert!(grant_authorization(&request, &state, 200).is_err());
+        let mut wrong = request.clone();
+        wrong.node_id = "a".repeat(64);
+        assert!(grant_authorization(&wrong, &state, 100).is_err());
+        let mut wrong = request;
+        wrong.public_key = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[12; 32]).into(),
+            "test",
+        )
+        .unwrap()
+        .public_key()
+        .to_openssh()
+        .unwrap();
+        assert!(grant_authorization(&wrong, &state, 100).is_err());
+    }
+    #[test]
+    fn revoked_grant_cannot_renew_even_if_flag_is_active() {
+        let (request, mut state) = fixture();
+        state.grants[0].active = true;
+        state.revocations.push(
+            mycelium_peer_protocol::AccessRecord::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                AccessStatement::Revoke {
+                    revocation_id: "rev".into(),
+                    grant_id: Some("test".into()),
+                    principal: None,
+                    serial: None,
+                    revoked_at: 105,
+                    reason: "test".into(),
+                },
+            )
+            .unwrap(),
+        );
+        assert!(grant_authorization(&request, &state, 100).is_ok());
+        assert!(grant_authorization(&request, &state, 105).is_err());
+    }
+    #[test]
+    fn missing_scope_or_tampering_denies_renewal() {
+        let (request, mut state) = fixture();
+        if let AccessStatement::Grant { scopes, .. } = &mut state.grants[0].record.statement {
+            scopes.clear();
+        }
+        assert!(grant_authorization(&request, &state, 100).is_err());
+        state.grants[0].record = mycelium_peer_protocol::AccessRecord::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            state.grants[0].record.statement.clone(),
+        )
+        .unwrap();
+        assert!(grant_authorization(&request, &state, 100).is_err());
+    }
+    #[test]
+    fn native_certificate_is_ca_verified_serial_bound_and_grant_clamped() {
+        let (request, state) = fixture();
+        let directory = std::env::temp_dir().join(format!(
+            "mycelium-renewal-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let ca = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[17; 32]).into(),
+            "test CA",
+        )
+        .unwrap();
+        let ca_path = directory.join("ca");
+        fs::write(
+            &ca_path,
+            ca.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let response = issue_inner(&request, 100, &ca_path, &state).unwrap();
+        let certificate =
+            ssh_key::Certificate::from_openssh(response.certificate.as_ref().unwrap()).unwrap();
+        certificate
+            .validate_at(
+                100,
+                [&ca.public_key().fingerprint(ssh_key::HashAlg::Sha256)],
+            )
+            .unwrap();
+        assert_eq!(certificate.serial(), 42);
+        assert_eq!(certificate.valid_before(), 200);
+        assert_eq!(response.expires_at, Some(200));
+        let old_path = directory.join("expired-cert");
+        let new_path = directory.join("new-cert");
+        let (binding, serial) = grant_authorization(&request, &state, 50).unwrap();
+        let short = RenewalBinding {
+            principal: binding.principal,
+            roles: binding.roles,
+            credential_ttl: 1,
+        };
+        fs::write(
+            &old_path,
+            sign_certificate(&request, &short, serial, 50, &ca_path).unwrap(),
+        )
+        .unwrap();
+        fs::write(&new_path, response.certificate.unwrap()).unwrap();
+        validate_replacement(&old_path, &new_path, 100, 200).unwrap(); // An expired login certificate may renew.
+        assert!(validate_replacement(&old_path, &new_path, 100, 201).is_err());
+        let wrong_ca = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[18; 32]).into(),
+            "wrong CA",
+        )
+        .unwrap();
+        fs::write(
+            &ca_path,
+            wrong_ca
+                .to_openssh(ssh_key::LineEnding::LF)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            &new_path,
+            issue_inner(&request, 100, &ca_path, &state)
+                .unwrap()
+                .certificate
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(validate_replacement(&old_path, &new_path, 100, 200).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

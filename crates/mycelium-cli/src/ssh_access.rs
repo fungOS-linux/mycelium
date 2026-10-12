@@ -50,7 +50,7 @@ pub fn run(args: &[String], state: &Value) -> Result<Vec<String>, String> {
         Some("host-bundle") => host_bundle(args, state),
         Some("host-apply") => host_apply(args),
         Some("host-rollout") => host_rollout(args),
-        Some("renewal-authorize") => renewal_authorize(args),
+        Some("renewal-authorize") => Err("renewal-authorize must publish a signed access grant through the CLI dispatcher".into()),
         Some("client-config") => client_config(args),
         Some("profile") => profile(args),
         Some("host-policy") => host_policy(args, state),
@@ -494,28 +494,32 @@ fn validate_profile(profile: &SshClientProfile) -> Result<(), String> {
     Ok(())
 }
 
-fn renewal_authorize(args: &[String]) -> Result<Vec<String>, String> {
+pub(crate) fn renewal_statement(args: &[String], state: &Value) -> Result<(AccessStatement, PathBuf), String> {
     require_write(args)?;
-    let node_id = required(args, "--node")?.to_owned();
-    let unix_users = repeated(args, "--unix-user")
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    let roles = repeated(args, "--role")
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    let credential_ttl = parse_duration(value(args, "--credential-ttl").unwrap_or("7d"))?;
-    myceliumd::ssh_renewal::authorize(myceliumd::ssh_renewal::RenewalBinding {
-        node_id: node_id.clone(),
-        unix_users,
-        roles,
-        credential_ttl,
-        revoked: false,
-    })?;
-    Ok(vec![format!(
-        "authorized SSH certificate renewal for peer {node_id}"
-    )])
+    let grant_id = required(args,"--grant")?;
+    let node_id = required(args,"--node")?;
+    let ttl = parse_duration(value(args,"--credential-ttl").unwrap_or("8h"))?;
+    let scope = myceliumd::ssh_renewal::scope(node_id,ttl)?;
+    let entry = state["grants"].as_array().into_iter().flatten().find(|g| g["active"] == true && g["record"]["statement"]["grant_id"] == grant_id).ok_or("renewal needs an active signed --grant; it cannot revive expired access")?;
+    let record: mycelium_peer_protocol::AccessRecord = serde_json::from_value(entry["record"].clone()).map_err(|e| e.to_string())?;
+    record.verify()?;
+    let mut statement = record.statement;
+    let at = now()?;
+    let AccessStatement::Grant {grant_id: id, serial, scopes, roles, unix_users, ssh_public_keys, not_before, not_after, ..} = &mut statement else {return Err("not an access grant".into());};
+    if roles.is_empty() || unix_users.is_empty() || ssh_public_keys.is_empty() || at < *not_before || at >= *not_after {return Err("renewal grant needs current roles, Unix users and enrolled SSH keys".into());}
+    for role in repeated(args,"--role") {if !roles.iter().any(|r| r == role) {return Err("renewal cannot add a role missing from the selected grant".into());}}
+    for user in repeated(args,"--unix-user") {if !unix_users.iter().any(|u| u == user) {return Err("renewal cannot add a Unix user missing from the selected grant".into());}}
+    if let Some(duration) = value(args,"--authorization-ttl") {
+        let duration = parse_duration(duration)?;
+        if duration == 0 || duration > 365*86400 {return Err("authorization TTL must be between 1 second and 365 days".into());}
+        *not_after = at.saturating_add(duration);
+    }
+    *id = format!("ssh-renewal-{}-{at}-{}", &node_id[..8], &mycelium_peer_protocol::sha256_hex(grant_id.as_bytes())[..8]);
+    *serial = at;
+    *not_before = at.saturating_sub(30);
+    scopes.retain(|s| !s.starts_with("ssh-renewal:")); scopes.push(scope);
+    let key = value(args,"--signing-key").map(PathBuf::from).unwrap_or_else(|| myceliumd::home_dir().join("access.key"));
+    Ok((statement,key))
 }
 
 fn host_rollout(args: &[String]) -> Result<Vec<String>, String> {
@@ -1115,7 +1119,7 @@ pub(crate) fn issue_for_invite(
     } else {
         roles
             .iter()
-            .map(|role| format!("mycelium-role-{role}"))
+            .flat_map(|role| [format!("mycelium-role-{role}"),mycelium_peer_protocol::ssh_role_principal(name,role)])
             .collect()
     };
     let principals = principals.join(",");
@@ -1295,11 +1299,7 @@ fn issue_bound(
     let principals = if roles.is_empty() {
         unix_users.join(",")
     } else {
-        roles
-            .iter()
-            .map(|role| format!("mycelium-role-{role}"))
-            .collect::<Vec<_>>()
-            .join(",")
+        roles.iter().flat_map(|role| [format!("mycelium-role-{role}"),mycelium_peer_protocol::ssh_role_principal(&principal,role)]).collect::<Vec<_>>().join(",")
     };
     let validity = format!("+0s:+{ttl}s");
     let serial = serial.to_string();

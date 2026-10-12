@@ -32,7 +32,9 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 const SECURITY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const HARDWARE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DIGEST_INTERVAL: Duration = Duration::from_secs(15);
-const SSH_RENEWAL_INTERVAL: Duration = Duration::from_secs(15 * 60);
+// Requests have a five-minute acceptance window. A fifteen-minute worker
+// interval can miss every request forever when peers' phases are offset.
+const SSH_RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_ARTIFACT_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -297,6 +299,16 @@ impl Mesh {
     pub async fn start(self: &Arc<Self>) -> Result<(), AnyError> {
         self.publish(PeerEvent::Hello(self.hello.clone())).await?;
         self.refresh_local_hello().await?;
+        let renewal_mesh = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(renewal_mesh.key.to_bytes()[0] as u64 % 30)).await;
+            loop {
+                if let Err(error) = renewal_mesh.renew_ssh_credentials().await {
+                    eprintln!("myceliumd: gossiped SSH renewal: {error}");
+                }
+                tokio::time::sleep(SSH_RENEWAL_INTERVAL).await;
+            }
+        });
         let collector = self.clone();
         tokio::spawn(async move {
             loop {
@@ -419,6 +431,7 @@ impl Mesh {
                 PeerEvent::Endpoint(endpoint) => endpoints.push(endpoint.clone()),
                 PeerEvent::Egress(_) => {}
                 PeerEvent::Access(_) => {}
+                PeerEvent::SshCredentialRequest(_) | PeerEvent::SshCredentialResponses(_) => {}
                 PeerEvent::Transport(binding) => view.transports.push(binding.clone()),
                 PeerEvent::WireGuard(binding) => view.transports.push(binding.credential.clone()),
                 PeerEvent::Hardware(snapshot) => view.hardware = Some(snapshot.clone()),
@@ -634,6 +647,58 @@ impl Mesh {
         .await
     }
 
+    /// A single worker owns renewal state. Requests are one retained slot per
+    /// peer; responses are one bounded batch per issuer, independent of the
+    /// current direct/relay transport and connection count.
+    pub async fn renew_ssh_credentials(&self) -> Result<(), AnyError> {
+        let at = now();
+        let key = self.key.clone();
+        let pending = tokio::task::spawn_blocking(move || crate::ssh_renewal::renewal_request(&key,at)).await??;
+        if let Some(request) = &pending {
+            let already_published = self.observations.lock().await.values().any(|e| matches!(&e.event,PeerEvent::SshCredentialRequest(old) if e.origin == self.hello.node_id && old == request));
+            if !already_published {self.publish(PeerEvent::SshCredentialRequest(request.clone())).await?;}
+        }
+        let snapshot: Vec<_> = self.observations.lock().await.values()
+            .filter(|e| matches!(e.event,PeerEvent::SshCredentialRequest(_) | PeerEvent::SshCredentialResponses(_)))
+            .cloned().collect();
+        if let Some(request) = &pending {
+            for envelope in &snapshot {
+                let PeerEvent::SshCredentialResponses(deliveries) = &envelope.event else {continue;};
+                for delivery in deliveries.iter().filter(|d| d.node_id == self.hello.node_id && d.response.request_id == request.request_id && d.response.certificate.is_some()) {
+                    let response = delivery.response.clone();
+                    match tokio::task::spawn_blocking(move || crate::ssh_renewal::install(&response,at)).await? {
+                        Ok(()) => {eprintln!("myceliumd: installed CA-verified renewed SSH certificate from {}",envelope.origin); break;}
+                        Err(error) => eprintln!("myceliumd: reject gossiped SSH credential: {error}"),
+                    }
+                }
+            }
+        }
+        if !crate::home_dir().join("ssh/user_ca").is_file() {return Ok(());}
+        let mut requests: Vec<_> = snapshot.iter().filter_map(|e| match &e.event {
+            PeerEvent::SshCredentialRequest(r) if r.requested_at.abs_diff(at) <= 300 => Some(r.clone()),_=>None
+        }).collect();
+        requests.sort_by_key(|r| (r.requested_at,r.node_id.clone()));
+        let old = snapshot.iter().find_map(|e| match &e.event {
+            PeerEvent::SshCredentialResponses(d) if e.origin == self.hello.node_id => Some(d.clone()),_=>None
+        }).unwrap_or_default();
+        let mut deliveries = Vec::new();
+        let access = self.access_view(at).await;
+        for request in requests.into_iter().take(mycelium_peer_protocol::MAX_SSH_RENEWAL_DELIVERIES) {
+            if let Some(existing) = old.iter().find(|d| d.node_id == request.node_id && d.response.request_id == request.request_id && d.response.certificate.is_some() && d.response.expires_at.is_some_and(|expiry| expiry > at)) {
+                deliveries.push(existing.clone()); continue;
+            }
+            let state = access.clone();
+            let node_id = request.node_id.clone();
+            if let Some(response) = tokio::task::spawn_blocking(move || crate::ssh_renewal::issue(&request,at,&state)).await? {
+                deliveries.push(mycelium_peer_protocol::SshRenewalDelivery {node_id,response});
+            }
+        }
+        deliveries.sort_by(|a,b| a.node_id.cmp(&b.node_id));
+        let mut sorted_old = old; sorted_old.sort_by(|a,b| a.node_id.cmp(&b.node_id));
+        if deliveries != sorted_old {self.publish(PeerEvent::SshCredentialResponses(deliveries)).await?;}
+        Ok(())
+    }
+
     pub async fn access_records(&self) -> Vec<AccessRecord> {
         self.observations
             .lock()
@@ -673,6 +738,7 @@ impl Mesh {
                 let revoked_by = revocations
                     .iter()
                     .filter(|revocation| revocation.statement.revokes(&record.statement))
+                    .filter(|revocation| matches!(&revocation.statement, AccessStatement::Revoke {revoked_at,..} if *revoked_at <= at))
                     .filter_map(|revocation| match &revocation.statement {
                         AccessStatement::Revoke { revocation_id, .. } => {
                             Some(revocation_id.clone())
@@ -1185,13 +1251,6 @@ impl Mesh {
             .unwrap_or(DEFAULT_ARTIFACT_REQUEST_INTERVAL);
         let mut artifact_interval = tokio::time::interval(artifact_request_interval);
         artifact_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let renewal_jitter = self.key.to_bytes()[0] as u64 % 60;
-        let mut renewal_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(renewal_jitter),
-            SSH_RENEWAL_INTERVAL,
-        );
-        renewal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut pending_renewal = None::<String>;
         let mut remote_identity = None::<String>;
         let mut binding_required = self.require_transport_binding || iroh_endpoint.is_some();
         let mut transport_authenticated = false;
@@ -1308,22 +1367,13 @@ impl Mesh {
                             if binding_required && !transport_authenticated {
                                 continue;
                             }
-                            if let Some(response) = crate::ssh_renewal::issue(&request, now()) {
+                            if let Some(response) = crate::ssh_renewal::issue(&request, now(), &self.access_view(now()).await) {
                                 send(&mut writer, &PeerMessage::SshRenewalResponse(response)).await?;
                             }
                         }
-                        PeerMessage::SshRenewalResponse(response) => {
-                            if binding_required && !transport_authenticated {
-                                continue;
-                            }
-                            if pending_renewal.as_deref() == Some(response.request_id.as_str()) {
-                                match crate::ssh_renewal::install(&response, now()) {
-                                    Ok(()) => {}
-                                    Err(error) => eprintln!("myceliumd: SSH certificate renewal: {error}"),
-                                }
-                                pending_renewal = None;
-                            }
-                        }
+                        // New clients use retained gossip deliveries; keep the
+                        // direct response variant decodable for older peers.
+                        PeerMessage::SshRenewalResponse(_) => {}
                         PeerMessage::Hello(hello) => {
                             if remote_identity.as_ref().is_some_and(|identity| identity != &hello.node_id) {
                                 return Err("peer identity changed within authenticated stream".into());
@@ -1356,18 +1406,6 @@ impl Mesh {
                     if !binding_required || transport_authenticated {
                         if let Some(request) = self.next_artifact_request().await? {
                             send(&mut writer, &request).await?;
-                        }
-                    }
-                }
-                _ = renewal_interval.tick() => {
-                    if (!binding_required || transport_authenticated) && pending_renewal.is_none() {
-                        match crate::ssh_renewal::renewal_request(&self.key, now()) {
-                            Ok(Some(request)) => {
-                                pending_renewal = Some(request.request_id.clone());
-                                send(&mut writer, &PeerMessage::SshRenewalRequest(request)).await?;
-                            }
-                            Ok(None) => {}
-                            Err(error) => eprintln!("myceliumd: prepare SSH certificate renewal: {error}"),
                         }
                     }
                 }
@@ -1731,6 +1769,16 @@ fn event_is_authorized(
         PeerEvent::Access(record) => {
             record.verify().is_ok() && resolver.access(&record.signer).authorized
         }
+        PeerEvent::SshCredentialRequest(request) => request.node_id == envelope.origin
+            && request.request_id.len() <= 64 && request.public_key.len() <= 16384
+            && request.requested_at.abs_diff(envelope.emitted_at) <= 300
+            && request.verify().is_ok(),
+        PeerEvent::SshCredentialResponses(deliveries) => deliveries.len() <= mycelium_peer_protocol::MAX_SSH_RENEWAL_DELIVERIES && deliveries.iter().all(|d| {
+            d.node_id.len() == 64 && d.node_id.bytes().all(|b| b.is_ascii_hexdigit())
+                && d.response.request_id.len() <= 64
+                && d.response.certificate.as_ref().is_none_or(|c| c.len() <= 16384)
+                && d.response.error.as_ref().is_none_or(|e| e.len() <= 512)
+        }),
         PeerEvent::Transport(binding) => binding.validate_for(&envelope.origin).is_ok(),
         PeerEvent::WireGuard(binding) => binding.validate_for(&envelope.origin).is_ok(),
         PeerEvent::Hardware(snapshot) => snapshot.validate_for(&envelope.origin).is_ok(),
@@ -1779,6 +1827,8 @@ fn event_key(envelope: &SignedEnvelope) -> String {
                 format!("access:{}:revoke:{revocation_id}", record.signer)
             }
         },
+        PeerEvent::SshCredentialRequest(_) => format!("{}:ssh-credential-request",envelope.origin),
+        PeerEvent::SshCredentialResponses(_) => format!("{}:ssh-credential-responses",envelope.origin),
         PeerEvent::Transport(binding) => {
             format!("{}:transport:{:?}", envelope.origin, binding.kind)
         }
@@ -1794,6 +1844,8 @@ fn event_origin_matches(envelope: &SignedEnvelope) -> bool {
     match &envelope.event {
         PeerEvent::SyncHints(hints) => hints.node_id == envelope.origin,
         PeerEvent::Hello(hello) => hello.node_id == envelope.origin,
+        PeerEvent::SshCredentialRequest(request) => request.node_id == envelope.origin,
+        PeerEvent::SshCredentialResponses(_) => true,
         PeerEvent::Health(_)
         | PeerEvent::Topology(_)
         | PeerEvent::Release(_)
@@ -2535,6 +2587,24 @@ fn parse_darwin_swap(text: &str) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_gossip_is_origin_bound_and_slot_bounded() {
+        let key = SigningKey::from_bytes(&[9;32]);
+        let request = mycelium_peer_protocol::SshRenewalRequest::sign("request-1".into(),100,"ssh-ed25519 AAAA".into(),&key).unwrap();
+        let first = SignedEnvelope::sign(&key,1,100,PeerEvent::SshCredentialRequest(request.clone())).unwrap();
+        let second = SignedEnvelope::sign(&key,2,101,PeerEvent::SshCredentialRequest(request.clone())).unwrap();
+        assert_eq!(event_key(&first),event_key(&second)); assert!(event_origin_matches(&first));
+        let forged = SignedEnvelope::sign(&SigningKey::from_bytes(&[8;32]),1,100,PeerEvent::SshCredentialRequest(request)).unwrap();
+        assert!(!event_origin_matches(&forged));
+        let empty = BTreeSet::new(); let resolver = crate::authority::AuthorityResolver::new(&empty,&empty,&empty,[],100);
+        assert!(event_is_authorized(&first,&empty,&resolver)); assert!(!event_is_authorized(&forged,&empty,&resolver));
+        let delivery = mycelium_peer_protocol::SshRenewalDelivery {node_id:first.origin.clone(),response:mycelium_peer_protocol::SshRenewalResponse {request_id:"request-1".into(),certificate:None,expires_at:None,error:Some("denied".into())}};
+        for (count,allowed) in [(32,true),(33,false)] {
+            let envelope = SignedEnvelope::sign(&key,1,100,PeerEvent::SshCredentialResponses(vec![delivery.clone();count])).unwrap();
+            assert_eq!(event_is_authorized(&envelope,&empty,&resolver),allowed);
+        }
+    }
 
     #[test]
     fn observation_batches_are_bounded_by_wire_size() {

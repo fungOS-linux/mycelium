@@ -14,11 +14,13 @@ use std::{
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Policy {
+pub(crate) struct Policy {
     version: u32,
-    authority_roots: BTreeSet<String>,
+    pub(crate) authority_roots: BTreeSet<String>,
     #[serde(default)]
     legacy_access_keys: BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) legacy_release_keys: BTreeSet<String>,
     accepted_roles: BTreeSet<String>,
     #[serde(default)]
     sudo_roles: BTreeSet<String>,
@@ -31,6 +33,7 @@ struct Policy {
 #[derive(Debug, Serialize)]
 struct Plan {
     accounts: BTreeMap<String, BTreeSet<String>>,
+    ssh_principals: BTreeMap<String, BTreeSet<String>>,
     sudo_users: BTreeSet<String>,
     managed_users: BTreeSet<String>,
     sudoers: String,
@@ -69,6 +72,7 @@ fn validate(policy: &Policy) -> Result<(), String> {
         .authority_roots
         .iter()
         .chain(&policy.legacy_access_keys)
+        .chain(&policy.legacy_release_keys)
     {
         if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("invalid public authority key".into());
@@ -142,10 +146,12 @@ fn derive(
         return Err("no verified access evidence; refusing host changes".into());
     }
     let mut accounts = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut ssh_principals = BTreeMap::<String, BTreeSet<String>>::new();
     let mut verified = Vec::new();
     let revocations: Vec<_> = records.iter().filter(|r| matches!(&r.statement, AccessStatement::Revoke {revoked_at, ..} if *revoked_at <= now)).collect();
     for record in &records {
         let AccessStatement::Grant {
+            principal,
             roles,
             unix_users,
             not_before,
@@ -184,6 +190,11 @@ fn derive(
                 .entry(user.clone())
                 .or_default()
                 .extend(roles.clone());
+            ssh_principals.entry(user.clone()).or_default().extend(
+                roles
+                    .iter()
+                    .map(|role| mycelium_peer_protocol::ssh_role_principal(principal, role)),
+            );
         }
     }
     for user in &previous {
@@ -215,6 +226,7 @@ fn derive(
     Ok((
         Plan {
             accounts,
+            ssh_principals,
             sudo_users,
             managed_users,
             sudoers,
@@ -260,7 +272,7 @@ fn command(program: &str, args: &[&str]) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn install(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+pub(crate) fn install(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     protected(path.parent().ok_or("missing destination parent")?)?;
@@ -541,6 +553,19 @@ pub fn run(args: &[String], access: &Value, authority: &Value) -> Result<Vec<Str
         }
     }
     crate::ssh_access::run(&bundle_args, &verified)?;
+    // The legacy --allow interface knows roles but not human identity. Replace
+    // its generated principal text with the independently verified grant map.
+    for (user, principals) in &plan.ssh_principals {
+        let contents = principals
+            .iter()
+            .map(|p| format!("{p}\n"))
+            .collect::<String>();
+        install(
+            &bundle.join("principals").join(user),
+            contents.as_bytes(),
+            0o644,
+        )?;
+    }
     if !crate::ssh_access::host_bundle_matches_installed(&bundle)? {
         crate::ssh_access::run(
             &[
@@ -585,7 +610,28 @@ fn install_timer(args: &[String], policy: &Path) -> Result<Vec<String>, String> 
             return Err("systemd paths must be absolute safe path atoms".into());
         }
     }
-    let service = format!("[Unit]\nDescription=Reconcile verified Mycelium host grants\n[Service]\nType=oneshot\nEnvironment=PATH=/usr/sbin:/usr/bin:/sbin:/bin\nEnvironment=MYCELIUM_HOME={home}\nEnvironment=MYCELIUM_NO_AUTOSTART=1\nExecStart={} access host apply --policy {} --write\n",binary.display(),policy.display());
+    let update_path = args
+        .windows(2)
+        .find(|w| w[0] == "--updates")
+        .map(|w| Path::new(&w[1]));
+    let action = if let Some(updates) = update_path {
+        protected(updates)?;
+        let text = updates.to_str().ok_or("invalid update policy path")?;
+        if !text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b))
+        {
+            return Err("unsafe systemd update path".into());
+        }
+        format!(
+            "supervise --policy {} --updates {} --write",
+            policy.display(),
+            updates.display()
+        )
+    } else {
+        format!("apply --policy {} --write", policy.display())
+    };
+    let service = format!("[Unit]\nDescription=Reconcile verified Mycelium host grants\n[Service]\nType=oneshot\nEnvironment=PATH=/usr/sbin:/usr/bin:/sbin:/bin\nEnvironment=MYCELIUM_HOME={home}\nEnvironment=MYCELIUM_NO_AUTOSTART=1\nExecStart={} access host {action}\n",binary.display());
     let timer = "[Unit]\nDescription=Refresh Mycelium account, sudo and PAM grants\n[Timer]\nOnActiveSec=30s\nOnUnitActiveSec=2m\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n";
     install(
         Path::new("/etc/systemd/system/mycelium-host-access.service"),
@@ -613,6 +659,7 @@ mod tests {
             version: 1,
             authority_roots: BTreeSet::new(),
             legacy_access_keys: BTreeSet::from(["a".repeat(64)]),
+            legacy_release_keys: BTreeSet::new(),
             accepted_roles: BTreeSet::from(["operator".into()]),
             sudo_roles: BTreeSet::new(),
             ca_public: "/etc/ssh/ca.pub".into(),
@@ -841,5 +888,35 @@ mod tests {
         .unwrap();
         assert!(offline.sudo_users.is_empty());
         assert!(offline.pam_access.contains("- : mames : ALL"));
+    }
+    #[test]
+    fn same_role_does_not_authorize_another_persons_account() {
+        let (p, r) = signed_fixture();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let mut statement = r.statement.clone();
+        if let AccessStatement::Grant {
+            grant_id,
+            principal,
+            unix_users,
+            ..
+        } = &mut statement
+        {
+            *grant_id = "sam".into();
+            *principal = "sam".into();
+            *unix_users = vec!["sam".into()];
+        }
+        let sam = AccessRecord::sign(&key, statement).unwrap();
+        let mut state = snapshot(&r, true, vec![]);
+        state["grants"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"active":true,"record":sam}));
+        let (plan, _) = derive(&p, &state, &serde_json::json!([]), BTreeSet::new(), 15).unwrap();
+        let sam_certificate = BTreeSet::from([
+            "mycelium-role-operator".to_owned(),
+            mycelium_peer_protocol::ssh_role_principal("sam", "operator"),
+        ]);
+        assert!(plan.ssh_principals["mames"].is_disjoint(&sam_certificate));
+        assert!(!plan.ssh_principals["sam"].is_disjoint(&sam_certificate));
     }
 }

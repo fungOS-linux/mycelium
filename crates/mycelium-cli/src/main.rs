@@ -9,6 +9,7 @@ mod completions;
 mod dns;
 mod enroll;
 mod host_access;
+mod host_supervisor;
 mod invite;
 mod node;
 mod oidc;
@@ -161,7 +162,8 @@ usage:
   mycelium access list [--json]
   mycelium access host plan --policy /etc/mycelium/access.json
   mycelium access host apply --policy /etc/mycelium/access.json (--write | --dry-run)
-  mycelium access host install-timer --policy /etc/mycelium/access.json --daemon-home /home/USER/.mycelium --write
+  mycelium access host install-timer --policy /etc/mycelium/access.json --daemon-home /home/USER/.mycelium [--updates /etc/mycelium/access-updates.json] --write
+  mycelium access host supervise --policy /etc/mycelium/access.json --updates /etc/mycelium/access-updates.json --write
   mycelium access keygen --path PATH --write [--json]
   mycelium access publish --statement PATH --signing-key PATH --write [--dry-run] [--json]
   mycelium authority list [--json]
@@ -176,7 +178,7 @@ usage:
   mycelium access ssh client-config --host ALIAS --hostname HOST --user USER --identity PATH --certificate PATH --path FILE --write [--json]
   mycelium access ssh host-apply --bundle DIR --write
   mycelium access ssh host-rollout --bundle DIR --target SSH-HOST... [--remote-bin PATH] --write
-  mycelium access ssh renewal-authorize --node NODE-ID --unix-user USER --role ROLE [--credential-ttl 7d] --write
+  mycelium access ssh renewal-authorize --grant ID --node NODE-ID [--authorization-ttl 90d] [--credential-ttl 8h] [--signing-key PATH] --write
   mycelium access ssh profile show
   mycelium access ssh profile set --principal ID --unix-user USER [--allow-user USER]... [--role ROLE]... --write
   mycelium access ssh host-policy set --role ROLE... --ca-public PATH --write
@@ -889,6 +891,28 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
 
 async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
     if args.first().is_some_and(|value| value == "host") {
+        if args.get(1).is_some_and(|v|v=="install-timer") && args.iter().any(|a|a=="--updates") {
+            if args.iter().any(|a|a=="--dry-run") {return Err(access_error("timer installation does not support --dry-run; inspect access host plan instead".into()));}
+            if !args.iter().any(|a|a=="--write") {return Err(access_error("timer installation requires --write".into()));}
+            ssh_access::require_root("root host cache subscription").map_err(access_error)?;
+            let source=host_supervisor::placement_hint(&args[1..]).map_err(access_error)?;
+            let mut client=connect().await?;
+            client.call(&Request::SoftwarePolicySet {policy:source.to_string_lossy().into_owned(),write:true,dry_run:false}).await?;
+        }
+        if args.get(1).is_some_and(|value| value == "supervise") {
+            let snapshot = async {
+                let mut client = connect().await?;
+                let access = client.call(&Request::AccessList).await?;
+                let authority = client.call(&Request::AuthorityList).await?;
+                let packages = client.call(&Request::PackageList).await?;
+                Ok::<_,ClientError>((access,authority,packages))
+            }.await;
+            let (access,authority,packages) = match snapshot {
+                Ok(values) => values,
+                Err(error) => {eprintln!("mycelium: package carrier unavailable ({error}); enforcing cached access without updating binaries");(serde_json::Value::Null,serde_json::Value::Null,serde_json::Value::Null)}
+            };
+            return host_supervisor::run(&args[1..],&access,&authority,&packages).map_err(access_error);
+        }
         let snapshot = async {
             let mut client = connect().await?;
             let access = client.call(&Request::AccessList).await?;
@@ -904,6 +928,18 @@ async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
         }.map_err(access_error);
     }
     if args.first().is_some_and(|value| value == "ssh") {
+        if args.get(1).is_some_and(|value| value == "renewal-authorize") {
+            let mut client = connect().await?;
+            let state = client.call(&Request::AccessList).await?;
+            let (statement, key) = ssh_access::renewal_statement(&args[1..],&state).map_err(access_error)?;
+            let directory = myceliumd::home_dir().join("ssh");
+            std::fs::create_dir_all(&directory).map_err(|e| access_error(e.to_string()))?;
+            let path = directory.join(format!("renewal-authorization-{}.json",std::process::id()));
+            std::fs::write(&path,serde_json::to_vec(&statement).map_err(|e| access_error(e.to_string()))?).map_err(|e| access_error(e.to_string()))?;
+            let result = client.call(&Request::AccessPublish {statement:path.to_string_lossy().into_owned(),signing_key:key.to_string_lossy().into_owned(),write:true,dry_run:false}).await;
+            let _ = std::fs::remove_file(path);
+            return result.map(|value| vec![value.to_string()]);
+        }
         let state = if args.get(1).is_some_and(|value| value == "host-apply") {
             serde_json::json!({})
         } else {
