@@ -146,6 +146,7 @@ fn derive(
         return Err("no verified access evidence; refusing host changes".into());
     }
     let mut accounts = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut sudo_expiries = BTreeMap::<String, u64>::new();
     let mut ssh_principals = BTreeMap::<String, BTreeSet<String>>::new();
     let mut verified = Vec::new();
     let revocations: Vec<_> = records.iter().filter(|r| matches!(&r.statement, AccessStatement::Revoke {revoked_at, ..} if *revoked_at <= now)).collect();
@@ -195,6 +196,13 @@ fn derive(
                     .iter()
                     .map(|role| mycelium_peer_protocol::ssh_role_principal(principal, role)),
             );
+            if !roles.is_disjoint(&policy.sudo_roles) {
+                let expiry = (*not_after).min(now.saturating_add(300));
+                sudo_expiries
+                    .entry(user.clone())
+                    .and_modify(|at| *at = (*at).max(expiry))
+                    .or_insert(expiry);
+            }
         }
     }
     for user in &previous {
@@ -210,7 +218,18 @@ fn derive(
     let mut sudoers =
         "# Managed by Mycelium from verified active grants; do not edit.\n".to_owned();
     for user in &sudo_users {
-        sudoers.push_str(&format!("{user} ALL=(ALL:ALL) NOPASSWD: ALL\n"));
+        let expiry = time::OffsetDateTime::from_unix_timestamp(
+            i64::try_from(sudo_expiries[user]).map_err(|_| "sudo lease timestamp overflow")?,
+        )
+        .map_err(|e| e.to_string())?
+        .format(time::macros::format_description!(
+            "[year][month][day][hour][minute][second]Z"
+        ))
+        .map_err(|e| e.to_string())?;
+        // Reuse the bounded-sudo lease design without a second policy loop.
+        sudoers.push_str(&format!(
+            "{user} ALL=(ALL:ALL) NOTAFTER={expiry} NOPASSWD: ALL\n"
+        ));
     }
     let mut pam_access =
         "# Managed account authorization only; unmanaged accounts unchanged.\n".to_owned();
@@ -469,19 +488,35 @@ pub fn run(args: &[String], access: &Value, authority: &Value) -> Result<Vec<Str
         }
     }
     // Preflight every PAM stack before changing accounts or SSH policy.
-    let marker = "account required pam_access.so accessfile=/etc/security/mycelium-access.conf";
+    let old_marker = "account required pam_access.so accessfile=/etc/security/mycelium-access.conf";
+    let bootstrap = Path::new("/usr/local/libexec/mycelium-access/mycelium");
+    if !policy.pam_services.is_empty() {
+        protected(bootstrap)?;
+    }
+    if !path
+        .to_string_lossy()
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b))
+    {
+        return Err("PAM policy path must be a safe absolute path atom".into());
+    }
+    let marker = format!(
+        "account required pam_exec.so quiet seteuid {} access host pam-check --policy {}",
+        bootstrap.display(),
+        path.display()
+    );
     let mut pam = Vec::new();
     for service in &policy.pam_services {
         let module_present = [
-            "/usr/lib/security/pam_access.so",
-            "/usr/lib/x86_64-linux-gnu/security/pam_access.so",
-            "/usr/lib/aarch64-linux-gnu/security/pam_access.so",
-            "/lib/security/pam_access.so",
+            "/usr/lib/security/pam_exec.so",
+            "/usr/lib/x86_64-linux-gnu/security/pam_exec.so",
+            "/usr/lib/aarch64-linux-gnu/security/pam_exec.so",
+            "/lib/security/pam_exec.so",
         ]
         .iter()
         .any(|p| Path::new(p).is_file());
         if !module_present {
-            return Err("pam_access.so unavailable; no host changes made".into());
+            return Err("pam_exec.so unavailable; no host changes made".into());
         }
         let path = format!("/etc/pam.d/{service}");
         protected(Path::new(&path))?;
@@ -490,11 +525,8 @@ pub fn run(args: &[String], access: &Value, authority: &Value) -> Result<Vec<Str
         if !Path::new(&backup).exists() {
             install(Path::new(&backup), old.as_bytes(), 0o600)?;
         }
-        let new = if old.lines().any(|l| l == marker) {
-            old
-        } else {
-            format!("{marker}\n{old}")
-        };
+        let preserved=old.lines().filter(|l|*l != old_marker && !l.starts_with("account required pam_exec.so quiet seteuid /usr/local/libexec/mycelium-access/mycelium access host pam-check --policy ")).collect::<Vec<_>>().join("\n");
+        let new = format!("{marker}\n{preserved}\n");
         pam.push((path, new));
     }
     install(
@@ -580,6 +612,50 @@ pub fn run(args: &[String], access: &Value, authority: &Value) -> Result<Vec<Str
     fs::remove_dir_all(&bundle).map_err(|e| format!("remove generated host bundle: {e}"))?;
     command("visudo", &["-c"])?;
     Ok(vec![format!("verified grants applied: {} accounts, {} sudo users; PAM account policy updated (no passwords changed)", plan.accounts.len(), plan.sudo_users.len())])
+}
+
+/// PAM account evaluation is offline and rechecks expiry at login/sudo time.
+/// It never contacts the user daemon and never consumes its `active` flags.
+pub(crate) fn pam_check(args: &[String]) -> Result<Vec<String>, String> {
+    crate::ssh_access::require_root("PAM grant evaluation")?;
+    if std::env::var("PAM_TYPE").as_deref() != Ok("account") {
+        return Err("PAM grant check requires account context".into());
+    }
+    let user = std::env::var("PAM_USER").map_err(|_| "missing PAM_USER")?;
+    let service = std::env::var("PAM_SERVICE").map_err(|_| "missing PAM_SERVICE")?;
+    let path = args
+        .windows(2)
+        .find(|w| w[0] == "--policy")
+        .map(|w| Path::new(&w[1]))
+        .ok_or("missing --policy")?;
+    protected(path)?;
+    let policy: Policy = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    validate(&policy)?;
+    if !policy.pam_services.contains(&service) {
+        return Err("PAM service is not admitted by root policy".into());
+    }
+    let managed = Path::new("/var/lib/mycelium/access/managed-users.json");
+    protected(managed)?;
+    let users: BTreeSet<String> =
+        serde_json::from_slice(&fs::read(managed).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if !users.contains(&user) {
+        return Ok(vec![]);
+    } // unmanaged local-owner/recovery accounts unchanged
+    let evidence = Path::new("/var/lib/mycelium/access/evidence.json");
+    protected(evidence)?;
+    let value: Value = serde_json::from_slice(&fs::read(evidence).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let (plan, _) = derive(&policy, &value["access"], &value["authority"], users, at)?;
+    if !plan.accounts.contains_key(&user) {
+        return Err("managed account has no active, non-revoked signed grant".into());
+    }
+    Ok(vec![])
 }
 
 fn install_timer(args: &[String], policy: &Path) -> Result<Vec<String>, String> {
@@ -918,5 +994,35 @@ mod tests {
         ]);
         assert!(plan.ssh_principals["mames"].is_disjoint(&sam_certificate));
         assert!(!plan.ssh_principals["sam"].is_disjoint(&sam_certificate));
+    }
+    #[test]
+    fn sudo_lease_is_grant_clamped_and_bounded_when_timer_stops() {
+        let (p, mut r) = signed_fixture();
+        let (plan, _) = derive(
+            &p,
+            &snapshot(&r, true, vec![]),
+            &serde_json::json!([]),
+            BTreeSet::new(),
+            15,
+        )
+        .unwrap();
+        assert!(plan.sudoers.contains("NOTAFTER=19700101000020Z"));
+        if let AccessStatement::Grant { not_after, .. } = &mut r.statement {
+            *not_after = 86400;
+        }
+        r = AccessRecord::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            r.statement,
+        )
+        .unwrap();
+        let (plan, _) = derive(
+            &p,
+            &snapshot(&r, true, vec![]),
+            &serde_json::json!([]),
+            BTreeSet::new(),
+            15,
+        )
+        .unwrap();
+        assert!(plan.sudoers.contains("NOTAFTER=19700101000515Z"));
     }
 }

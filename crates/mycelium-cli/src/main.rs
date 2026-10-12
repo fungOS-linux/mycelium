@@ -37,11 +37,17 @@ use myceliumd::siem::SinkConfig;
 use std::io::Write;
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // PAM account checks are synchronous, offline and do not need Tokio's
+    // per-core thread pool or package/daemon startup configuration.
+    if args.get(0).is_some_and(|v|v=="access") && args.get(1).is_some_and(|v|v=="host") && args.get(2).is_some_and(|v|v=="pam-check") {
+        if let Err(error)=host_access::pam_check(&args[2..]) {eprintln!("mycelium: PAM account denied: {error}");std::process::exit(2);}
+        return;
+    }
     if let Err(error) = packaged::configure_cli() {
         eprintln!("mycelium: {error}");
         std::process::exit(1);
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(|a| a.as_str()) {
         Some("_serve") => {
             // hidden: run the daemon in this process (used by autostart)
@@ -891,6 +897,7 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
 
 async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
     if args.first().is_some_and(|value| value == "host") {
+        if args.get(1).is_some_and(|v|v=="pam-check") {return host_access::pam_check(&args[1..]).map_err(access_error);}
         if args.get(1).is_some_and(|v|v=="install-timer") && args.iter().any(|a|a=="--updates") {
             if args.iter().any(|a|a=="--dry-run") {return Err(access_error("timer installation does not support --dry-run; inspect access host plan instead".into()));}
             if !args.iter().any(|a|a=="--write") {return Err(access_error("timer installation requires --write".into()));}

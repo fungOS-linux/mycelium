@@ -229,7 +229,7 @@ fn host_policy_reconcile(args: &[String], state: &Value) -> Result<Vec<String>, 
 }
 
 pub(crate) fn require_root(action: &str) -> Result<(), String> {
-    let output = Command::new("id")
+    let output = Command::new("/usr/bin/id")
         .arg("-u")
         .output()
         .map_err(|error| format!("determine effective user: {error}"))?;

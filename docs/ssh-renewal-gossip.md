@@ -39,6 +39,12 @@ principal is retained on certificates for compatibility with older hosts.
 Upgrade/renew clients before activating the stricter host worker. Local recovery
 keys and local-owner sudo remain separate, deliberately unmanaged permissions.
 
+Managed sudo uses five-minute `NOTAFTER` leases, clamped to the signed grant's
+expiry. PAM calls the fixed root bootstrap's offline `pam-check` account action,
+which re-verifies retained signatures and validity at login/sudo time. It does
+not contact the daemon or start an async thread pool. Thus stopping the timer
+does not leave indefinitely usable managed sudo or stale PAM account approval.
+
 At least one authorized issuer holding the existing SSH CA must be reachable
 through gossip. Private CA keys are never gossiped. Existing certificates remain
 usable until their own expiry during an issuer outage; choose a lifetime suited
