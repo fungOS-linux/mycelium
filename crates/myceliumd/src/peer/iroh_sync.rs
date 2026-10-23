@@ -115,9 +115,15 @@ impl SyncRendezvous {
         }
         if let Some(at) = at {
             if self.endpoint.observed_at > at || self.endpoint.expires_at <= at {
-                return Err(
-                    "rendezvous expired or issued in the future; export a fresh one".into(),
-                );
+                return Err(format!(
+                    "rendezvous is not fresh (observed_at {}, expires_at {}, now {}); \
+                     a fresh rendezvous is published every 30 seconds by a running Iroh sync \
+                     runtime, and there is no manual export that regenerates one — if this is \
+                     your own peer, check that myceliumd is running with Iroh sync enabled \
+                     and MYCELIUM_IROH_SERVER_NAME set in its environment, and see \
+                     'Iroh rendezvous refresh' errors in daemon.log",
+                    self.endpoint.observed_at, self.endpoint.expires_at, at
+                ));
             }
         }
         Ok(())
