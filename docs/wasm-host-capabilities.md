@@ -2,11 +2,17 @@
 
 **Status:** design + inventory, 2026-10-26. No code in this unit: no
 `Cargo.toml` change, no WIT file, no backend, no firmware blob.
-**Scope:** one plan for three streams that were being designed separately:
+**Scope:** one plan for the streams that were being designed separately:
 
 1. absorb the COLMI BLE reversal host (`ring-host`) into the fleet wasmtime host;
 2. expose Unibus streams to wasm guests with Mycelium controlling grants/ACL;
-3. sign modules with Mycelium fleet identity.
+3. sign modules with Mycelium fleet identity;
+4. put a capability-scoped **surface/windowing** ABI in front of the same
+   runtime, across five targets (FireTV, AppleTV, CAT S22, macOS, Linux).
+
+Section H evaluates the surface ABI against all five targets and names the
+tvOS/AOT constraint up front. Nothing here weakens the existing rule that a
+scene `.wasm` imports nothing.
 
 **Why this file, not `host-access-grants.md`.** `docs/host-access-grants.md`
 begins "`mycelium access host` reconciles local accounts, OpenSSH principals/KRL,
@@ -693,6 +699,12 @@ S2  fleet:stream bridge to Unibus
 S3  signed manifests, generations, revocation
 ```
 
+The windowing/surface work is a **parallel track** with its own W0–W3 slices in
+Section H. The addendum calls them "S0–S3 surface"; they are labelled W0–W3
+here only to avoid colliding with the capability slices above. W0 (the
+platform-neutral surface trait) and S1 (the BLE ABI) can start together because
+they touch different crates.
+
 S2 and S3 both depend on S1's capability vocabulary; they are otherwise
 independent and can run in parallel. **S3 must land before any module is
 fetched from a peer, the network, or a shared store.** Until then, S1/S2 only
@@ -875,11 +887,11 @@ Today there are two hosts with different assumptions:
 Keeping both costs: two wasmtime APIs (the `HasSelf` linker shape changed), two
 audit surfaces for sandboxing, two sets of limits (only one is real), and a
 drift risk where the capability host is the one without budgets. The
-recommendation is **one runtime crate** with two binaries/backends: port the
-`ring-host` BLE backend and WIT ideas into `canvas-model-host`'s runtime and
-retire its wasmtime layer. That means picking a single wasmtime version
-(upgrade canvas to 34, or port the backend to 24). This is a human decision
-because it changes the canvas dependency graph.
+recommendation is **one runtime library** (`canvas-model-host`'s runtime plus
+the BLE and surface backends behind traits), linked by the platform shells as
+their binary, and retire `ring-host`'s separate wasmtime layer. That means
+picking a single wasmtime version (upgrade canvas to 34, or port the backend to
+24). This is a human decision because it changes the canvas dependency graph.
 
 **Non-negotiable safety rule:** adding imports must not weaken the scene path.
 The scene `Module` check that rejects any import
@@ -889,11 +901,388 @@ import `fleet:ble`, and an app module cannot claim to be a scene.
 
 ---
 
+## H. Windowing and the surface ABI
+
+This section extends the same capability model to a window. It does not change
+the three decisions above; it adds a fourth thing a module may be granted and a
+fifth target-specific execution mode (AOT) that the signing manifest must carry.
+
+### H.1 The hard constraint: five targets, two execution modes
+
+| Target | Window owner today | wasm execution | Module form | Honest status |
+|---|---|---|---|---|
+| **Linux** | `canvas-linux` is a Smithay Wayland **compositor** (`canvas:crates/canvas-linux/src/runner.rs:1-7`; `compositor.rs:1-14`) | JIT, unconstrained | `.wasm` | qualification target; no entitlements |
+| **macOS / neo** | `crates/canvas` owns `NSWindow` through objc2/AppKit (`canvas:crates/canvas/src/main.rs:13006-13023`); wgpu 27 | JIT, needs hardened-runtime `com.apple.security.cs.allow-jit` | `.wasm` | **developer MVP** |
+| **FireTV (Android)** | `canvas-android` `GLSurfaceView` + JNI (`canvas:crates/canvas-android/src/workspace_demo.rs:1,62-90`; `android/dev/fpl/canvas/WorkspaceDemoView.java:22-27`) | JIT, needs executable dual-mapped W^X | `.wasm` (`.cwasm` for startup) | **first product backend** |
+| **CAT S22 (Android)** | same Android backend as FireTV; additionally the BLE ring host (`neo:host/README.md:5-8,76-93`) | JIT, same as Android | `.wasm` | hardware currently detached (G.2) |
+| **AppleTV (tvOS)** | UIKit/CoreGraphics, not Metal/wgpu (`canvas:crates/canvas-tvos/README.md:3-15`; `src/lib.rs:1-2`) | **no JIT**: tvOS enforces W^X | **AOT `.cwasm` only** | **research risk** |
+
+The constraint that drives the design: **tvOS cannot JIT**, so wasmtime cannot
+compile at runtime there. AppleTV needs a precompiled `cwasm` produced ahead of
+time by cranelift and loaded with `Module::deserialize` (core wasm) or
+`Component::deserialize` (component model). The exact API names must be pinned
+to the chosen wasmtime version at implementation time; the direction is fixed.
+Even AOT does not fully settle tvOS: the executable mapping must be app-signed
+code, so **downloaded modules on tvOS are out of scope** until Apple's policy is
+resolved. Bundled modules only is the safe assumption.
+
+Consequences for this design:
+
+- A precompiled artifact is **not portable**. It is keyed by target triple,
+  wasmtime version, and cranelift flags as well as the wasm CID. The signed
+  manifest therefore carries an artifact list, not one CID (H.6).
+- JIT and AOT hosts share the same WIT and the same verification path. Only the
+  final compile step differs: `Component::new` vs `Component::deserialize`.
+- `canvas-model-host` is currently an **offscreen renderer/video producer**, not
+  a window (`canvas:crates/canvas-model-host/README.md:1-9`; `src/main.rs` has
+  no surface creation). A surface implementation belongs in the platform shell
+  (`canvas`, `canvas-linux`, `canvas-android`, `canvas-tvos`) consuming the same
+  runtime crate. This is another argument for one runtime library with several
+  shell binaries (G.6).
+
+### H.2 `fleet:surface@1.0.0`: guest as scene submitter
+
+**Decision: (a) the guest is a scene submitter; the host owns the window.**
+
+The host owns window creation, size/placement, the compositor, the GPU device,
+frame pacing, focus, and input normalization. The guest receives a capability
+handle, submits a bounded retained scene tree, and polls capability-scoped
+events. This is the same shape as `fleet:gpu` (bounded draw list, host device)
+and `fleet:audio` (bounded PCM, host sink), generalised to a window.
+
+Why (a) is safe under the existing caps model:
+
+- No ambient authority is added. The guest gets no `NSWindow`, `ANativeWindow`,
+  `wl_surface`, `CAMetalLayer`, file descriptor, display id, or GPU handle. It
+  cannot open a window it was not granted, size it, move it, or enumerate
+  displays.
+- The host is the only renderer and the only input owner. There is no callback
+  into wasm; the guest polls, exactly like `fleet:ble.next-event` and the
+  Canvas Lua "pulse" contract ("Pulse time is supplied by the scheduler;
+  scripts cannot read a clock", `canvas:docs/canvas-lua-modules.md:30-31`).
+- The data is bounded and declarative. A tree of nodes with CIDs, transforms,
+  opacity and text is a value, not a device resource; the host can reject it
+  before presenting. This is the same property that makes the scene path
+  auditable (`canvas:crates/canvas-model-host/src/wasm.rs:1-30`).
+- Input is already a solved contract in this tree. `ExternalSurfaceInput`
+  bounds pointer events to normalized coordinates and a generation
+  (`canvas:crates/canvas-core/src/external_surface.rs:115-149`); scroll deltas
+  are finite and capped at 4096 (`:151-178`). Reuse those rules rather than
+  inventing raw keycodes.
+
+```wit
+// fleet:surface@1.0.0 — DEFINED, NOT SHIPPED until W1.
+//
+// Limits (host-enforced): parent-chain depth ≤ 32, nodes ≤ 4096, text ≤ 64 KiB
+// total, submit ≤ 1 MiB, one in-flight frame per window, event queue ≤ 64.
+// No fs, net, clock, env, display enumeration, raw keycodes, or GPU handles.
+package fleet:surface@1.0.0;
+
+interface types {
+  record size { width: u32, height: u32, scale: f32 }
+
+  /// A retained node. Images/fonts are CIDs the host resolves; never paths.
+  /// Flat on purpose: WIT records cannot be recursive, and a flat list with
+  /// parent indices is easier to bound and validate than a tree value.
+  record node {
+    parent: option<u32>,
+    cid: option<string>,
+    x: f32, y: f32, width: f32, height: f32,
+    opacity: f32,
+    text: option<string>,
+  }
+
+  record scene {
+    root: u32,
+    nodes: list<node>,
+  }
+
+  enum event-kind {
+    pointer-down, pointer-move, pointer-up, scroll,
+    key, focus, visibility, resize, tick,
+  }
+
+  /// Host-normalized. `host-time-ms` is the only time a guest ever sees.
+  record event {
+    kind: event-kind,
+    generation: u64,
+    x: f32, y: f32,
+    delta-x: f32, delta-y: f32,
+    key: option<string>,
+    focused: option<bool>,
+    visible: option<bool>,
+    size: option<size>,
+    host-time-ms: u64,
+  }
+}
+
+interface surface {
+  use types.{size, scene, event};
+
+  enum error {
+    denied,
+    no-surface,
+    stale-generation,
+    over-budget,
+    invalid,
+    not-ready,
+  }
+
+  resource window {
+    info: func() -> result<size, error>;
+    /// Returns a host frame id; no per-frame callback.
+    submit: func(generation: u64, root: scene) -> result<u64, error>;
+    poll-event: func(timeout-ms: u32) -> result<option<event>, error>;
+    close: func() -> result<_, error>;
+  }
+
+  /// The host chooses geometry, display, and chrome from policy + `purpose`.
+  open: func(purpose: string) -> result<window, error>;
+}
+```
+
+One capability, `fleet:surface`, for `open`/`submit`/`poll-event`/`close`. An
+observer that only needs to know a window exists gets no surface capability; it
+consumes Unibus state instead. `purpose` is a bounded token from host policy
+(`fullscreen`, `panel`, `overlay`), never geometry or a display id.
+
+**What (a) cannot do** (state it now, so nobody promises it later):
+
+- no custom shaders, pipelines, raw buffers, or render passes;
+- no owning more than one window, or placing/resizing/moving its own window;
+- no native menus, drag-and-drop, tray icons, or global shortcuts;
+- no raw keycodes, pointer capture, or access to other windows' input;
+- no vsync/fence-level choreography or direct scanout;
+- no embedding an arbitrary external pixel surface (that is the
+  `ExternalSurface` producer path, and would need its own capability);
+- no reading a clock; animation is driven by host `tick` events.
+
+These are not accidental omissions. Each one either exposes a device or a
+lifetime the host owns, or makes the guest a compositor, which is the (b) model.
+
+### H.3 The rejected alternative: (b) guest as UI owner
+
+In (b), the guest owns a retained widget tree through host imports: it creates
+nodes, sets focus and z-order, receives per-widget callbacks, and may run
+layout. It can be made safe with a widget schema, per-node budgets, host-owned
+focus policy, and a strict "host renders every node" rule. But:
+
+- it is a much larger authority surface (focus, z-order, hit-testing, scrolling,
+  text editing, accessibility) that the host currently owns natively;
+- it invites a live tree with callbacks, which breaks the no-reentrancy rule and
+  makes fuel/epoch accounting meaningless across host calls;
+- it starts to re-implement a compositor inside every guest, which is the thing
+  the platform shells already do well.
+
+Recommendation: **not v1**. If dynamic UI is needed later, add `fleet:ui@1` as a
+*submitted tree document* (same as (a), richer node vocabulary), not as a live
+tree the guest owns. That keeps one renderer and one input owner.
+
+The hybrid worth naming: a guest that genuinely produces pixels (video, a
+terminal, a remote desktop) should use the existing producer-owned
+`ExternalSurface` contract (`canvas:crates/canvas-core/src/external_surface.rs:1-6,274-331`),
+with the host allocating the shared buffer on the guest's behalf. That is a
+separate `fleet:surface.producer` capability, not part of (a), and it is not in
+W1.
+
+### H.4 Where the windowing lives today (cited, not invented)
+
+| Layer | What it actually owns | Not it | Source |
+|---|---|---|---|
+| `canvas-core::desktop` | inventory/focus/layout of **already identified** OS windows: `Display`, `WindowSurface`, `DesktopSnapshot`, `WindowBackend::{snapshot,apply_layout,focus}` | window creation, pixels, input delivery to guests | `canvas:crates/canvas-core/src/desktop.rs:7-31,71-77` |
+| `canvas-core::external_surface` | producer-owned **pixel** surface contract: register/present/withdraw, `SurfaceTransport` (shm/DMA-BUF/IOSurface/Mach), `FrameSync`, generation, normalized input, visibility, scroll, stream requirements | window creation, guest UI tree | `canvas:crates/canvas-core/src/external_surface.rs:1-6,46-78,115-178,274-331,378-460` |
+| `fpl-gfx` | retained wgpu renderer into a **caller-supplied** texture view; `surface.rs` has portable IOSurface/DMA-BUF descriptor + lease | windows, event loop, input, layout policy | `fpl-gfx:README.md:7-11,33-36`; `src/surface.rs:1-6`; `Cargo.toml:21` |
+| macOS shell | `NSWindow` behavior and sharing through objc2/AppKit | a portable surface trait | `canvas:crates/canvas/src/main.rs:13006-13023` |
+| Linux shell | Smithay Wayland compositor, seat, KMS/DRM output | a portable surface trait | `canvas:crates/canvas-linux/src/runner.rs:1-14`; `compositor.rs:1-14` |
+| Android/FireTV shell | `GLSurfaceView`, EGL/GLES, lifecycle, D-pad, JNI | a portable surface trait | `canvas:crates/canvas-android/src/workspace_demo.rs:1,62-90`; `android/.../WorkspaceDemoView.java:22-27`; `AGENT-ACCESS.md:5-20` |
+| tvOS shell | UIKit remote focus/lifecycle + CoreGraphics raster | Metal/wgpu, guest surface | `canvas:crates/canvas-tvos/README.md:3-15`; `src/lib.rs:1-2` |
+
+There is **no winit** anywhere in the tree. Windowing is bespoke per platform:
+AppKit, Smithay, `GLSurfaceView`, UIKit. The desktop `canvas` shell is built on
+iced 0.14 with its wgpu backend (`canvas:crates/canvas/Cargo.toml:27,42`), so a
+guest surface there is an iced widget or a native child layer, not a new event
+loop; `canvas-linux` is the compositor itself. That is the right
+*implementation* seam (each platform's event loop and lifecycle are genuinely
+different), but it is the wrong *guest* seam. Before `fleet:surface`, the tree needs one small
+platform-neutral trait so the WIT maps to one contract rather than four:
+
+```rust
+// canvas-core, W0. Sketch only; not code in this unit.
+pub trait SurfaceHost {
+    type Error;
+    fn open(&mut self, request: SurfaceRequest) -> Result<SurfaceId, Self::Error>;
+    fn info(&self, id: SurfaceId) -> Result<SurfaceSize, Self::Error>;
+    fn submit(&mut self, id: SurfaceId, generation: u64, root: &SceneNode)
+        -> Result<u64, Self::Error>;
+    fn poll_event(&mut self, id: SurfaceId, timeout_ms: u32)
+        -> Result<Option<SurfaceEvent>, Self::Error>;
+    fn close(&mut self, id: SurfaceId) -> Result<(), Self::Error>;
+}
+```
+
+`WindowBackend` must **not** be stretched into this: it manages windows Canvas
+already identified and explicitly has no create/destroy or pixel path
+(`desktop.rs:71-77`). `ExternalSurface` is the closest precedent for input,
+visibility, generation and stream interests, and its validation rules should be
+reused; it is not a guest UI contract.
+
+### H.5 Two checkouts, same repository: windowing is being built twice
+
+Verified facts (read-only):
+
+| | current | firetv |
+|---|---|---|
+| path | `~/src/fpl/canvas-current-workspace` | `~/src/fpl/canvas-firetv-native-workspace` |
+| tip | `61cce16` (`feat/shared-workspace-egui`) | `3c8b30c` (`feat(firetv): host shared native egui mail workspace`) |
+| common ancestor | `ae9fdc54` | same |
+| commits after ancestor | 9 | 17 |
+| wasm host | has `canvas-model-host/src/wasm.rs`, `tests/wasm_scene.rs`, fixtures, WIT worktrees | **does not have them** |
+| TV/ambient work | has the shared egui mail/calendar commits, not the ambient shader line | has 8 ambient/shader/TV commits |
+| egui windowing | `crates/canvas-android/src/workspace_demo.rs` + `WorkspaceDemoView.java` | **byte-identical copies** |
+
+`git diff 61cce16 3c8b30c` is ~70 files, +2220/−4552. The firetv line deletes the
+wasm scene tests/fixtures and the widget-host first-party work; the current line
+lacks the ambient shader and TV pacing work. The egui windowing files are
+identical on both, so that code is duplicated at the branch level even though
+the bytes currently agree. A merge is **not** a fast-forward and cannot be done
+by picking a tip.
+
+Recommendation (input to the human, nothing merged here): **the current line
+(`61cce16`) wins as the base.** It contains the wasm host and capability work
+that this document is about, and the egui windowing that the firetv line also
+has. Replay the firetv line's 17 commits on top, explicitly dropping the
+deletion of `canvas-model-host/tests/*` and `src/wasm.rs`, then reconcile the
+ambient shader changes against the wasm host. If the firetv line wins instead,
+the entire wasm host work must be re-landed, and the capability manifest branch
+would have to be rebased onto a tree that no longer has the module loader.
+
+Cost to name: 17 commits across a 70-file divergence; conflicts in
+`canvas-model-host`, `canvas-workspace`, `canvas/src/main.rs`, and docs; a
+second windowing implementation to delete (not merge) once one line wins. The
+sooner this is decided, the cheaper it is.
+
+### H.6 Portability matrix and the AOT/precompiled-module pipeline
+
+| Target | JIT allowed | Required module artifact | Runtime gate | Notes |
+|---|---|---|---|---|
+| Linux | yes | `.wasm` | none | easiest proof; no entitlement |
+| macOS / neo | yes, with entitlement | `.wasm` | hardened runtime `com.apple.security.cs.allow-jit` | notarisation/signing applies to the host |
+| FireTV / CAT S22 (Android) | yes, with dual-mapped W^X | `.wasm`, optional `.cwasm` for startup | executable mapping permitted by the app | same Android backend for both |
+| AppleTV (tvOS) | **no** | **`.cwasm` (AOT)** | app-signed executable only; no downloaded code | research risk |
+
+**AOT pipeline.** On a build host with the exact wasmtime version and target:
+
+1. compile the module with cranelift ahead of time
+   (`Engine::precompile_component` for a component, `Module::precompile_module`
+   for core wasm);
+2. store the resulting `cwasm` bytes as an artifact;
+3. record `{ target_triple, engine_version, cranelift_flags_digest, cid, size }`
+   in the signed manifest;
+4. on the device, select the artifact whose target and engine match **exactly**,
+   verify its CID, then `Component::deserialize`/`Module::deserialize`.
+
+Any mismatch is a named rejection (`module_unsupported_artifact`), never a
+fallback to JIT on a target that forbids it. The manifest from E.2 gains an
+`artifacts` array; because it is inside the signed statement, the signature
+covers every precompiled artifact, not just the wasm bytes.
+
+**Honest MVP and research risk.** The honest MVP is **macOS desktop** (the
+developer loop: `crates/canvas` already owns an `NSWindow`, wgpu 27 is present,
+and JIT is a known entitlement) with **FireTV/Android** as the first product
+backend (it already has a shipped APK and the GLSurfaceView/JNI seam). Linux is
+the qualification backend because it needs no entitlement and its compositor is
+native. **tvOS is the research risk**: no JIT, `.cwasm` portability is narrow,
+and App Store policy for executable content may forbid anything but bundled
+modules even with AOT. Do not schedule tvOS on the critical path.
+
+### H.7 Surface track: W0–W3 (the addendum's "S0–S3")
+
+**W0 — platform-neutral surface trait.**
+
+- **Deliver:** `SurfaceHost` + `SurfaceRequest/SurfaceSize/SurfaceEvent` in
+  `canvas-core`, a fake backend, and validation tests. No WIT, no window, no GPU.
+- **Prove:** `cargo test -p canvas-core surface_host`.
+- **Not in slice:** no `fleet:surface`, no backend, no wasm changes.
+
+**W1 — `fleet:surface@1.0.0` + macOS backend.**
+
+- **Deliver:** the WIT package; the macOS `SurfaceHost`; runtime gating on
+  `fleet:surface`; event normalization (pointer/scroll/key/focus/visibility/
+  resize/tick); a fixture guest that submits a CID scene; host time on ticks.
+- **Prove:** `cargo test -p canvas-model-host surface` with the fake surface;
+  then a manual macOS run that opens one window, draws the fixture, and receives
+  a click and a resize. The scene path still imports nothing.
+- **Not in slice:** no Android/Linux/tvOS, no retained widget tree (b), no custom
+  shaders, no multi-window, no external pixel producer, no AOT.
+
+**W2 — second backend: Android/FireTV (also CAT S22).**
+
+- **Deliver:** `SurfaceHost` over the existing `GLSurfaceView`/JNI path; D-pad
+  and pointer normalization; lifecycle (pause/resume/destroy) as host events;
+  the same WIT, no guest change.
+- **Prove:** `cargo test -p canvas-android surface_host` (fake JNI), plus the
+  existing `canvas-tvctl` D-pad path on an authorized FireTV. CAT S22 reuses it;
+  no separate code path.
+- **Not in slice:** no tvOS, no AOT, no BLE integration, no FireTV UI redesign.
+  Linux is the qualification backend and can land as W2b without changing the
+  ABI.
+
+**W3 — precompiled/tvOS pipeline.**
+
+- **Deliver:** `artifacts[]` in the signed manifest; a build-host precompile
+  step keyed by target/engine/flags; exact-match selection and
+  `deserialize`; `module_unsupported_artifact`; tvOS simulator proof only.
+- **Prove:** `cargo test -p canvas-model-host aot_manifest` (precompile on the
+  host, deserialize, reject wrong target/engine/flags), then the tvOS simulator
+  app loading a bundled `.cwasm`.
+- **Not in slice:** no App Store claim, no downloaded modules on tvOS, no JIT
+  fallback, no device qualification, no automatic artifact distribution.
+
+### H.8 Naming
+
+The human asked whether the windowing layer needs its own name. The WIT
+namespace stays `fleet:surface@1` regardless. Candidates, checked for collisions
+in mycelium, canvas and unibus:
+
+| Candidate | Why | Collision |
+|---|---|---|
+| **Casement** | a window sash; evokes windows without naming the product | none found |
+| **Plinth** | the substrate a thing stands on; good for the trait layer | none found |
+| **Tessera** | a tile; fits retained scene trees and multi-surface layouts | none found |
+
+**Recommendation: Casement** for the platform-neutral surface/window layer,
+with `fleet:surface@1` unchanged. "Agora" is already taken in this repository
+for the agent tiling desktop (`docs/agora-desktop.md`, `docs/agora-tiling.md`),
+so it must not be reused. "Canvas", "Coherence", and "Panopticon" are also
+taken by the product, the design system, and the wall respectively. If the
+human prefers a substrate name, **Plinth** is the conservative second choice;
+**Tessera** is better reserved for a future retained-tree/UI layer.
+
+### H.9 Uncertainties introduced by this addendum
+
+- The exact AOT entry points for the chosen wasmtime version
+  (`Engine::precompile_component`/`Component::deserialize` vs the core-module
+  pair) are **[?]** until pinned; the pipeline shape is not.
+- Whether tvOS permits a **bundled** `.cwasm` to map executable under App Store
+  policy is **[?]**; downloaded modules are assumed forbidden until proven
+  otherwise.
+- FireTV JIT under its Android version/SELinux policy is **[?]** until run on
+  the Omni; CAT S22 is **[?]** until the device is attached.
+- The two branches may diverge further while this doc is reviewed; the commit
+  counts in H.5 are a snapshot, not a guarantee.
+- Whether `canvas`'s iced event loop can host a native child surface without
+  fighting iced's compositor is **[?]**; that is exactly why W0 defines a trait
+  and W1 proves one backend rather than promising all five.
+
+---
+
 ## Decisions a human must confirm
 
-1. **Host target.** One runtime crate, with `canvas-model-host` as the surviving
-   wasmtime host and `ring-host`'s BLE backend ported into it; single pinned
-   wasmtime version (24 or 34). Reject "keep both hosts".
+1. **Host target.** One runtime crate (library + binaries), with
+   `canvas-model-host` as the surviving wasmtime host and `ring-host`'s BLE
+   backend ported into it; platform shells (`canvas`, `canvas-linux`,
+   `canvas-android`, `canvas-tvos`) host the surface. Single pinned wasmtime
+   version (24 or 34). Reject "keep both hosts".
 2. **Signing scope and trust root.** Sign the manifest containing
    `module_cid`; verify the digest before compile. Trust the existing
    `MYCELIUM_AUTHORITY_KEYS` root and a new, narrowly delegated
@@ -906,3 +1295,11 @@ import `fleet:ble`, and an app module cannot claim to be a scene.
 5. **Module/Unibus identity.** In S2 a wasm module is a sub-tenant of the host,
    not a first-class Unibus producer. Confirm, or schedule the larger grant
    extension explicitly.
+6. **Surface model.** Guest as scene submitter (a), host owns window,
+   compositor, GPU, pacing and input; (b) retained UI ownership is deferred.
+7. **Branch base.** `61cce16` wins as the base and firetv's 17 commits are
+   replayed on top; windowing is not built twice. Nothing is merged in this
+   unit.
+8. **MVP target.** macOS desktop first for the developer loop, FireTV/Android
+   as the first product backend, Linux as qualification, tvOS last and
+   research-only. Only bundled `.cwasm` modules are assumed on tvOS.
