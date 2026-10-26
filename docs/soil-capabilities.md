@@ -980,6 +980,7 @@ last row: tvOS has no JIT.
 | **macOS / neo** | `crates/canvas` owns `NSWindow` through objc2/AppKit (`canvas:crates/canvas/src/main.rs:13006-13023`); wgpu 27 | JIT, needs hardened-runtime `com.apple.security.cs.allow-jit` | `.wasm` | **developer MVP** |
 | **FireTV (Android)** | `canvas-android` `GLSurfaceView` + JNI (`canvas:crates/canvas-android/src/workspace_demo.rs:1,62-90`; `android/dev/fpl/canvas/WorkspaceDemoView.java:22-27`) | JIT, needs executable dual-mapped W^X | `.wasm` (`.cwasm` for startup) | **first product backend** |
 | **CAT S22 (Android)** | same Android backend as FireTV; additionally the BLE ring host (`neo:host/README.md:5-8,76-93`) | JIT, same as Android | `.wasm` | hardware currently detached (G.2) |
+| **Web (browser)** | Browser tab owns the window/DOM; `soil:surface` maps to a host-owned canvas/DOM, not a new window | Browser core-wasm engine (V8/SpiderMonkey/JavaScriptCore) + host glue, not wasmtime/component-model | web-target core `.wasm` artifact, **no `.cwasm`** | sixth target, auth designed in; Web Bluetooth is Chromium-only and WebGPU is not universal — see [`soil-web.md`](soil-web.md). |
 | **AppleTV (tvOS)** | UIKit/CoreGraphics, not Metal/wgpu (`canvas:crates/canvas-tvos/README.md:3-15`; `src/lib.rs:1-2`) | **no JIT**: tvOS enforces W^X | **AOT `.cwasm` only** | **research risk** |
 
 The constraint that drives the design: **tvOS cannot JIT**, so wasmtime cannot
