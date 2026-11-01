@@ -308,6 +308,7 @@ pub fn install(bundle: &Path, home: &Path) -> Result<Vec<String>, ClientError> {
                 &authority_keys,
                 &release_keys,
                 &access_keys,
+                None,
             )?,
         )
         .map_err(ClientError::Io)?;
@@ -392,6 +393,7 @@ pub(crate) fn install_peer_material(
         &authority_keys,
         &release_keys,
         &access_keys,
+        iroh_server_name,
         system_service,
     )?;
     start_peer_service(&service, home, system_service)?;
@@ -451,6 +453,10 @@ pub(crate) fn repair_peer_service(
     let release_keys = setting("MYCELIUM_RELEASE_KEYS").unwrap_or("");
     let access_keys = setting("MYCELIUM_ACCESS_KEYS").unwrap_or("");
     let authority_keys = setting("MYCELIUM_AUTHORITY_KEYS").unwrap_or("");
+    // node.env is the canonical store (systemd reads it via
+    // EnvironmentFile); launchd cannot, so repair must carry the Iroh
+    // server name into the plist explicitly or macOS sync stays off.
+    let iroh_server_name = setting("MYCELIUM_IROH_SERVER_NAME").ok();
     validate_label("site", site).map_err(|error| error.to_string())?;
     for peer in peers.split(',').filter(|peer| !peer.is_empty()) {
         validate_peer(peer).map_err(|error| error.to_string())?;
@@ -462,6 +468,7 @@ pub(crate) fn repair_peer_service(
         authority_keys,
         release_keys,
         access_keys,
+        iroh_server_name,
         system_service,
     )?;
     start_peer_service(&service, home, system_service)?;
@@ -499,6 +506,7 @@ fn write_peer_service(
     authority_keys: &str,
     release_keys: &str,
     access_keys: &str,
+    iroh_server_name: Option<&str>,
     system_service: bool,
 ) -> Result<PathBuf, String> {
     if crate::packaged::current()? {
@@ -532,7 +540,7 @@ fn write_peer_service(
             .map_err(|error| format!("create launch agent directory: {error}"))?;
         std::fs::write(
             &path,
-            resolved_launchd(home, site, peers, authority_keys, release_keys, access_keys)
+            resolved_launchd(home, site, peers, authority_keys, release_keys, access_keys, iroh_server_name)
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| format!("write launch agent: {error}"))?;
@@ -654,9 +662,21 @@ fn resolved_launchd(
     authority_keys: &str,
     release_keys: &str,
     access_keys: &str,
+    iroh_server_name: Option<&str>,
 ) -> Result<String, ClientError> {
     let home = xml(&display(home)?);
-    Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>dev.fpl.mycelium</string>\n<key>ProgramArguments</key><array><string>{home}/bin/mycelium</string><string>_serve</string></array>\n<key>EnvironmentVariables</key><dict>\n<key>MYCELIUM_HOME</key><string>{home}</string>\n<key>MYCELIUM_SITE</key><string>{}</string>\n<key>MYCELIUM_PEER_LISTEN</key><string>0.0.0.0:7443</string>\n<key>MYCELIUM_PEERS</key><string>{}</string>\n<key>MYCELIUM_PEER_CA</key><string>{home}/pki/ca.pem</string>\n<key>MYCELIUM_PEER_CERT</key><string>{home}/pki/node.pem</string>\n<key>MYCELIUM_PEER_KEY</key><string>{home}/pki/node-key.pem</string>\n<key>MYCELIUM_AUTHORITY_KEYS</key><string>{}</string>\n<key>MYCELIUM_RELEASE_KEYS</key><string>{}</string>\n<key>MYCELIUM_ACCESS_KEYS</key><string>{}</string>\n<key>MYCELIUM_UPDATE_CHANNEL</key><string>canary</string>\n</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{home}/daemon.log</string>\n<key>StandardErrorPath</key><string>{home}/daemon.log</string>\n</dict></plist>\n", xml(site), xml(peers), xml(authority_keys), xml(release_keys), xml(access_keys)))
+    let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>dev.fpl.mycelium</string>\n<key>ProgramArguments</key><array><string>{home}/bin/mycelium</string><string>_serve</string></array>\n<key>EnvironmentVariables</key><dict>\n<key>MYCELIUM_HOME</key><string>{home}</string>\n<key>MYCELIUM_SITE</key><string>{}</string>\n<key>MYCELIUM_PEER_LISTEN</key><string>0.0.0.0:7443</string>\n<key>MYCELIUM_PEERS</key><string>{}</string>\n<key>MYCELIUM_PEER_CA</key><string>{home}/pki/ca.pem</string>\n<key>MYCELIUM_PEER_CERT</key><string>{home}/pki/node.pem</string>\n<key>MYCELIUM_PEER_KEY</key><string>{home}/pki/node-key.pem</string>\n<key>MYCELIUM_AUTHORITY_KEYS</key><string>{}</string>\n<key>MYCELIUM_RELEASE_KEYS</key><string>{}</string>\n<key>MYCELIUM_ACCESS_KEYS</key><string>{}</string>\n<key>MYCELIUM_UPDATE_CHANNEL</key><string>canary</string>\n</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{home}/daemon.log</string>\n<key>StandardErrorPath</key><string>{home}/daemon.log</string>\n</dict></plist>\n", xml(site), xml(peers), xml(authority_keys), xml(release_keys), xml(access_keys));
+    // launchd has no EnvironmentFile equivalent: every variable the daemon
+    // needs must be embedded in the plist. Omitting MYCELIUM_IROH_SERVER_NAME
+    // here left macOS daemons unable to start Iroh sync at all.
+    Ok(match iroh_server_name {
+        Some(name) => plist.replacen(
+            "<key>MYCELIUM_UPDATE_CHANNEL</key>",
+            &format!("<key>MYCELIUM_IROH_SERVER_NAME</key><string>{}</string>\n<key>MYCELIUM_UPDATE_CHANNEL</key>", xml(name)),
+            1,
+        ),
+        None => plist,
+    })
 }
 
 fn validate_peer(peer: &str) -> Result<(), ClientError> {

@@ -57,11 +57,24 @@ pub fn run(args: &[String]) -> Result<Vec<String>, String> {
         }
         Some("enable") if args.len() == 2 && args[1] == "--write" => {
             std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+            let path = home.join("iroh-sync.json");
+            if path.exists() {
+                // Enabling twice is a no-op, not an error: report the
+                // existing configuration instead of failing with EEXIST.
+                let config: SyncConfig =
+                    serde_json::from_slice(&read(&path)?).map_err(|e| e.to_string())?;
+                config.validate()?;
+                return Ok(vec![format!(
+                    "Iroh already enabled (public relays {}, {} sync seed(s)); no changes written. If the daemon's rendezvous is stale, restart myceliumd and check MYCELIUM_IROH_SERVER_NAME in its environment",
+                    if config.public_relays { "on" } else { "off" },
+                    config.seeds.len()
+                )]);
+            }
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(home.join("iroh-sync.json"))
+                .open(&path)
                 .map_err(|e| e.to_string())?;
             file.write_all(b"{\"public_relays\":false,\"seeds\":[]}\n")
                 .map_err(|e| e.to_string())?;
