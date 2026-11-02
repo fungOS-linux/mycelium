@@ -1,7 +1,9 @@
 # Soil capabilities: BLE, Unibus streams, signed Spores, and surfaces
 
-**Status:** design + inventory, 2026-10-26. No code in this unit: no
-`Cargo.toml` change, no WIT file, no backend, no firmware blob.
+**Status:** design + inventory, 2026-10-26; implementation moved 2026-11-01.
+The BLE host, canonical `soil:ble@1.0.0` WIT and the COLMI ring Spore now live
+in `fungOS-linux/soil` (`crates/soil-ble-host`, `wit/soil-ble.wit`,
+`spores/colmi-ring`). This document remains the design and provenance record.
 **Scope:** one plan for the streams that were being designed separately:
 
 1. absorb the COLMI BLE reversal host (`ring-host`) into **Soil**, the fleet wasmtime runtime;
@@ -28,7 +30,8 @@ This document is the missing consumer-side design and links back to both.
 |---|---|---|
 | *(none)* | `ajmwagar/mycelium`, branch `pi/fungos-wasm-host` | this unit's only write target |
 | `canvas:` | `~/src/fpl/canvas-current-workspace` @ `61cce16` (and its `.worktrees/`) | read-only |
-| `neo:` | `averys-macbook-neo:~/Documents/src/reversal/colmi` | read-only over ssh |
+| `neo:` | `averys-macbook-neo:~/Documents/src/reversal/colmi` | read-only over ssh (research only; BLE code moved) |
+| `soil:` | `fungOS-linux/soil` | canonical `soil:*` WIT + BLE host/Spore |
 
 Unibus references (`DESIGN.md`, `crates/unibus/...`) are `~/src/fpl/unibus`,
 also read-only here.
@@ -241,10 +244,15 @@ interface types {
   record characteristic { uuid: string, readable: bool, writable: bool, notifiable: bool }
   record service { uuid: string, characteristics: list<characteristic> }
 
+  record notification {
+    /// The characteristic is included; the current host used to discard it.
+    char-uuid: string,
+    data: list<u8>,
+  }
+
   variant event {
-    /// The characteristic is included: today's Soil discards it.
-    notification(char-uuid: string, data: list<u8>),
-    disconnected(reason: string),
+    notification(notification),
+    disconnected(string),
   }
 }
 
@@ -315,6 +323,10 @@ already owns is cheaper. A case that only consumes Unibus `ring.*` events needs
    own local world (`import soil:ble/ble; export run(...)`) until a shared
    `soil:app@1` runner world exists. Putting `run` in the capability package
    would make every BLE consumer export the ring's entry point.
+
+The canonical WIT is now `wit/soil-ble.wit` in `fungOS-linux/soil`. WIT
+variant cases carry one type, not named fields, so the review sketch above uses
+a `notification` record; the canonical file does the same.
 
 ### B.4 Lease: an authenticated claim, not a Spore field
 
