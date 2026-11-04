@@ -15,6 +15,14 @@ pub fn resolve(
     match reference.scheme() {
         "env" => credentials.password = Some(Secret::Env(reference.location().into())),
         "ssh-key" => credentials.key_path = Some(reference.location().into()),
+        "geode" => {
+            // The reference is valid, but this host has no geode backend wired
+            // in yet. Fail closed rather than falling back to env or a file.
+            return Err(MyceliumError::Validation(
+                "geode credential references need a configured geode backend; none is configured on this host"
+                    .into(),
+            ));
+        }
         provider => {
             return Err(MyceliumError::Validation(format!(
                 "unsupported credential provider `{provider}`"
@@ -37,5 +45,12 @@ mod tests {
             credentials.password,
             Some(Secret::Env("ROUTER_PASSWORD".into()))
         );
+    }
+
+    #[test]
+    fn geode_references_fail_closed_without_a_backend() {
+        let reference = CredentialRef::parse("geode://mail/work/imap").unwrap();
+        let error = resolve(&reference, None).unwrap_err();
+        assert!(error.to_string().contains("configured geode backend"));
     }
 }

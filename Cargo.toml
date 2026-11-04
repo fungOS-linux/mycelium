@@ -22,6 +22,7 @@ mycelium-driver-snmp = { path = "crates/mycelium-driver-snmp" }
 mycelium-driver-unifi = { path = "crates/mycelium-driver-unifi" }
 mycelium-plugins-lua = { path = "crates/mycelium-plugins-lua" }
 mycelium-peer-protocol = { path = "crates/mycelium-peer-protocol" }
+geode = { path = "crates/geode" }
 fpl-resource-observation = { path = "crates/fpl-resource-observation" }
 myceliumd = { path = "crates/myceliumd" }
 async-trait = "0.1"
@@ -41,6 +42,16 @@ rustls = "0.23"
 rustls-pemfile = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+data-encoding = "2"
+hmac = "0.12"
+sha1 = "0.10"
+subtle = "2"
+percent-encoding = "2"
+url = "2"
 
 [profile.release]
 lto = "thin"

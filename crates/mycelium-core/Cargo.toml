@@ -14,6 +14,7 @@ sha2.workspace = true
 indexmap.workspace = true
 mycelium-network-types = { workspace = true, features = ["serde"] }
 fpl-resource-observation.workspace = true
+geode.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

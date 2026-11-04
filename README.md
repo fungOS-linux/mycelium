@@ -986,6 +986,20 @@ read-only presence evidence, not attestation or proof that peer keys are protect
 See [hardware-backed peer secrets](docs/hardware-key-protection.md) for the sealing
 boundary, recovery requirements and mixed-version rollout caveat.
 
+## Owner-local credentials
+
+Adapters that need a password or key hold a `geode://<realm>/<account>/<slot>`
+reference, not the secret. `crates/geode` stores the opaque secret plus a purpose
+allowlist and reveals it only through a bounded lease; secrets have a redacting
+`Debug`, no `Serialize`, and zeroize on drop. Credential kind and credential
+expiry are metadata, and no platform backend is selected automatically.
+
+Optional connectors keep protocol behaviour out of the store:
+`geode-passkey` (software WebAuthn/ES256), `geode-otp` (TOTP/HOTP 2FA), and
+`geode-oauth` (PKCE, refresh, device authorization, OIDC discovery). Composio and
+fpl-auth are reference profiles, not provider OAuth implementations. See
+[geode](docs/geode.md) and [geode connectors](docs/geode-connectors.md).
+
 ## Security posture, STIG, and SIEM events
 
 Every agent periodically publishes a bounded security-posture observation
