@@ -125,9 +125,13 @@ assert_eq!(lease.expose().unwrap(), b"hunter2");
    constructor. Prove migration from `EnvBackend` does not change configuration.
    The passkey and OTP connectors currently persist software keys through this
    backend, so Keychain is the next step for at-rest protection.
-2. **`mycelium-core` integration** — accept `geode://` in `CredentialRef` and
-   resolve it only at the driver invocation boundary. Resolution stays lazy; the
-   reference stays the durable value.
+2. **`mycelium-core` integration** — `CredentialRef` now accepts
+   `geode://<realm>/<account>/<slot>`, revalidates on deserialize, and exposes
+   `as_geode()` / `from_geode()`. `myceliumd` resolves `env://` and `ssh-key://`
+   today and fails closed for `geode://` with an explicit "no geode backend
+   configured" error. Next: wire a durable backend into the daemon and resolve at
+   the driver invocation boundary. Resolution stays lazy; the reference stays the
+   durable value.
 3. **`unibus-mail` integration** — `email.account.v1` carries a geode reference;
    the IMAP/POP3 adapter leases `mail.connect` for the duration of a session and
    drops it on disconnect.

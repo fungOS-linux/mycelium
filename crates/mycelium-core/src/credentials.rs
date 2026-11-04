@@ -3,8 +3,18 @@ use serde::{Deserialize, Serialize};
 /// A non-secret pointer resolved only by the daemon that invokes a driver.
 /// References deliberately reject URI user-info, queries, and fragments so a
 /// password cannot be smuggled into durable inventory by accident.
+///
+/// Supported providers:
+///
+/// - `env://NAME` — read the variable at use time.
+/// - `ssh-key:///absolute/path` — a private key file.
+/// - `geode://<realm>/<account>/<slot>` — an owner-local geode credential.
+///
+/// A valid reference is not a promise that this host can resolve it. `geode`
+/// references require a configured geode backend; without one, resolution fails
+/// closed instead of falling back to another provider.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct CredentialRef(String);
 
 impl CredentialRef {
@@ -13,7 +23,7 @@ impl CredentialRef {
         let (scheme, location) = value
             .split_once("://")
             .ok_or("credential reference needs a provider scheme")?;
-        if !matches!(scheme, "env" | "ssh-key") {
+        if !matches!(scheme, "env" | "ssh-key" | "geode") {
             return Err(format!("unsupported credential provider `{scheme}`"));
         }
         if location.is_empty()
@@ -34,7 +44,26 @@ impl CredentialRef {
         if scheme == "ssh-key" && !location.starts_with('/') {
             return Err("ssh-key credential reference needs an absolute path".into());
         }
+        if scheme == "geode" {
+            geode::GeodeRef::parse(&value).map_err(|error| error.to_string())?;
+        }
         Ok(Self(value))
+    }
+
+    /// Construct from an already-validated geode reference.
+    pub fn from_geode(reference: &geode::GeodeRef) -> Self {
+        Self(reference.as_reference())
+    }
+
+    /// The typed geode reference, when this is a geode credential.
+    ///
+    /// `parse` and serde validate the value, so a `geode` scheme that fails to
+    /// parse here would mean a `CredentialRef` was constructed outside this API.
+    pub fn as_geode(&self) -> Option<geode::GeodeRef> {
+        if self.scheme() != "geode" {
+            return None;
+        }
+        geode::GeodeRef::parse(self.as_str()).ok()
     }
 
     pub fn scheme(&self) -> &str {
@@ -53,6 +82,20 @@ impl CredentialRef {
 impl std::fmt::Debug for CredentialRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "CredentialRef({})", self.0)
+    }
+}
+
+impl TryFrom<String> for CredentialRef {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl From<CredentialRef> for String {
+    fn from(value: CredentialRef) -> Self {
+        value.0
     }
 }
 
@@ -139,5 +182,57 @@ mod tests {
         assert!(CredentialRef::parse("env://9INVALID").is_err());
         assert!(CredentialRef::parse("vault://secret/router").is_err());
         assert!(CredentialRef::parse("ssh-key://relative-key").is_err());
+    }
+
+    #[test]
+    fn geode_references_are_typed_and_validated() {
+        let reference = CredentialRef::parse("geode://mail/work/imap").unwrap();
+        assert_eq!(reference.scheme(), "geode");
+        assert_eq!(reference.location(), "mail/work/imap");
+        let typed = reference.as_geode().unwrap();
+        assert_eq!(typed.realm(), "mail");
+        assert_eq!(typed.account(), "work");
+        assert_eq!(typed.slot(), "imap");
+        assert_eq!(CredentialRef::from_geode(&typed), reference);
+        assert!(CredentialRef::parse("env://ROUTER_PASSWORD")
+            .unwrap()
+            .as_geode()
+            .is_none());
+
+        for invalid in [
+            "geode://user:pass@mail/work/imap",
+            "geode://mail/work/imap?password=hunter2",
+            "geode://mail/work/imap#hunter2",
+            "geode://mail/work",
+            "geode:///work/imap",
+            "geode://mail/work/imap/extra",
+        ] {
+            assert!(
+                CredentialRef::parse(invalid).is_err(),
+                "accepted invalid geode reference: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialization_revalidates_references() {
+        let reference: CredentialRef = serde_json::from_str("\"geode://mail/work/imap\"").unwrap();
+        assert_eq!(reference.scheme(), "geode");
+        assert_eq!(
+            serde_json::to_string(&reference).unwrap(),
+            "\"geode://mail/work/imap\""
+        );
+
+        for invalid in [
+            "\"env://user:pass@example\"",
+            "\"ssh-key://relative-key\"",
+            "\"geode://mail/work\"",
+            "\"vault://secret/router\"",
+        ] {
+            assert!(
+                serde_json::from_str::<CredentialRef>(invalid).is_err(),
+                "deserialized invalid credential reference: {invalid}"
+            );
+        }
     }
 }

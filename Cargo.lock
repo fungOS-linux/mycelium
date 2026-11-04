@@ -2524,6 +2524,7 @@ dependencies = [
  "async-trait",
  "fpl-boot-contract",
  "fpl-resource-observation",
+ "geode",
  "indexmap",
  "mycelium-network-types",
  "serde",

@@ -42,6 +42,12 @@ geode://composio/<project>/api-key       COMPOSIO_API_KEY
 geode://composio/<user>/consumer-key     ck_... (Composio For You)
 ```
 
+`mycelium-core::CredentialRef` accepts the `geode://` form alongside `env://`
+and `ssh-key://`, revalidates it on deserialize, and returns a typed
+`geode::GeodeRef` via `as_geode()`. Resolving the reference is a separate,
+host-local capability: `myceliumd` currently fails closed for `geode://` until a
+durable backend is configured.
+
 Purposes used by the connectors:
 
 | Purpose | Held by | Reveals |
@@ -205,5 +211,6 @@ and never treat a generated code as a durable credential.
 2. `geoded` if connectors need a real use-without-reveal boundary.
 3. `geode-composio` client once a concrete MCP/agent consumer exists.
 4. Generic HMAC signer (`hmac.sign`) once a webhook/bridge consumer exists.
-5. `mycelium-core` `CredentialRef` and `unibus-mail` integration.
+5. Wire a durable geode backend into `myceliumd` so `CredentialRef` resolution
+   works, then `unibus-mail` session leases.
 6. Platform passkey signer for interactive macOS clients (not headless).
