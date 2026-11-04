@@ -30,5 +30,5 @@ pub use clock::{Clock, ManualClock, SharedClock, SystemClock};
 pub use error::GeodeError;
 pub use lease::Lease;
 pub use reference::GeodeRef;
-pub use secret::{Purpose, SecretBytes, SecretMeta};
-pub use store::{Store, MAX_LEASE, MIN_LEASE};
+pub use secret::{CredentialKind, Purpose, SecretBytes, SecretMeta};
+pub use store::{NewCredential, Store, MAX_LEASE, MIN_LEASE};

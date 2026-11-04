@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use crate::backend::{Backend, StoredRecord};
 use crate::clock::{SharedClock, SystemClock};
 use crate::lease::Lease;
 use crate::reference::GeodeRef;
-use crate::secret::{Purpose, SecretBytes, SecretMeta};
+use crate::secret::{CredentialKind, Purpose, SecretBytes, SecretMeta};
 use crate::GeodeError;
 
 /// Shortest lease the store will issue. A zero-length lease is a bug, not a
@@ -16,6 +17,83 @@ pub const MIN_LEASE: Duration = Duration::from_secs(1);
 /// Longest lease the store will issue. Long-lived secrets belong to a supervisor
 /// or a platform backend, not to an adapter that forgot to release.
 pub const MAX_LEASE: Duration = Duration::from_secs(60 * 60);
+
+/// Builder for a new credential entry.
+///
+/// A builder keeps call sites readable and makes the metadata surface explicit
+/// rather than positional.
+#[derive(Clone, Debug)]
+pub struct NewCredential {
+    pub secret: SecretBytes,
+    pub kind: CredentialKind,
+    pub purposes: BTreeSet<Purpose>,
+    pub label: Option<String>,
+    pub expires_at: Option<u64>,
+}
+
+impl NewCredential {
+    pub fn new(kind: CredentialKind, secret: impl Into<SecretBytes>) -> Self {
+        Self {
+            secret: secret.into(),
+            kind,
+            purposes: BTreeSet::new(),
+            label: None,
+            expires_at: None,
+        }
+    }
+
+    pub fn opaque(secret: impl Into<SecretBytes>) -> Self {
+        Self::new(CredentialKind::Opaque, secret)
+    }
+
+    pub fn api_key(secret: impl Into<SecretBytes>) -> Self {
+        Self::new(CredentialKind::ApiKey, secret)
+    }
+
+    pub fn oauth2_refresh(secret: impl Into<SecretBytes>) -> Self {
+        Self::new(CredentialKind::OAuth2RefreshToken, secret)
+    }
+
+    pub fn oauth2_access(secret: impl Into<SecretBytes>, expires_at: u64) -> Self {
+        Self::new(CredentialKind::OAuth2AccessToken, secret).expires_at(expires_at)
+    }
+
+    pub fn oauth2_id(secret: impl Into<SecretBytes>, expires_at: Option<u64>) -> Self {
+        let credential = Self::new(CredentialKind::OAuth2IdToken, secret);
+        match expires_at {
+            Some(expires_at) => credential.expires_at(expires_at),
+            None => credential,
+        }
+    }
+
+    pub fn passkey(secret: impl Into<SecretBytes>) -> Self {
+        Self::new(CredentialKind::Passkey, secret)
+    }
+
+    pub fn otp_secret(secret: impl Into<SecretBytes>) -> Self {
+        Self::new(CredentialKind::OtpSecret, secret)
+    }
+
+    pub fn with_purpose(mut self, purpose: Purpose) -> Self {
+        self.purposes.insert(purpose);
+        self
+    }
+
+    pub fn with_purposes(mut self, purposes: impl IntoIterator<Item = Purpose>) -> Self {
+        self.purposes.extend(purposes);
+        self
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn expires_at(mut self, expires_at: u64) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+}
 
 /// Owner-local store: a backend plus the policy every access passes through.
 pub struct Store<B: Backend> {
@@ -49,7 +127,7 @@ impl<B: Backend> Store<B> {
         self.backend.kind()
     }
 
-    /// Create or replace an entry.
+    /// Create or replace an opaque entry.
     ///
     /// An existing entry keeps its `created_at`; the replacement is recorded as
     /// a rotation. The caller must supply at least one purpose.
@@ -60,9 +138,17 @@ impl<B: Backend> Store<B> {
         purposes: impl IntoIterator<Item = Purpose>,
         label: Option<&str>,
     ) -> Result<SecretMeta, GeodeError> {
-        let purposes = purposes
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
+        let mut credential = NewCredential::opaque(secret).with_purposes(purposes);
+        credential.label = label.map(str::to_owned);
+        self.insert(reference, credential)
+    }
+
+    /// Insert a typed credential.
+    pub fn insert(
+        &self,
+        reference: &GeodeRef,
+        credential: NewCredential,
+    ) -> Result<SecretMeta, GeodeError> {
         let now = self.clock.now();
         let existing = self.backend.read(reference)?;
         let created_at = existing
@@ -70,17 +156,21 @@ impl<B: Backend> Store<B> {
             .map(|record| record.meta.created_at)
             .unwrap_or(now);
         let meta = SecretMeta {
-            label: label.map(str::to_owned),
+            kind: credential.kind,
+            label: credential.label,
             created_at,
             rotated_at: now,
             last_used_at: existing.as_ref().and_then(|r| r.meta.last_used_at),
-            purposes,
+            expires_at: credential.expires_at,
+            purposes: credential.purposes,
         };
         meta.validate()?;
 
         self.require_writable()?;
-        self.backend
-            .write(reference, StoredRecord::new(secret, meta.clone()))?;
+        self.backend.write(
+            reference,
+            StoredRecord::new(credential.secret, meta.clone()),
+        )?;
         self.record(reference, None, AuditOutcome::Stored);
         Ok(meta)
     }
@@ -91,6 +181,19 @@ impl<B: Backend> Store<B> {
         reference: &GeodeRef,
         secret: SecretBytes,
     ) -> Result<SecretMeta, GeodeError> {
+        self.renew(reference, secret, None)
+    }
+
+    /// Replace the secret and optionally set a new credential expiry.
+    ///
+    /// This is the token-rotation path: kind, purposes, label, and `created_at`
+    /// are preserved; `expires_at` is replaced with the supplied value.
+    pub fn renew(
+        &self,
+        reference: &GeodeRef,
+        secret: SecretBytes,
+        expires_at: Option<u64>,
+    ) -> Result<SecretMeta, GeodeError> {
         let existing = self
             .backend
             .read(reference)?
@@ -98,10 +201,12 @@ impl<B: Backend> Store<B> {
         self.require_writable()?;
 
         let meta = SecretMeta {
+            kind: existing.meta.kind,
             label: existing.meta.label.clone(),
             created_at: existing.meta.created_at,
             rotated_at: self.clock.now(),
             last_used_at: existing.meta.last_used_at,
+            expires_at,
             purposes: existing.meta.purposes.clone(),
         };
         meta.validate()?;
@@ -164,6 +269,19 @@ impl<B: Backend> Store<B> {
         }
 
         let now = self.clock.now();
+        if record.meta.is_expired(now) {
+            let expired_at = record.meta.expires_at.unwrap_or(now);
+            self.record(
+                reference,
+                Some(purpose.clone()),
+                AuditOutcome::Denied(DenyReason::CredentialExpired),
+            );
+            return Err(GeodeError::CredentialExpired {
+                reference: reference.to_string(),
+                expired_at,
+            });
+        }
+
         record.meta.last_used_at = Some(now);
         // Bookkeeping must not deny an otherwise valid lease. A read-only
         // backend simply cannot persist `last_used_at`.

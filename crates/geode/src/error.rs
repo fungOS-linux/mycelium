@@ -16,6 +16,8 @@ pub enum GeodeError {
     NotFound(String),
     #[error("purpose `{purpose}` is not allowed for {reference}")]
     PurposeNotAllowed { reference: String, purpose: String },
+    #[error("the credential at {reference} expired at {expired_at}")]
+    CredentialExpired { reference: String, expired_at: u64 },
     #[error("the lease on {0} has expired")]
     Expired(String),
     #[error("lease ttl must be between {min:?} and {max:?}, got {requested:?}")]

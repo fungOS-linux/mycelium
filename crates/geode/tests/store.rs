@@ -304,3 +304,74 @@ fn unsupported_backends_fail_closed() {
     assert!(matches!(error, GeodeError::Backend(_)));
     assert_eq!(store.backend_kind(), "unsupported");
 }
+
+#[test]
+fn typed_credentials_carry_a_kind_and_a_credential_expiry() {
+    let (store, manual, _shared) = store_at(1_000);
+    let reference = GeodeRef::parse("geode://oauth/example/access").unwrap();
+    let meta = store
+        .insert(
+            &reference,
+            geode::NewCredential::oauth2_access("access-token", 1_030)
+                .with_purpose(Purpose::oauth2_access())
+                .with_label("example access"),
+        )
+        .unwrap();
+    assert_eq!(meta.kind, geode::CredentialKind::OAuth2AccessToken);
+    assert_eq!(meta.expires_at, Some(1_030));
+
+    let lease = store
+        .lease(
+            &reference,
+            &Purpose::oauth2_access(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(lease.expose().unwrap(), b"access-token");
+
+    manual.advance(Duration::from_secs(30));
+    assert!(matches!(
+        store.lease(
+            &reference,
+            &Purpose::oauth2_access(),
+            Duration::from_secs(5)
+        ),
+        Err(GeodeError::CredentialExpired { .. })
+    ));
+    assert_eq!(
+        store.audit().last().unwrap().outcome,
+        AuditOutcome::Denied(DenyReason::CredentialExpired)
+    );
+}
+
+#[test]
+fn renew_rotates_the_secret_and_expiry_but_keeps_identity() {
+    let (store, manual, _shared) = store_at(1_000);
+    let reference = GeodeRef::parse("geode://oauth/example/refresh").unwrap();
+    store
+        .insert(
+            &reference,
+            geode::NewCredential::oauth2_refresh("first")
+                .with_purpose(Purpose::oauth2_refresh())
+                .with_label("example refresh"),
+        )
+        .unwrap();
+
+    manual.advance(Duration::from_secs(10));
+    let meta = store
+        .renew(&reference, SecretBytes::from("second"), Some(2_000))
+        .unwrap();
+    assert_eq!(meta.kind, geode::CredentialKind::OAuth2RefreshToken);
+    assert_eq!(meta.created_at, 1_000);
+    assert_eq!(meta.rotated_at, 1_010);
+    assert_eq!(meta.expires_at, Some(2_000));
+    assert_eq!(meta.label.as_deref(), Some("example refresh"));
+    let lease = store
+        .lease(
+            &reference,
+            &Purpose::oauth2_refresh(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(lease.expose().unwrap(), b"second");
+}

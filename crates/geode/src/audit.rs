@@ -10,6 +10,7 @@ use crate::secret::Purpose;
 pub enum DenyReason {
     NotFound,
     PurposeNotAllowed,
+    CredentialExpired,
     InvalidTtl,
     Backend,
 }

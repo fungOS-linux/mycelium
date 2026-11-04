@@ -116,6 +116,30 @@ impl Purpose {
     pub fn test() -> Self {
         Self("test.read".into())
     }
+
+    pub fn passkey_assert() -> Self {
+        Self("passkey.assert".into())
+    }
+
+    pub fn oauth2_access() -> Self {
+        Self("oauth2.access".into())
+    }
+
+    pub fn oauth2_refresh() -> Self {
+        Self("oauth2.refresh".into())
+    }
+
+    pub fn oauth2_id() -> Self {
+        Self("oauth2.id".into())
+    }
+
+    pub fn otp_generate() -> Self {
+        Self("otp.generate".into())
+    }
+
+    pub fn mcp_invoke() -> Self {
+        Self("mcp.invoke".into())
+    }
 }
 
 impl fmt::Display for Purpose {
@@ -144,6 +168,46 @@ impl From<Purpose> for String {
     }
 }
 
+/// What kind of credential an entry holds.
+///
+/// The kind is descriptive metadata for operators and connector preflight; the
+/// store still treats the bytes as opaque. A connector may require a kind before
+/// it will use an entry, but it must never rely on the kind label for secrecy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    #[default]
+    Opaque,
+    ApiKey,
+    OAuth2AccessToken,
+    OAuth2RefreshToken,
+    OAuth2IdToken,
+    OtpSecret,
+    Passkey,
+    Certificate,
+}
+
+impl CredentialKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Opaque => "opaque",
+            Self::ApiKey => "api_key",
+            Self::OAuth2AccessToken => "oauth2_access_token",
+            Self::OAuth2RefreshToken => "oauth2_refresh_token",
+            Self::OAuth2IdToken => "oauth2_id_token",
+            Self::OtpSecret => "otp_secret",
+            Self::Passkey => "passkey",
+            Self::Certificate => "certificate",
+        }
+    }
+}
+
+impl fmt::Display for CredentialKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Non-secret description of a stored secret.
 ///
 /// This is the entire metadata surface in v1. Adding fields is a deliberate act:
@@ -151,12 +215,18 @@ impl From<Purpose> for String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretMeta {
+    #[serde(default)]
+    pub kind: CredentialKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub created_at: u64,
     pub rotated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<u64>,
+    /// Absolute credential expiry, distinct from a lease's expiry. Access tokens
+    /// and certificates carry one; a password usually does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
     pub purposes: BTreeSet<Purpose>,
 }
 
@@ -180,5 +250,11 @@ impl SecretMeta {
             }
         }
         Ok(())
+    }
+
+    /// Whether the credential itself has expired. Lease expiry is separate and
+    /// is enforced by [`crate::Lease`].
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|expires_at| now >= expires_at)
     }
 }

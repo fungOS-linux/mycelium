@@ -80,10 +80,12 @@ impl Backend for EnvBackend {
                 Ok(Some(StoredRecord::new(
                     SecretBytes::new(bytes),
                     SecretMeta {
+                        kind: crate::secret::CredentialKind::Opaque,
                         label: None,
                         created_at: 0,
                         rotated_at: 0,
                         last_used_at: None,
+                        expires_at: None,
                         purposes: self.purposes.clone(),
                     },
                 )))
