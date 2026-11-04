@@ -758,7 +758,14 @@ pub async fn redeem(args: &[String]) -> Result<Vec<String>, String> {
         let key = Path::new(required(args, "--peer-key")?);
         #[cfg(feature = "iroh-sync")]
         let iroh_server_name = if let Some((seed, relays)) = sync_seed {
-            crate::pair_iroh::install_seed(&home, seed, relays)?;
+            // The redeemed principal is this peer's certificate SAN: the
+            // daemon advertises exactly that name for Iroh sync.
+            crate::pair_iroh::install_seed(
+                &home,
+                seed,
+                relays,
+                Some(redeemed.principal.as_str()),
+            )?;
             Some(redeemed.principal.as_str())
         } else { None };
         #[cfg(not(feature = "iroh-sync"))]

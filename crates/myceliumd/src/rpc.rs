@@ -2629,6 +2629,42 @@ impl Daemon {
                 }))
                 .map_err(json_err)
             }
+            Request::SyncReload => {
+                #[cfg(feature = "iroh-sync")]
+                {
+                    to_value(
+                        self.mesh
+                            .reload_sync()
+                            .await
+                            .map_err(MyceliumError::Validation)?,
+                    )
+                    .map_err(json_err)
+                }
+                #[cfg(not(feature = "iroh-sync"))]
+                {
+                    Err(MyceliumError::Validation(
+                        "this daemon was built without Iroh sync".into(),
+                    ))
+                }
+            }
+            Request::SyncStatus => {
+                #[cfg(feature = "iroh-sync")]
+                {
+                    to_value(
+                        self.mesh
+                            .sync_status()
+                            .await
+                            .map_err(MyceliumError::Validation)?,
+                    )
+                    .map_err(json_err)
+                }
+                #[cfg(not(feature = "iroh-sync"))]
+                {
+                    Err(MyceliumError::Validation(
+                        "this daemon was built without Iroh sync".into(),
+                    ))
+                }
+            }
             Request::Shutdown => {
                 self.persist().await?;
                 self.persist_topology().await?;
@@ -3209,6 +3245,33 @@ pub async fn serve() -> std::io::Result<()> {
         crate::VERSION,
         socket.display()
     );
+    // SIGHUP reloads the optional transport configuration in place. The
+    // default terminate action is replaced, so the daemon survives the signal.
+    #[cfg(all(unix, feature = "iroh-sync"))]
+    {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut hangup = match signal(SignalKind::hangup()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    eprintln!("myceliumd: install SIGHUP handler: {error}");
+                    return;
+                }
+            };
+            while hangup.recv().await.is_some() {
+                match daemon.mesh.reload_sync().await {
+                    Ok(status) => eprintln!(
+                        "myceliumd: Iroh sync reloaded (running={}, seeds={}, public relays={})",
+                        status.running,
+                        status.seeds,
+                        status.public_relays
+                    ),
+                    Err(error) => eprintln!("myceliumd: Iroh sync reload: {error}"),
+                }
+            }
+        });
+    }
     // Native recovery can wait on systemd/application readiness. Keep it off
     // the control/gossip event loop and never turn boot into an update trigger.
     tokio::task::spawn_blocking(|| match crate::software::recover_interrupted_activations() {

@@ -295,19 +295,23 @@ pub(crate) fn install_seed(
     home: &Path,
     seed: SyncRendezvous,
     public_relays: bool,
+    server_name: Option<&str>,
 ) -> Result<(), String> {
     let config = SyncConfig {
         public_relays,
         direct_first: true,
+        server_name: server_name.map(str::to_owned),
         seeds: vec![seed],
     };
     config.validate()?;
     std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
     // Enrollment must not silently replace an existing peer's sync configuration.
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(home.join("iroh-sync.json"))
         .map_err(|e| e.to_string())?;
     file.write_all(&serde_json::to_vec(&config).map_err(|e| e.to_string())?)
@@ -479,14 +483,15 @@ mod tests {
             cert.to_str().unwrap(),
         ]);
         let home = root.join("new-peer");
-        install_seed(&home, seed, relays).unwrap();
+        install_seed(&home, seed, relays, Some("new-peer")).unwrap();
         let config: SyncConfig =
             serde_json::from_slice(&std::fs::read(home.join("iroh-sync.json")).unwrap()).unwrap();
         assert_eq!(
             config.seeds[0].endpoint.endpoint_id,
             sync.endpoint.endpoint_id
         );
-        assert!(install_seed(&home, sync, relays).is_err());
+        assert_eq!(config.server_name.as_deref(), Some("new-peer"));
+        assert!(install_seed(&home, sync, relays, Some("new-peer")).is_err());
         tokio::time::timeout(DEADLINE, task)
             .await
             .unwrap()
