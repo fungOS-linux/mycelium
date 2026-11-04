@@ -986,6 +986,15 @@ read-only presence evidence, not attestation or proof that peer keys are protect
 See [hardware-backed peer secrets](docs/hardware-key-protection.md) for the sealing
 boundary, recovery requirements and mixed-version rollout caveat.
 
+## Owner-local credentials
+
+Adapters that need a password or key hold a `geode://<realm>/<account>/<slot>`
+reference, not the secret. `crates/geode` stores the opaque secret plus a purpose
+allowlist and reveals it only through a bounded lease; secrets have a redacting
+`Debug`, no `Serialize`, and zeroize on drop. No platform backend is selected
+automatically, and an unimplemented backend fails closed. See
+[geode](docs/geode.md).
+
 ## Security posture, STIG, and SIEM events
 
 Every agent periodically publishes a bounded security-posture observation
