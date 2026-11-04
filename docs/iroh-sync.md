@@ -11,9 +11,11 @@ cargo install --path crates/mycelium-cli --features iroh-sync --locked
 ```
 
 On each already-enrolled peer, retain the existing `MYCELIUM_PEER_CA`,
-`MYCELIUM_PEER_CERT`, and `MYCELIUM_PEER_KEY` settings. Set
-`MYCELIUM_IROH_SERVER_NAME` in its daemon environment to a name/IP present
-in **that peer's certificate SAN**, then:
+`MYCELIUM_PEER_CERT`, and `MYCELIUM_PEER_KEY` settings. The TLS SAN this peer
+advertises can come from `MYCELIUM_IROH_SERVER_NAME` in the daemon environment
+or from `"server_name"` in `iroh-sync.json`; it must be a name/IP present in
+**that peer's certificate SAN**. When both are set they must agree, otherwise
+the daemon refuses to advertise a name its certificate does not carry.
 
 The runtime uses UDP port 7444 for stable saved connection hints across restart;
 `MYCELIUM_IROH_PORT` overrides it (zero/invalid values fail). IPv6 is used when
@@ -23,27 +25,30 @@ prioritized over container interfaces when public hints reach the 16-address
 bound; excluded scoped link-local addresses are not remotely dialable.
 
 ```sh
-mycelium sync enable --write
-mycelium daemon stop
-mycelium daemon start
+mycelium sync enable --write --server-name peer.example
 mycelium sync export --qr
 ```
 
-For a system-managed daemon, restart its existing service rather than starting
-a second daemon. Export may briefly fail until local address discovery completes.
-The QR contains public connection hints and the TLS name; no private key,
-authority grant, SSH permission, or enrollment secret is included.
+The command applies the change to the running daemon: the Iroh transport is
+rebuilt in place and the peer identity, the signed observation log, and the
+TCP gossip path are untouched. No daemon stop/start cycle is needed. Export may
+briefly fail until local address discovery completes. The QR contains public
+connection hints and the TLS name; no private key, authority grant, SSH
+permission, or enrollment secret is included.
 
 Save the exported JSON (or scanned QR content) on the other enrolled peer:
 
 ```sh
 mycelium sync join rendezvous.json --write
-mycelium daemon stop
-mycelium daemon start
 mycelium peers --json
 mycelium scan
 mycelium services --json
 ```
+
+`join` also applies the seed to the running daemon. `mycelium sync status`
+reports the effective state, and `mycelium sync reload` re-reads the
+configuration on demand. `SIGHUP` to the daemon performs the same reload, so a
+system-managed service can be reconfigured without a restart.
 
 Rendezvous export expires after two minutes, refreshed every 30 seconds. Import
 rejects expired/future data. Explicitly imported seeds persist across restarts;
@@ -80,10 +85,11 @@ participating peers when NAT/firewalls prevent direct QUIC:
 
 ```sh
 mycelium sync relays enable --write
-# Restart the existing systemd user service or LaunchAgent.
 ```
 
-Use `relays disable --write` to restore direct-only policy. No public DNS record,
+The relay policy is applied to the running daemon immediately; no service
+restart is required. Use `relays disable --write` to restore direct-only policy.
+No public DNS record,
 UPnP mapping, cloud firewall rule, WireGuard route, or ACL is changed. Removing
 TCP access alone does not guarantee Iroh connectivity: direct UDP must work or
 relay policy must be enabled. TLS SAN checks and both TLS/Iroh signed bindings
@@ -105,15 +111,14 @@ metadata terms only, not a confidentiality one.
 
 ```sh
 mycelium sync relays disable --write   # sets public_relays=false, keeps seeds
-# Restart the managed daemon / LaunchAgent.
 ```
 
 That revokes the relay list: the runtime clears relay hints from every
 rendezvous and refuses new relay dials, leaving direct QUIC (and authenticated
 TCP) only. Existing direct connections are unaffected. To remove all Iroh
 bootstrap state as well, restore `iroh-sync.json` from backup or delete it and
-restart; the transport key in `iroh-secret.key` may be retained for a stable
-identity. Backups: `~/.mycelium/iroh-sync.json.bak-*`.
+run `mycelium sync reload`; the transport key in `iroh-secret.key` may be
+retained for a stable identity. Backups: `~/.mycelium/iroh-sync.json.bak-*`.
 
 ## Enroll a new peer using a QR claim
 
@@ -187,11 +192,17 @@ yet issued by enrollment and do not replace mTLS.
 `iroh-sync.json` is strict, bounded JSON, with at most 32 unique seeds:
 
 ```json
-{"public_relays":false,"direct_first":true,"seeds":[]}
+{"public_relays":false,"direct_first":true,"server_name":"peer.example","seeds":[]}
 ```
 
-Public n0 relays are opt-in via `public_relays: true` followed by restart.
-With them disabled, this slice requires reachable direct addresses (LAN or
+`server_name` is optional; it is the TLS SAN this peer advertises for its own
+Iroh endpoint. It is a public name, never a credential or an access grant.
+Unknown fields are rejected, and an invalid configuration is reported instead
+of being applied: the running transport keeps the last valid configuration.
+
+Public n0 relays are opt-in via `public_relays: true` followed by a reload
+(the write already reloads the daemon). With them disabled, this slice requires
+reachable direct addresses (LAN or
 an existing routed overlay). WAN/NAT hole-punch and relay behavior has not
 been qualified across the fleet. Public DNS endpoint lookup/publication and
 UPnP/PCP/NAT-PMP port mapping are disabled. Iroh does not deploy WireGuard.
@@ -205,8 +216,14 @@ enforced before allocation grows beyond the bound.
 Runtime-owned `iroh-sync-endpoints.json` publishes expiring leases through the
 existing Iroh discovery projection on `scan`; application-owned
 `iroh-endpoints.json` remains untouched. The public rendezvous file is separate
-from enrollment and credentials. Removing the sync configuration and
-restarting disables the runtime; retain the transport key for stable identity.
+from enrollment and credentials. Removing the sync configuration and reloading
+disables the runtime; retain the transport key for stable identity.
+
+A missing or invalid sync configuration no longer prevents the daemon from
+starting: the optional transport stays idle and the daemon keeps its TCP
+gossip path. `mycelium sync status` reports the last error, and a corrected
+configuration is applied by the next write, `mycelium sync reload`, or
+`SIGHUP`.
 
 ## Verification
 
@@ -215,6 +232,7 @@ cargo check -p mycelium-cli --features iroh-sync --tests
 cargo test -p myceliumd --features iroh-sync iroh_sync
 cargo test -p myceliumd peer_framing_bounds_and_cancellation
 cargo test -p mycelium-cli --features iroh-sync pair_iroh -- --test-threads=1
+cargo test -p mycelium-cli --features iroh-sync sync
 # Relay-only carriage (needs reachable public n0 relays; asserts no direct path):
 cargo test --release -p myceliumd --features iroh-sync relay_only -- --ignored --nocapture
 ```

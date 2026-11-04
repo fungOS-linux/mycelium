@@ -371,6 +371,10 @@ pub enum Request {
     ConsolePlan {
         id: String,
     },
+    /// Re-read `iroh-sync.json` and apply it to the running daemon.
+    SyncReload,
+    /// Current Iroh sync state (enabled, running, relay policy, seeds).
+    SyncStatus,
     /// Persist state and exit.
     Shutdown,
 }

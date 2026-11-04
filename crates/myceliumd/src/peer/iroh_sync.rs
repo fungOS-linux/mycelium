@@ -77,8 +77,9 @@ async fn dial_once(mesh: Arc<Mesh>, endpoint: Endpoint, connector: TlsConnector,
     mesh.run_bound_stream(stream, fingerprint, None, Some(connection.remote_id().to_string())).await
 }
 
-/// Explicit persistent seed configuration; changes take effect on restart.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Explicit persistent seed configuration. The daemon re-reads this file
+/// on a live reload, so a change applies without restarting the process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncConfig {
     /// Public relays are opt-in. No public DNS address publication is enabled.
@@ -89,6 +90,12 @@ pub struct SyncConfig {
     /// attempt to make relay-first/relay-only policy.
     #[serde(default = "default_direct_first")]
     pub direct_first: bool,
+    /// TLS SAN this peer advertises for its own Iroh endpoint. It is a
+    /// public name, never a credential or an access grant. When absent the
+    /// daemon falls back to MYCELIUM_IROH_SERVER_NAME; when neither is set
+    /// the peer still dials configured seeds but advertises nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
     #[serde(default)]
     pub seeds: Vec<SyncRendezvous>,
 }
@@ -97,8 +104,20 @@ fn default_direct_first() -> bool {
     true
 }
 
+/// The default matches the serde default: direct paths stay preferred.
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            public_relays: false,
+            direct_first: true,
+            server_name: None,
+            seeds: Vec::new(),
+        }
+    }
+}
+
 /// Public, expiring connection hints. This is NOT an enrollment claim.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncRendezvous {
     pub endpoint: mycelium_iroh_discovery::Endpoint,
@@ -228,187 +247,453 @@ fn portable_addresses(
     addresses
 }
 
-pub(super) async fn start(mesh: Arc<Mesh>, tls: &TlsSettings) -> Result<(), AnyError> {
-    let home = crate::home_dir();
-    let path = home.join("iroh-sync.json");
-    if !path.exists() {
-        return Ok(());
-    }
-    let config: SyncConfig = serde_json::from_slice(&read_bounded(&path)?)?;
-    config.validate()?;
-    let server_name = std::env::var("MYCELIUM_IROH_SERVER_NAME")
-        .map_err(|_| "MYCELIUM_IROH_SERVER_NAME must match this peer's certificate SAN")?;
-    ServerName::try_from(server_name.clone())?;
-    let port: u16 = match std::env::var("MYCELIUM_IROH_PORT") {
-        Ok(value) => value.parse()?,
-        Err(std::env::VarError::NotPresent) => 7444,
-        Err(error) => return Err(error.into()),
-    };
-    if port == 0 { return Err("Iroh sync requires a stable nonzero UDP port".into()); }
-    let preferred: BTreeSet<_> = mesh.hello.interfaces.iter()
-        .filter(|interface| !["veth", "docker", "br-", "sh-"].iter().any(|prefix| interface.name.starts_with(prefix)))
-        .flat_map(|interface| interface.addresses.iter().copied()).collect();
-    let builder = Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(transport_key(&home.join("iroh-secret.key"))?)
-        .clear_ip_transports()
-        .bind_addr(format!("0.0.0.0:{port}"))?
-        .bind_addr_with_opts(format!("[::]:{port}"), iroh::endpoint::BindOpts::default().set_is_required(false))?
-        .clear_address_lookup()
-        .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
-        .transport_config(
-            iroh::endpoint::QuicTransportConfig::builder()
-                .max_concurrent_bidi_streams(1u8.into())
-                .max_concurrent_uni_streams(0u8.into())
-                .build(),
-        )
-        .alpns(vec![ALPN.to_vec()]);
-    let builder = if config.public_relays {
-        builder
-    } else {
-        builder.relay_mode(iroh::RelayMode::Disabled)
-    };
-    let endpoint = builder.bind().await?;
-    let mut hello = mesh.local_hello().await;
-    hello.capabilities.push("transport.iroh-key-binding".into());
-    mesh.publish(PeerEvent::Hello(hello)).await?;
-    mesh.publish(PeerEvent::Transport(TransportCredentialBinding {
-        node_id: mesh.hello.node_id.clone(),
-        kind: TransportKind::Iroh,
-        public_key: endpoint.id().to_string(),
-        generation: now(),
-        valid_until: None,
-    }))
-    .await?;
-    let acceptor = TlsAcceptor::from(Arc::new(tls.server_config()?));
-    let connector = TlsConnector::from(Arc::new(tls.client_config()?));
-    let permits = Arc::new(tokio::sync::Semaphore::new(LIMIT));
-    let listener = endpoint.clone();
-    let incoming_mesh = mesh.clone();
-    tokio::spawn(async move {
-        while let Some(incoming) = listener.accept().await {
-            let Ok(permit) = permits.clone().try_acquire_owned() else {
-                incoming.refuse();
-                continue;
-            };
-            let mesh = incoming_mesh.clone();
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let result: Result<(), AnyError> = async {
-                    let connection = tokio::time::timeout(HANDSHAKE, incoming).await??;
-                    let (send, recv) =
-                        tokio::time::timeout(HANDSHAKE, connection.accept_bi()).await??;
-                    let stream = tokio::time::timeout(
-                        HANDSHAKE,
-                        acceptor.accept(tokio::io::join(recv, send)),
-                    )
-                    .await??;
-                    let fingerprint = tls_peer_fingerprint(stream.get_ref().1.peer_certificates());
-                    mesh.run_bound_stream(
-                        stream,
-                        fingerprint,
-                        None,
-                        Some(connection.remote_id().to_string()),
-                    )
-                    .await
-                }
-                .await;
-                if let Err(error) = result {
-                    eprintln!("myceliumd: Iroh incoming sync: {error}");
-                }
-            });
+/// Live state of the optional Iroh sync transport.
+#[derive(Clone, Debug, Serialize)]
+pub struct SyncStatus {
+    /// A configuration file exists on disk.
+    pub enabled: bool,
+    /// The Iroh endpoint is bound and the sync tasks are running.
+    pub running: bool,
+    pub public_relays: bool,
+    pub direct_first: bool,
+    /// TLS SAN this peer advertises, when one is configured.
+    pub server_name: Option<String>,
+    /// Iroh endpoint identity. Transport identity only: never a user identity.
+    pub endpoint_id: Option<String>,
+    /// Configured bootstrap seeds.
+    pub seeds: usize,
+    /// Last configuration or transport error.
+    pub error: Option<String>,
+    /// Unix time of the last reconciliation attempt.
+    pub updated_at: u64,
+}
+
+/// A running Iroh sync transport: one endpoint plus its background tasks.
+struct SyncStack {
+    endpoint: Endpoint,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    config: SyncConfig,
+    server_name: Option<String>,
+}
+
+impl SyncStack {
+    async fn stop(self) {
+        // Stop the background tasks first: they hold endpoint handles.
+        for task in self.tasks {
+            task.abort();
+            let _ = task.await;
         }
-    });
-    let outgoing_mesh = mesh.clone();
-    let outgoing_endpoint = endpoint.clone();
-    tokio::spawn(async move {
-        let mut running = BTreeMap::<String, tokio::task::JoinHandle<Result<(), AnyError>>>::new();
-        let mut retries = BTreeMap::<String, (u64, u64)>::new();
-        let configured: BTreeSet<_> = config.seeds.iter().map(|seed| seed.endpoint.endpoint_id.clone()).collect();
-        // Give the concurrently starting TCP connector first opportunity.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        loop {
-            let at = now();
-            let finished: Vec<_> = running.iter().filter(|(_, task)| task.is_finished()).map(|(id, _)| id.clone()).collect();
-            for id in finished {
-                let task = running.remove(&id).unwrap();
-                match task.await {
-                    Ok(Ok(())) => { retries.insert(id, (at + 5, 5)); }
-                    result => {
-                        eprintln!("myceliumd: Iroh fallback {id}: {result:?}");
-                        let delay = retries.get(&id).map_or(5, |(_, delay)| (delay * 2).min(60));
-                        retries.insert(id, (at + delay, delay));
+        // Closing is not enough: a closed endpoint keeps its UDP socket until
+        // the last handle is dropped, and the replacement transport needs the
+        // same stable port.
+        self.endpoint.close().await;
+        drop(self.endpoint);
+    }
+}
+
+/// Daemon-side settings for the optional Iroh transport. They are resolved
+/// once, at daemon start: a running process cannot inherit a new environment,
+/// so a reload only ever applies what is already in effect.
+#[derive(Clone, Debug)]
+pub(super) struct SyncOptions {
+    /// State directory holding `iroh-sync.json` and the transport key.
+    pub home: std::path::PathBuf,
+    /// Raw `MYCELIUM_IROH_PORT` value; absent means the default port.
+    pub port: Option<String>,
+    /// Raw `MYCELIUM_IROH_SERVER_NAME` value.
+    pub server_name: Option<String>,
+}
+
+impl SyncOptions {
+    pub(super) fn from_env(home: std::path::PathBuf) -> Self {
+        Self {
+            home,
+            port: std::env::var("MYCELIUM_IROH_PORT").ok(),
+            server_name: std::env::var("MYCELIUM_IROH_SERVER_NAME").ok(),
+        }
+    }
+
+    fn port(&self) -> Result<u16, String> {
+        let port: u16 = match &self.port {
+            Some(value) => value
+                .parse()
+                .map_err(|_| format!("MYCELIUM_IROH_PORT `{value}` is not a UDP port"))?,
+            None => 7444,
+        };
+        if port == 0 {
+            return Err("Iroh sync requires a stable nonzero UDP port".into());
+        }
+        Ok(port)
+    }
+}
+
+/// Owns the optional Iroh sync transport and applies configuration changes
+/// without restarting the daemon or dropping the peer mesh.
+#[derive(Clone)]
+pub(super) struct SyncSupervisor {
+    mesh: Arc<Mesh>,
+    tls: TlsSettings,
+    options: SyncOptions,
+    stack: Arc<Mutex<Option<SyncStack>>>,
+    status: Arc<tokio::sync::RwLock<SyncStatus>>,
+}
+
+impl SyncSupervisor {
+    pub(super) fn new(mesh: Arc<Mesh>, tls: TlsSettings, options: SyncOptions) -> Self {
+        Self {
+            mesh,
+            tls,
+            options,
+            stack: Arc::new(Mutex::new(None)),
+            status: Arc::new(tokio::sync::RwLock::new(SyncStatus {
+                enabled: false,
+                running: false,
+                public_relays: false,
+                direct_first: true,
+                server_name: None,
+                endpoint_id: None,
+                seeds: 0,
+                error: None,
+                updated_at: now(),
+            })),
+        }
+    }
+
+    /// Re-read `iroh-sync.json` and apply it. The peer identity, the signed
+    /// observations, and the TCP gossip path are untouched: only the optional
+    /// Iroh transport is rebuilt, and its endpoint identity is stable because
+    /// the transport secret key is persisted on disk.
+    pub(super) async fn apply(&self) -> Result<SyncStatus, String> {
+        let outcome = self.reconcile().await;
+        {
+            let mut status = self.status.write().await;
+            status.updated_at = now();
+            status.error = outcome.as_ref().err().cloned();
+        }
+        match outcome {
+            Ok(()) => Ok(self.status().await),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn reconcile(&self) -> Result<(), String> {
+        let path = self.options.home.join("iroh-sync.json");
+        let enabled = path.exists();
+        let desired = load_config(&path)?;
+        let server_name = resolve_server_name(desired.as_ref(), self.options.server_name.clone())?;
+        // Fail before touching the running transport.
+        self.options.port()?;
+        {
+            let mut status = self.status.write().await;
+            status.enabled = enabled;
+            status.public_relays = desired.as_ref().is_some_and(|config| config.public_relays);
+            status.direct_first = desired.as_ref().is_none_or(|config| config.direct_first);
+            status.seeds = desired.as_ref().map_or(0, |config| config.seeds.len());
+            status.server_name = server_name.clone();
+        }
+        let mut guard = self.stack.lock().await;
+        let unchanged = match (guard.as_ref(), desired.as_ref()) {
+            (None, None) => true,
+            (Some(stack), Some(config)) => {
+                stack.config == *config && stack.server_name == server_name
+            }
+            _ => false,
+        };
+        if unchanged {
+            return Ok(());
+        }
+        if let Some(stack) = guard.take() {
+            stack.stop().await;
+        }
+        if let Some(config) = desired {
+            let stack = SyncStack::start(
+                self.mesh.clone(),
+                &self.tls,
+                &self.options,
+                config,
+                server_name,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            *guard = Some(stack);
+        }
+        Ok(())
+    }
+
+    /// Current sync state, including whether the endpoint is live.
+    pub(super) async fn status(&self) -> SyncStatus {
+        let mut status = self.status.read().await.clone();
+        let guard = self.stack.lock().await;
+        status.running = guard.is_some();
+        if let Some(stack) = guard.as_ref() {
+            status.endpoint_id = Some(stack.endpoint.id().to_string());
+        }
+        status
+    }
+}
+
+/// Read and validate the on-disk sync configuration. A missing file means
+/// "Iroh sync is off"; an invalid file is an error that leaves the running
+/// transport untouched.
+fn load_config(path: &std::path::Path) -> Result<Option<SyncConfig>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = read_bounded(path).map_err(|error| error.to_string())?;
+    let config: SyncConfig =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    config.validate()?;
+    Ok(Some(config))
+}
+
+/// Resolve the TLS SAN this peer advertises. The file and the environment
+/// must agree when both are present: silently preferring one would advertise
+/// a name the peer certificate does not carry.
+fn resolve_server_name(
+    config: Option<&SyncConfig>,
+    from_env: Option<String>,
+) -> Result<Option<String>, String> {
+    let from_config = config
+        .and_then(|config| config.server_name.clone())
+        .filter(|name| !name.trim().is_empty());
+    let from_env = from_env.filter(|name| !name.trim().is_empty());
+    let name = match (from_config, from_env) {
+        (Some(config), Some(env)) if config != env => {
+            return Err(format!(
+                "Iroh server name conflict: iroh-sync.json advertises `{config}` but MYCELIUM_IROH_SERVER_NAME is `{env}`; make them agree"
+            ));
+        }
+        (Some(config), _) => Some(config),
+        (None, Some(env)) => Some(env),
+        (None, None) => None,
+    };
+    if let Some(name) = &name {
+        ServerName::try_from(name.clone())
+            .map_err(|_| format!("invalid Iroh server name `{name}`"))?;
+    }
+    Ok(name)
+}
+
+impl SyncStack {
+    /// Bind the transport endpoint. A reload reuses the stable UDP port, so
+    /// the previous transport may still be releasing it: a short retry keeps
+    /// a configuration change from leaving the peer without Iroh sync.
+    async fn bind(
+        options: &SyncOptions,
+        config: &SyncConfig,
+    ) -> Result<Endpoint, AnyError> {
+        let home = &options.home;
+        let port = options.port()?;
+        let mut delay = Duration::from_millis(100);
+        let mut last: Option<AnyError> = None;
+        for attempt in 0..5 {
+            let builder = Endpoint::builder(iroh::endpoint::presets::N0)
+                .secret_key(transport_key(&home.join("iroh-secret.key"))?)
+                .clear_ip_transports()
+                .bind_addr(format!("0.0.0.0:{port}"))?
+                .bind_addr_with_opts(
+                    format!("[::]:{port}"),
+                    iroh::endpoint::BindOpts::default().set_is_required(false),
+                )?
+                .clear_address_lookup()
+                .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+                .transport_config(
+                    iroh::endpoint::QuicTransportConfig::builder()
+                        .max_concurrent_bidi_streams(1u8.into())
+                        .max_concurrent_uni_streams(0u8.into())
+                        .build(),
+                )
+                .alpns(vec![ALPN.to_vec()]);
+            let builder = if config.public_relays {
+                builder
+            } else {
+                builder.relay_mode(iroh::RelayMode::Disabled)
+            };
+            match builder.bind().await {
+                Ok(endpoint) => return Ok(endpoint),
+                Err(error) => {
+                    let retryable = attempt < 4;
+                    last = Some(error.into());
+                    if !retryable {
+                        break;
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(1));
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| "Iroh endpoint did not bind".into()))
+    }
+
+    async fn start(
+        mesh: Arc<Mesh>,
+        tls: &TlsSettings,
+        options: &SyncOptions,
+        config: SyncConfig,
+        server_name: Option<String>,
+    ) -> Result<Self, AnyError> {
+        let home = options.home.clone();
+        let preferred: BTreeSet<_> = mesh.hello.interfaces.iter()
+            .filter(|interface| !["veth", "docker", "br-", "sh-"].iter().any(|prefix| interface.name.starts_with(prefix)))
+            .flat_map(|interface| interface.addresses.iter().copied()).collect();
+        let endpoint = Self::bind(options, &config).await?;
+        let mut hello = mesh.local_hello().await;
+        if !hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == "transport.iroh-key-binding")
+        {
+            hello.capabilities.push("transport.iroh-key-binding".into());
+            mesh.publish(PeerEvent::Hello(hello)).await?;
+        }
+        mesh.publish(PeerEvent::Transport(TransportCredentialBinding {
+            node_id: mesh.hello.node_id.clone(),
+            kind: TransportKind::Iroh,
+            public_key: endpoint.id().to_string(),
+            generation: now(),
+            valid_until: None,
+        }))
+        .await?;
+        let acceptor = TlsAcceptor::from(Arc::new(tls.server_config()?));
+        let connector = TlsConnector::from(Arc::new(tls.client_config()?));
+        let permits = Arc::new(tokio::sync::Semaphore::new(LIMIT));
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let listener = endpoint.clone();
+        let incoming_mesh = mesh.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Some(incoming) = listener.accept().await {
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    continue;
+                };
+                let mesh = incoming_mesh.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let result: Result<(), AnyError> = async {
+                        let connection = tokio::time::timeout(HANDSHAKE, incoming).await??;
+                        let (send, recv) =
+                            tokio::time::timeout(HANDSHAKE, connection.accept_bi()).await??;
+                        let stream = tokio::time::timeout(
+                            HANDSHAKE,
+                            acceptor.accept(tokio::io::join(recv, send)),
+                        )
+                        .await??;
+                        let fingerprint = tls_peer_fingerprint(stream.get_ref().1.peer_certificates());
+                        mesh.run_bound_stream(
+                            stream,
+                            fingerprint,
+                            None,
+                            Some(connection.remote_id().to_string()),
+                        )
+                        .await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        eprintln!("myceliumd: Iroh incoming sync: {error}");
+                    }
+                });
+            }
+        }));
+        let outgoing_mesh = mesh.clone();
+        let outgoing_endpoint = endpoint.clone();
+        let outgoing_config = config.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut running = BTreeMap::<String, tokio::task::JoinHandle<Result<(), AnyError>>>::new();
+            let mut retries = BTreeMap::<String, (u64, u64)>::new();
+            let configured: BTreeSet<_> = outgoing_config.seeds.iter().map(|seed| seed.endpoint.endpoint_id.clone()).collect();
+            // Give the concurrently starting TCP connector first opportunity.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            loop {
+                let at = now();
+                let finished: Vec<_> = running.iter().filter(|(_, task)| task.is_finished()).map(|(id, _)| id.clone()).collect();
+                for id in finished {
+                    let task = running.remove(&id).unwrap();
+                    match task.await {
+                        Ok(Ok(())) => { retries.insert(id, (at + 5, 5)); }
+                        result => {
+                            eprintln!("myceliumd: Iroh fallback {id}: {result:?}");
+                            let delay = retries.get(&id).map_or(5, |(_, delay)| (delay * 2).min(60));
+                            retries.insert(id, (at + delay, delay));
+                        }
                     }
                 }
+                let candidates = candidates(&outgoing_mesh, &outgoing_config.seeds, at).await;
+                retries.retain(|id, _| candidates.contains_key(id) || running.contains_key(id));
+                for (id, (owner, mut seed)) in candidates {
+                    if running.len() >= LIMIT { break; }
+                    if running.contains_key(&id) || retries.get(&id).is_some_and(|(next, _)| *next > at) { continue; }
+                    // Discovery adds sparse repair edges, not an all-to-all mesh.
+                    if !configured.contains(&id) && running.keys().filter(|key| !configured.contains(*key)).count() >= DISCOVERED_LINK_LIMIT { continue; }
+                    if !fallback_needed(&outgoing_mesh, owner.as_deref()) { continue; }
+                    if !outgoing_config.public_relays { seed.endpoint.relay_urls.clear(); }
+                    if seed.validate(None).is_err() { continue; }
+                    let mesh = outgoing_mesh.clone();
+                    let endpoint = outgoing_endpoint.clone();
+                    let connector = connector.clone();
+                    running.insert(id, tokio::spawn(dial_once(mesh, endpoint, connector, seed)));
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            let candidates = candidates(&outgoing_mesh, &config.seeds, at).await;
-            retries.retain(|id, _| candidates.contains_key(id) || running.contains_key(id));
-            for (id, (owner, mut seed)) in candidates {
-                if running.len() >= LIMIT { break; }
-                if running.contains_key(&id) || retries.get(&id).is_some_and(|(next, _)| *next > at) { continue; }
-                // Discovery adds sparse repair edges, not an all-to-all mesh.
-                if !configured.contains(&id) && running.keys().filter(|key| !configured.contains(*key)).count() >= DISCOVERED_LINK_LIMIT { continue; }
-                if !fallback_needed(&outgoing_mesh, owner.as_deref()) { continue; }
-                if !config.public_relays { seed.endpoint.relay_urls.clear(); }
-                if seed.validate(None).is_err() { continue; }
-                let mesh = outgoing_mesh.clone();
-                let endpoint = outgoing_endpoint.clone();
-                let connector = connector.clone();
-                running.insert(id, tokio::spawn(dial_once(mesh, endpoint, connector, seed)));
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+        }));
+        // A peer without an advertised TLS SAN still dials its seeds, but it
+        // publishes no rendezvous: an unusable hint is worse than none.
+        if let Some(server_name) = server_name.clone() {
+            let mesh = mesh.clone();
+            let endpoint = endpoint.clone();
+            let home = home.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let addr = endpoint.addr();
+                    let at = now();
+                    let rendezvous = SyncRendezvous {
+                        server_name: server_name.clone(),
+                        endpoint: mycelium_iroh_discovery::Endpoint {
+                            id: "mycelium-sync".into(),
+                            endpoint_id: addr.id.to_string(),
+                            alpns: BTreeSet::from([String::from_utf8_lossy(ALPN).into_owned()]),
+                            // Scoped link-local addresses cannot be dialed from a portable
+                            // rendezvous. Container hosts can otherwise overflow the
+                            // bounded discovery contract with per-veth IPv6 addresses.
+                            direct_addresses: portable_addresses(addr.ip_addrs().copied(), &preferred),
+                            relay_urls: addr.relay_urls().map(ToString::to_string).collect(),
+                            observed_at: at,
+                            expires_at: at + 120,
+                        },
+                    };
+                    let result: Result<(), AnyError> = (|| {
+                        rendezvous.validate(Some(at))?;
+                        let temp = home.join("iroh-rendezvous.json.tmp");
+                        std::fs::write(&temp, serde_json::to_vec(&rendezvous)?)?;
+                        std::fs::rename(temp, home.join("iroh-rendezvous.json"))?;
+                        let document = mycelium_iroh_discovery::Document {
+                            schema_version: 1,
+                            endpoints: vec![rendezvous.endpoint.clone()],
+                        };
+                        let temp = home.join("iroh-sync-endpoints.json.tmp");
+                        std::fs::write(&temp, serde_json::to_vec(&document)?)?;
+                        std::fs::rename(temp, home.join("iroh-sync-endpoints.json"))?;
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        eprintln!("myceliumd: Iroh rendezvous refresh: {error}");
+                    } else if let Err(error) = mesh.publish(PeerEvent::SyncHints(mycelium_peer_protocol::SyncHints {
+                        node_id: mesh.node_id().into(),
+                        endpoint_id: rendezvous.endpoint.endpoint_id.clone(),
+                        server_name: rendezvous.server_name.clone(),
+                        direct_addresses: rendezvous.endpoint.direct_addresses.clone(),
+                        relay_urls: rendezvous.endpoint.relay_urls.clone(),
+                        observed_at: at,
+                        expires_at: rendezvous.endpoint.expires_at,
+                    })).await {
+                        eprintln!("myceliumd: Iroh hint gossip: {error}");
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }));
         }
-    });
-    tokio::spawn(async move {
-        loop {
-            let addr = endpoint.addr();
-            let at = now();
-            let rendezvous = SyncRendezvous {
-                server_name: server_name.clone(),
-                endpoint: mycelium_iroh_discovery::Endpoint {
-                    id: "mycelium-sync".into(),
-                    endpoint_id: addr.id.to_string(),
-                    alpns: BTreeSet::from([String::from_utf8_lossy(ALPN).into_owned()]),
-                    // Scoped link-local addresses cannot be dialed from a portable
-                    // rendezvous. Container hosts can otherwise overflow the
-                    // bounded discovery contract with per-veth IPv6 addresses.
-                    direct_addresses: portable_addresses(addr.ip_addrs().copied(), &preferred),
-                    relay_urls: addr.relay_urls().map(ToString::to_string).collect(),
-                    observed_at: at,
-                    expires_at: at + 120,
-                },
-            };
-            let result: Result<(), AnyError> = (|| {
-                rendezvous.validate(Some(at))?;
-                let temp = home.join("iroh-rendezvous.json.tmp");
-                std::fs::write(&temp, serde_json::to_vec(&rendezvous)?)?;
-                std::fs::rename(temp, home.join("iroh-rendezvous.json"))?;
-                let document = mycelium_iroh_discovery::Document {
-                    schema_version: 1,
-                    endpoints: vec![rendezvous.endpoint.clone()],
-                };
-                let temp = home.join("iroh-sync-endpoints.json.tmp");
-                std::fs::write(&temp, serde_json::to_vec(&document)?)?;
-                std::fs::rename(temp, home.join("iroh-sync-endpoints.json"))?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                eprintln!("myceliumd: Iroh rendezvous refresh: {error}");
-            } else if let Err(error) = mesh.publish(PeerEvent::SyncHints(mycelium_peer_protocol::SyncHints {
-                node_id: mesh.node_id().into(),
-                endpoint_id: rendezvous.endpoint.endpoint_id.clone(),
-                server_name: rendezvous.server_name.clone(),
-                direct_addresses: rendezvous.endpoint.direct_addresses.clone(),
-                relay_urls: rendezvous.endpoint.relay_urls.clone(),
-                observed_at: at,
-                expires_at: rendezvous.endpoint.expires_at,
-            })).await {
-                eprintln!("myceliumd: Iroh hint gossip: {error}");
-            }
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        }
-    });
-    Ok(())
+        Ok(Self { endpoint, tasks, config, server_name })
+    }
 }
 
 #[cfg(test)]
@@ -546,6 +831,7 @@ mod tests {
         assert!(SyncConfig {
             public_relays: false,
             direct_first: true,
+            server_name: None,
             seeds: vec![r.clone(), r]
         }
         .validate()
@@ -553,6 +839,7 @@ mod tests {
         assert!(SyncConfig {
             public_relays: true,
             direct_first: false,
+            server_name: None,
             seeds: vec![]
         }
         .validate()
@@ -561,6 +848,72 @@ mod tests {
         // An older config without the field defaults to direct-first.
         let parsed: SyncConfig = serde_json::from_str(r#"{"public_relays":true,"seeds":[]}"#).unwrap();
         assert!(parsed.direct_first);
+        assert!(parsed.server_name.is_none());
+    }
+
+    #[test]
+    fn config_loading_is_bounded_and_validated() {
+        let dir = std::env::temp_dir().join(format!(
+            "mycelium-sync-config-{}-{}",
+            std::process::id(),
+            SecretKey::generate().public()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("iroh-sync.json");
+        // A missing file means "Iroh sync is off", not an error.
+        assert!(load_config(&path).unwrap().is_none());
+        std::fs::write(
+            &path,
+            br#"{"public_relays":true,"direct_first":true,"server_name":"peer.test","seeds":[]}"#,
+        )
+        .unwrap();
+        let config = load_config(&path).unwrap().unwrap();
+        assert!(config.public_relays);
+        assert_eq!(config.server_name.as_deref(), Some("peer.test"));
+        // Unknown fields, bad policies, and oversized documents are refused
+        // instead of silently changing the transport.
+        std::fs::write(&path, br#"{"ssh_access":true}"#).unwrap();
+        assert!(load_config(&path).is_err());
+        std::fs::write(&path, br#"{"direct_first":false}"#).unwrap();
+        assert!(load_config(&path).is_err());
+        let oversized = format!(
+            "{{\"direct_first\":true,\"seeds\":[],\"server_name\":\"{}\"}}",
+            "a".repeat(70 * 1024)
+        );
+        std::fs::write(&path, oversized.as_bytes()).unwrap();
+        assert!(load_config(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn advertised_server_name_never_silently_disagrees() {
+        let config = SyncConfig {
+            server_name: Some("peer.test".into()),
+            ..SyncConfig::default()
+        };
+        assert_eq!(
+            resolve_server_name(Some(&config), None).unwrap().as_deref(),
+            Some("peer.test")
+        );
+        assert_eq!(
+            resolve_server_name(Some(&config), Some("peer.test".into()))
+                .unwrap()
+                .as_deref(),
+            Some("peer.test")
+        );
+        // A file/environment disagreement is an explicit error, not a choice.
+        assert!(resolve_server_name(Some(&config), Some("other.test".into())).is_err());
+        // The environment still works on its own.
+        assert_eq!(
+            resolve_server_name(None, Some("env.test".into()))
+                .unwrap()
+                .as_deref(),
+            Some("env.test")
+        );
+        // No name at all is not fatal: the peer still dials its seeds.
+        assert!(resolve_server_name(None, None).unwrap().is_none());
+        // A name that is not a valid TLS server name is refused.
+        assert!(resolve_server_name(None, Some("not a name".into())).is_err());
     }
 
     #[test]
@@ -582,6 +935,114 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(transport_key(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Write peer TLS material to disk so the supervisor can build the same
+    /// mTLS configuration the daemon uses.
+    fn tls_material(home: &std::path::Path) -> TlsSettings {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut params = CertificateParams::new(vec!["ca.test".into()]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = params.self_signed(&ca_key).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["peer.test".into()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+        std::fs::write(home.join("ca.pem"), ca.pem()).unwrap();
+        std::fs::write(home.join("node.pem"), leaf.pem()).unwrap();
+        std::fs::write(home.join("node-key.pem"), leaf_key.serialize_pem()).unwrap();
+        TlsSettings {
+            listen: None,
+            seeds: Vec::new(),
+            ca: home.join("ca.pem").to_string_lossy().into_owned(),
+            cert: home.join("node.pem").to_string_lossy().into_owned(),
+            key: home.join("node-key.pem").to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Pick a UDP port the endpoint can bind. The IPv6 address is optional in
+    /// the endpoint, so only the IPv4 bind has to be available.
+    fn free_udp_port() -> u16 {
+        for _ in 0..64 {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = socket.local_addr().unwrap().port();
+            drop(socket);
+            let ipv4 = std::net::UdpSocket::bind(("0.0.0.0", port));
+            if ipv4.is_err() {
+                continue;
+            }
+            drop(ipv4);
+            return port;
+        }
+        panic!("no free UDP port for the Iroh endpoint");
+    }
+
+    #[tokio::test]
+    async fn supervisor_applies_configuration_without_a_restart() {
+        let home = std::env::temp_dir().join(format!(
+            "mycelium-sync-reload-{}-{}",
+            std::process::id(),
+            SecretKey::generate().public()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let tls = tls_material(&home);
+        let options = SyncOptions {
+            home: home.clone(),
+            port: Some(free_udp_port().to_string()),
+            server_name: None,
+        };
+        let supervisor = SyncSupervisor::new(Mesh::ephemeral_for_test(), tls, options);
+
+        // Without a configuration file the transport stays idle.
+        let status = supervisor.apply().await.unwrap();
+        assert!(!status.enabled);
+        assert!(!status.running);
+        assert!(status.error.is_none());
+
+        // A valid configuration binds the endpoint without a daemon restart.
+        std::fs::write(
+            home.join("iroh-sync.json"),
+            br#"{"public_relays":false,"direct_first":true,"server_name":"peer.test","seeds":[]}"#,
+        )
+        .unwrap();
+        let status = supervisor.apply().await.unwrap();
+        assert!(status.enabled);
+        assert!(status.running);
+        assert_eq!(status.server_name.as_deref(), Some("peer.test"));
+        let endpoint = status.endpoint_id.clone().expect("an endpoint identity");
+        assert_eq!(endpoint.len(), 64);
+
+        // An invalid configuration is refused and the running transport stays.
+        std::fs::write(home.join("iroh-sync.json"), br#"{"direct_first":false}"#).unwrap();
+        assert!(supervisor.apply().await.is_err());
+        let status = supervisor.status().await;
+        assert!(status.running);
+        assert!(status.error.is_some());
+        assert_eq!(status.endpoint_id.as_deref(), Some(endpoint.as_str()));
+
+        // A corrected configuration is applied by the next reload. The
+        // transport identity is stable: only the transport secret key decides
+        // the endpoint id, never the configuration.
+        std::fs::write(
+            home.join("iroh-sync.json"),
+            br#"{"public_relays":false,"direct_first":true,"server_name":"other.test","seeds":[]}"#,
+        )
+        .unwrap();
+        let status = supervisor.apply().await.unwrap();
+        assert!(status.running);
+        assert_eq!(status.server_name.as_deref(), Some("other.test"));
+        assert_eq!(status.endpoint_id.as_deref(), Some(endpoint.as_str()));
+
+        // Removing the configuration disables the transport.
+        std::fs::remove_file(home.join("iroh-sync.json")).unwrap();
+        let status = supervisor.apply().await.unwrap();
+        assert!(!status.enabled);
+        assert!(!status.running);
+        assert!(status.error.is_none());
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     fn tls_pair() -> (TlsAcceptor, TlsConnector) {

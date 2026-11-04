@@ -16,7 +16,7 @@ pub const MAX_DOCUMENT_BYTES: usize = 65536;
 pub const MAX_LEASE_SECONDS: u64 = 300;
 pub const SERVICE_TYPE: &str = "_iroh._udp";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
     pub id: String,

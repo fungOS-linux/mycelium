@@ -93,8 +93,8 @@ mycelium — control plane for your network appliances
 
 usage:
   mycelium completions zsh|bash|fish
-  mycelium sync enable --write | export [--qr] | join <rendezvous.json> --write
-  mycelium sync relays enable|disable --write
+  mycelium sync enable --write [--server-name SAN] | export [--qr] | join <rendezvous.json> --write
+  mycelium sync relays enable|disable --write | reload | status
   mycelium pair --kind peer --iroh --qr --name NAME --site SITE [--public-relays] [--ttl 15m]
   mycelium setup [--gateway HTTPS-URL] [--claim CODE|--claim-file PATH] [--system-service] [--ttl 8h] [--key PATH] [--certificate PATH]
   mycelium setup --repair [--site SITE] [--path MYCELIUM-HOME] [--system-service]
@@ -492,7 +492,7 @@ async fn run(cmd: &str, args: &[String]) -> Result<Vec<String>, ClientError> {
     match cmd {
         "setup" => setup::run(args).await.map_err(access_error),
         "pair" => pair::run(args).await.map_err(access_error),
-        "sync" => sync::run(args).map_err(access_error),
+        "sync" => sync::run(args).await.map_err(access_error),
         "invite" => invite::run(args).map_err(access_error),
         "daemon" => daemon(args).await,
         "skills" => skills::run(args),

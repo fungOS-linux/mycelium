@@ -44,7 +44,7 @@ type AnyError = Box<dyn Error + Send + Sync>;
 #[cfg(feature = "iroh-sync")]
 mod iroh_sync;
 #[cfg(feature = "iroh-sync")]
-pub use iroh_sync::{SyncConfig, SyncRendezvous};
+pub use iroh_sync::{SyncConfig, SyncRendezvous, SyncStatus};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerView {
@@ -103,6 +103,10 @@ pub struct Mesh {
     trusted_release_keys: BTreeSet<String>,
     trusted_access_keys: BTreeSet<String>,
     require_transport_binding: bool,
+    /// Optional Iroh sync transport. The supervisor applies `iroh-sync.json`
+    /// changes without restarting the daemon or dropping the mesh.
+    #[cfg(feature = "iroh-sync")]
+    sync: std::sync::Mutex<Option<iroh_sync::SyncSupervisor>>,
 }
 
 impl Mesh {
@@ -168,6 +172,42 @@ impl Mesh {
         Ok(hello)
     }
 
+    /// Re-read `iroh-sync.json` and apply it without restarting the daemon.
+    /// Enrollment, trust, and the signed observation log are untouched: only
+    /// the optional Iroh transport is rebuilt.
+    #[cfg(feature = "iroh-sync")]
+    pub async fn reload_sync(&self) -> Result<SyncStatus, String> {
+        let supervisor = self
+            .sync
+            .lock()
+            .expect("Iroh sync supervisor lock poisoned")
+            .clone();
+        match supervisor {
+            Some(supervisor) => supervisor.apply().await,
+            None => Err(
+                "this daemon has no peer transport: Iroh sync needs MYCELIUM_PEER_CA/CERT/KEY, then a daemon restart"
+                    .into(),
+            ),
+        }
+    }
+
+    /// Current Iroh sync state, when this build supports it.
+    #[cfg(feature = "iroh-sync")]
+    pub async fn sync_status(&self) -> Result<SyncStatus, String> {
+        let supervisor = self
+            .sync
+            .lock()
+            .expect("Iroh sync supervisor lock poisoned")
+            .clone();
+        match supervisor {
+            Some(supervisor) => Ok(supervisor.status().await),
+            None => Err(
+                "this daemon has no peer transport: Iroh sync needs MYCELIUM_PEER_CA/CERT/KEY"
+                    .into(),
+            ),
+        }
+    }
+
     #[cfg(test)]
     pub fn ephemeral_for_test() -> Arc<Self> {
         let key = SigningKey::from_bytes(&[3; 32]);
@@ -197,6 +237,8 @@ impl Mesh {
             trusted_release_keys: BTreeSet::new(),
             trusted_access_keys: BTreeSet::new(),
             require_transport_binding: false,
+            #[cfg(feature = "iroh-sync")]
+            sync: std::sync::Mutex::new(None),
         })
     }
 
@@ -291,6 +333,8 @@ impl Mesh {
             trusted_release_keys,
             trusted_access_keys,
             require_transport_binding,
+            #[cfg(feature = "iroh-sync")]
+            sync: std::sync::Mutex::new(None),
         }))
     }
 
@@ -374,7 +418,25 @@ impl Mesh {
             .await?;
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             #[cfg(feature = "iroh-sync")]
-            iroh_sync::start(self.clone(), &tls).await?;
+            {
+                // Iroh sync is an optional transport: a bad configuration must
+                // never keep the daemon (and its TCP gossip path) down.
+                let options = iroh_sync::SyncOptions::from_env(crate::home_dir());
+                let supervisor = iroh_sync::SyncSupervisor::new(self.clone(), tls.clone(), options);
+                match supervisor.apply().await {
+                    Ok(status) => eprintln!(
+                        "myceliumd: Iroh sync {} ({} seed(s), public relays {})",
+                        if status.running { "running" } else { "idle" },
+                        status.seeds,
+                        if status.public_relays { "enabled" } else { "disabled" },
+                    ),
+                    Err(error) => eprintln!("myceliumd: Iroh sync not started: {error}"),
+                }
+                *self
+                    .sync
+                    .lock()
+                    .expect("Iroh sync supervisor lock poisoned") = Some(supervisor);
+            }
             if let Some(address) = tls.listen.clone() {
                 let mesh = self.clone();
                 let acceptor = TlsAcceptor::from(Arc::new(tls.server_config()?));
