@@ -137,6 +137,13 @@ impl Purpose {
         Self("otp.generate".into())
     }
 
+    /// Read a free-form secure note. A note is opaque text the owner keeps in
+    /// geode rather than in durable configuration; this purpose is the only
+    /// allowlist entry a note needs.
+    pub fn secure_note() -> Self {
+        Self("secure_note.read".into())
+    }
+
     pub fn mcp_invoke() -> Self {
         Self("mcp.invoke".into())
     }
@@ -194,6 +201,11 @@ pub enum CredentialKind {
     OtpSecret,
     Passkey,
     Certificate,
+    /// Free-form free text the owner wants kept out of durable configuration:
+    /// a password manager note, an incident write-up, a Wi-Fi passphrase hint.
+    /// The body stays opaque; `SecureNote` only lets a connector recognize that
+    /// an entry is a note rather than something to connect to.
+    SecureNote,
 }
 
 impl CredentialKind {
@@ -207,6 +219,7 @@ impl CredentialKind {
             Self::OtpSecret => "otp_secret",
             Self::Passkey => "passkey",
             Self::Certificate => "certificate",
+            Self::SecureNote => "secure_note",
         }
     }
 }

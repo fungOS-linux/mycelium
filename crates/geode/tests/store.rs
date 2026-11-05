@@ -345,6 +345,37 @@ fn typed_credentials_carry_a_kind_and_a_credential_expiry() {
 }
 
 #[test]
+fn secure_note_is_an_opaque_secret_revealed_through_its_own_purpose() {
+    let (store, _manual, _shared) = store_at(1_000);
+    let reference = GeodeRef::parse("geode://notes/home/wifi").unwrap();
+    let note = "guest password: hunter2\nreset: phone the office";
+    let meta = store
+        .insert(
+            &reference,
+            geode::NewCredential::secure_note(note)
+                .with_purpose(Purpose::secure_note())
+                .with_label("home wifi"),
+        )
+        .unwrap();
+    assert_eq!(meta.kind, geode::CredentialKind::SecureNote);
+    assert_eq!(meta.kind.as_str(), "secure_note");
+    // A note carries no credential expiry; the body is opaque bytes.
+    assert_eq!(meta.expires_at, None);
+    assert_eq!(meta.label.as_deref(), Some("home wifi"));
+
+    let lease = store
+        .lease(&reference, &Purpose::secure_note(), Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(lease.expose_str().unwrap(), note);
+
+    // A note is readable only through its own purpose, never a connection one.
+    assert!(matches!(
+        store.lease(&reference, &Purpose::http_basic(), Duration::from_secs(5),),
+        Err(GeodeError::PurposeNotAllowed { .. })
+    ));
+}
+
+#[test]
 fn renew_rotates_the_secret_and_expiry_but_keeps_identity() {
     let (store, manual, _shared) = store_at(1_000);
     let reference = GeodeRef::parse("geode://oauth/example/refresh").unwrap();

@@ -74,6 +74,13 @@ impl NewCredential {
         Self::new(CredentialKind::OtpSecret, secret)
     }
 
+    /// Create a free-form secure note. The body is the opaque secret; the
+    /// `label` is its title. A note carries no credential expiry and is read
+    /// through [`Purpose::secure_note`].
+    pub fn secure_note(secret: impl Into<SecretBytes>) -> Self {
+        Self::new(CredentialKind::SecureNote, secret)
+    }
+
     pub fn with_purpose(mut self, purpose: Purpose) -> Self {
         self.purposes.insert(purpose);
         self
