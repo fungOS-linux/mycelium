@@ -26,6 +26,8 @@ mod secret;
 mod store;
 
 pub use audit::{AuditEvent, AuditLog, AuditOutcome, DenyReason};
+#[cfg(target_os = "macos")]
+pub use backend::KeychainBackend;
 pub use backend::{Backend, EnvBackend, MemoryBackend, StoredRecord, UnsupportedBackend};
 pub use clock::{Clock, ManualClock, SharedClock, SystemClock};
 pub use error::GeodeError;

@@ -1,5 +1,7 @@
 mod disk;
 mod env;
+#[cfg(target_os = "macos")]
+mod keychain;
 mod memory;
 
 use std::fmt;
@@ -10,6 +12,8 @@ use crate::GeodeError;
 
 pub use disk::DiskBackend;
 pub use env::EnvBackend;
+#[cfg(target_os = "macos")]
+pub use keychain::KeychainBackend;
 pub use memory::MemoryBackend;
 
 /// One stored item: the secret plus its non-secret description.
