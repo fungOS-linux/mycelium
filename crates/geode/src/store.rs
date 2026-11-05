@@ -170,6 +170,7 @@ impl<B: Backend> Store<B> {
             last_used_at: existing.as_ref().and_then(|r| r.meta.last_used_at),
             expires_at: credential.expires_at,
             purposes: credential.purposes,
+            revoked_at: None,
         };
         meta.validate()?;
 
@@ -215,6 +216,7 @@ impl<B: Backend> Store<B> {
             last_used_at: existing.meta.last_used_at,
             expires_at,
             purposes: existing.meta.purposes.clone(),
+            revoked_at: existing.meta.revoked_at,
         };
         meta.validate()?;
         self.backend
@@ -262,6 +264,11 @@ impl<B: Backend> Store<B> {
             );
             return Err(GeodeError::NotFound(reference.to_string()));
         };
+
+        if record.meta.revoked_at.is_some() {
+            self.record(reference, Some(purpose.clone()), AuditOutcome::Revoked);
+            return Err(GeodeError::Revoked(reference.to_string()));
+        }
 
         if !record.meta.purposes.contains(purpose) {
             self.record(
@@ -325,6 +332,37 @@ impl<B: Backend> Store<B> {
             self.record(reference, None, AuditOutcome::Deleted);
         }
         Ok(deleted)
+    }
+
+    /// Revoke an entry: tombstone it, and refuse further secret access.
+    ///
+    /// The record stays on disk (so operators can still see *that* and *when*
+    /// it was revoked via [`Self::describe`]); the tombstone stops new leases
+    /// and is recorded in the audit log. Revocation is prospective: already
+    /// issued leases have no revoke point and cannot be killed retroactively, so
+    /// a bare revoke stops fresh pulls. Rotating or re-encrypting the shared key
+    /// (or the underlying secret) is what actually purges copies in the field.
+    ///
+    /// Returns whether an entry existed at the reference.
+    pub fn revoke(&self, reference: &GeodeRef) -> Result<bool, GeodeError> {
+        self.require_writable()?;
+        let existed = match self.backend.read(reference)? {
+            Some(record) => {
+                let now = self.clock.now();
+                let meta = SecretMeta {
+                    revoked_at: Some(now),
+                    ..record.meta.clone()
+                };
+                self.backend
+                    .write(reference, StoredRecord::new(record.secret, meta))?;
+                true
+            }
+            None => false,
+        };
+        if existed {
+            self.record(reference, None, AuditOutcome::Revoked);
+        }
+        Ok(existed)
     }
 
     /// Read non-secret metadata without issuing a lease.

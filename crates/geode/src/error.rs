@@ -14,6 +14,8 @@ pub enum GeodeError {
     EmptyPurposeSet,
     #[error("no secret stored at {0}")]
     NotFound(String),
+    #[error("the credential at {0} is revoked")]
+    Revoked(String),
     #[error("purpose `{purpose}` is not allowed for {reference}")]
     PurposeNotAllowed { reference: String, purpose: String },
     #[error("the credential at {reference} expired at {expired_at}")]

@@ -87,6 +87,7 @@ impl Backend for EnvBackend {
                         last_used_at: None,
                         expires_at: None,
                         purposes: self.purposes.clone(),
+                        revoked_at: None,
                     },
                 )))
             }

@@ -243,6 +243,12 @@ pub struct SecretMeta {
     pub label: Option<String>,
     pub created_at: u64,
     pub rotated_at: u64,
+    /// Unix timestamp at which the credential was revoked (tombstoned), if ever.
+    ///
+    /// This is non-secret *state*, the same category as `rotated_at`: an operator
+    /// can see that an entry is revoked and when, but never the secret itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<u64>,
     /// Absolute credential expiry, distinct from a lease's expiry. Access tokens

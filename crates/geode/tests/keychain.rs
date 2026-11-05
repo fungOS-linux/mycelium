@@ -96,6 +96,7 @@ fn keychain_backend_reports_not_found_and_updates_in_place() {
         last_used_at: None,
         expires_at: None,
         purposes: std::collections::BTreeSet::from([Purpose::test()]),
+        revoked_at: None,
     };
     meta.validate().expect("meta valid");
     backend

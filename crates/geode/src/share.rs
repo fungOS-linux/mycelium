@@ -35,7 +35,9 @@ impl Security {
 
     fn parse(value: &str) -> Option<Self> {
         match value {
-            "open" | "WPA" | "wpa" => Some(Security::Wpa),
+            "open" | "nopassword" | "none" | "no-password" | "wpa" | "wpa-passphrase" => {
+                Some(Security::Open)
+            }
             "wpa2" | "WPA2" => Some(Security::Wpa2),
             "wpa3" | "WPA3" => Some(Security::Wpa3),
             _ => None,

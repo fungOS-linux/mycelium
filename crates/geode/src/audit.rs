@@ -21,8 +21,13 @@ pub enum AuditOutcome {
     Stored,
     Rotated,
     Deleted,
-    Issued { ttl_secs: u64 },
+    Issued {
+        ttl_secs: u64,
+    },
     Denied(DenyReason),
+    /// The credential at a reference was revoked (tombstoned), or a read was
+    /// refused because the entry had been revoked.
+    Revoked,
 }
 
 /// A non-secret record of a store decision.
