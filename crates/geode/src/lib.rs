@@ -22,7 +22,9 @@ mod error;
 mod lease;
 mod passwords;
 mod reference;
+mod sealed;
 mod secret;
+mod share;
 mod store;
 
 pub use audit::{AuditEvent, AuditLog, AuditOutcome, DenyReason};
@@ -34,5 +36,7 @@ pub use error::GeodeError;
 pub use lease::Lease;
 pub use passwords::{built_in_wordlist, PasswordGenerator, PhraseGenerator, Requirements};
 pub use reference::GeodeRef;
+pub use sealed::{GroupKey, SealedEnvelope, SealedError};
 pub use secret::{CredentialKind, Purpose, SecretBytes, SecretMeta};
+pub use share::{device_has_access, DeviceGroupKeys, Security, WifiNetwork};
 pub use store::{NewCredential, Store, MAX_LEASE, MIN_LEASE};
