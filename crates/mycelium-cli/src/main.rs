@@ -203,7 +203,8 @@ usage:
   mycelium wireguard bindings [--json]
   mycelium egress list [--json]
   mycelium egress probe --server HOST:PORT... [--bind IP] [--port PORT] [--json]
-  mycelium dns zone [--suffix DOMAIN] [--json]
+  mycelium dns zone [--zone lan|overlay|all] [--suffix DOMAIN] [--json]
+  mycelium proxy status [--json]
   mycelium security status|events [--json]
   mycelium security scan [--stig-content PATH --stig-profile ID] [--remediation-plan] [--json]
   mycelium security sinks list [--json]
@@ -661,6 +662,7 @@ async fn run(cmd: &str, args: &[String]) -> Result<Vec<String>, ClientError> {
         "wireguard" => wireguard_command(args).await,
         "egress" => egress_command(args).await,
         "dns" => dns_command(args).await,
+        "proxy" => proxy_command(args).await,
         "security" => security_command(args).await,
         "enroll" => enroll_command(args).await,
         "annotate" => {
@@ -1480,6 +1482,46 @@ async fn egress_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     Ok(lines)
 }
 
+async fn proxy_command(args: &[String]) -> Result<Vec<String>, ClientError> {
+    match args.first().map(String::as_str).unwrap_or("status") {
+        "status" => {
+            let mut client = connect().await?;
+            let status = client.call(&Request::ProxyStatus).await?;
+            if args.iter().any(|arg| arg == "--json") {
+                return Ok(vec![serde_json::to_string(&status).map_err(|error| {
+                    err_usage(&format!("serialize proxy status: {error}"))
+                })?]);
+            }
+            Ok(vec![format!(
+                "service proxy: enabled={} listen={} relays={} loopback_targets={} alpn={}",
+                status
+                    .get("enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                status
+                    .get("listen")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?"),
+                status
+                    .get("public_relays")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                status
+                    .get("allow_loopback_targets")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                status
+                    .get("service_alpn")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?"),
+            )])
+        }
+        other => Err(err_usage(&format!(
+            "proxy currently supports `status`, not `{other}`"
+        ))),
+    }
+}
+
 async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     if args.first().map(String::as_str) != Some("zone") {
         return Err(err_usage("dns currently supports `zone`"));
@@ -1489,14 +1531,37 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
         .find(|pair| pair[0] == "--suffix")
         .map(|pair| pair[1].as_str())
         .unwrap_or("mycelium");
+    let zone = args
+        .windows(2)
+        .find(|pair| pair[0] == "--zone")
+        .map(|pair| pair[1].as_str())
+        .unwrap_or("lan");
     let mut client = connect().await?;
     let topology: Topology = serde_json::from_value(client.call(&Request::Topology).await?)
         .map_err(|error| err_usage(&format!("invalid topology response: {error}")))?;
     let bindings: Vec<mycelium_peer_protocol::WireGuardBinding> =
         serde_json::from_value(client.call(&Request::WireGuardBindingList).await?)
             .map_err(|error| err_usage(&format!("invalid WireGuard bindings: {error}")))?;
-    let records =
-        dns::derive_records(&topology, &bindings, suffix).map_err(|error| err_usage(&error))?;
+    // LAN zone: `node.site.<suffix>` -> a LAN address reached through a signed
+    // site route. Overlay zone: `node.<suffix>` -> the node's transport-agnostic
+    // overlay address. `all` emits both.
+    let mut records = Vec::new();
+    if matches!(zone, "lan" | "all") {
+        records.extend(
+            dns::derive_records(&topology, &bindings, suffix)
+                .map_err(|error| err_usage(&error))?,
+        );
+    }
+    if matches!(zone, "overlay" | "all") {
+        records.extend(
+            dns::derive_overlay_records(&topology, suffix).map_err(|error| err_usage(&error))?,
+        );
+    }
+    if !matches!(zone, "lan" | "overlay" | "all") {
+        return Err(err_usage("--zone must be `lan`, `overlay`, or `all`"));
+    }
+    records.sort();
+    records.dedup();
     if args.iter().any(|arg| arg == "--json") {
         return Ok(vec![serde_json::to_string(&records).map_err(|error| {
             err_usage(&format!("serialize DNS records: {error}"))
