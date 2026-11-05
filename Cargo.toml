@@ -10,6 +10,7 @@ repository = "https://github.com/ajmwagar/mycelium"
 
 [workspace.dependencies]
 mycelium-core = { path = "crates/mycelium-core" }
+geode = { path = "crates/geode" }
 mycelium-network-types = { path = "crates/mycelium-network-types" }
 mycelium-tailscale = { path = "crates/mycelium-tailscale" }
 mycelium-dnssd = { path = "crates/mycelium-dnssd" }
@@ -41,6 +42,7 @@ rustls = "0.23"
 rustls-pemfile = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
 
 [profile.release]
 lto = "thin"
