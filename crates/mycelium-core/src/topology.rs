@@ -412,6 +412,10 @@ pub enum Observation {
     Lease { lease: LeaseRecord, origin: Origin },
 }
 
+/// The single overlay network name the mycelium mesh publishes. One address
+/// space is shared by the WireGuard fast path and the proxy+iroh fallback.
+pub const MYCELIUM_OVERLAY_NETWORK: &str = "mycelium0";
+
 /// A node in the merged graph: one host, or one appliance device.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct TopoNode {
@@ -496,6 +500,30 @@ fn node_key(mac: Option<MacAddress>, ip: IpAddr, site: Option<&str>) -> String {
             Some(site) => format!("site:{site}:ip:{ip}"),
             None => format!("ip:{ip}"),
         },
+    }
+}
+
+impl TopoNode {
+    /// Addresses this node holds within a named overlay network, matched by
+    /// the origin that recorded them. Overlay addresses are transport-agnostic:
+    /// the same address space is served by a WireGuard fast path or a local
+    /// proxy over iroh depending on reachability, so callers must not infer a
+    /// transport from an address belonging to this set.
+    pub fn overlay_ips(&self, network: &str) -> BTreeSet<IpAddr> {
+        let keys = self
+            .overlays
+            .values()
+            .filter(|record| record.network == network)
+            .map(|record| origin_key(&record.origin))
+            .collect::<BTreeSet<_>>();
+        if keys.is_empty() {
+            return BTreeSet::new();
+        }
+        self.ips
+            .iter()
+            .filter(|(_, record)| record.origins.iter().any(|origin| keys.contains(origin)))
+            .map(|(ip, _)| *ip)
+            .collect()
     }
 }
 

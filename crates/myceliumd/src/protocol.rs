@@ -220,6 +220,8 @@ pub enum Request {
         #[serde(default)]
         dry_run: bool,
     },
+    /// Report the local `.myc` service proxy configuration and listener state.
+    ProxyStatus,
     SecurityPostureList,
     SecurityEventList,
     SecuritySinkList,

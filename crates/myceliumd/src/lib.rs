@@ -31,9 +31,12 @@ pub use iroh as iroh_transport;
 pub mod local_services;
 pub mod node_profile;
 pub mod protocol;
+#[cfg(feature = "iroh-sync")]
+pub mod proxy;
 pub mod resources;
 pub mod rpc;
 mod security;
+pub mod service;
 mod service_env;
 pub mod services;
 pub mod siem;

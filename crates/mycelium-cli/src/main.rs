@@ -249,7 +249,7 @@ usage:
   mycelium wireguard bindings [--json]
   mycelium egress list [--json]
   mycelium egress probe --server HOST:PORT... [--bind IP] [--port PORT] [--json]
-  mycelium dns zone [--suffix DOMAIN] [--json]
+  mycelium dns zone [--zone lan|overlay|all] [--suffix DOMAIN] [--site SITE] [--json]
   mycelium dns service-address --prefix CIDR [--json]
   mycelium dns plan --site SITE [--suffix DOMAIN] [--delegations FILE] [--json|--dnsmasq]
   mycelium dns resolver init --config FILE --site SITE --suffix DOMAIN --reachable CIDR... --write [--service-address CIDR] [--doh URL [--doh-listen ADDR]]
@@ -257,6 +257,7 @@ usage:
   mycelium dns resolver apply|run|system-install|system-remove --config FILE --write [--dry-run]
   mycelium dns blocklist plan --source FILE... [--allow DOMAIN]... [--action sinkhole|nxdomain] [--json|--dnsmasq]
   mycelium dns blocklist check NAME --source FILE... [--allow DOMAIN]... [--json]
+  mycelium proxy status [--json]
   mycelium security status|events [--json]
   mycelium security scan [--stig-content PATH --stig-profile ID] [--remediation-plan] [--json]
   mycelium security sinks list [--json]
@@ -717,6 +718,7 @@ async fn run(cmd: &str, args: &[String]) -> Result<Vec<String>, ClientError> {
         "wireguard" => wireguard_command(args).await,
         "egress" => egress_command(args).await,
         "dns" => dns_command(args).await,
+        "proxy" => proxy_command(args).await,
         "security" => security_command(args).await,
         "enroll" => enroll_command(args).await,
         "annotate" => {
@@ -1621,6 +1623,46 @@ async fn egress_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     Ok(lines)
 }
 
+async fn proxy_command(args: &[String]) -> Result<Vec<String>, ClientError> {
+    match args.first().map(String::as_str).unwrap_or("status") {
+        "status" => {
+            let mut client = connect().await?;
+            let status = client.call(&Request::ProxyStatus).await?;
+            if args.iter().any(|arg| arg == "--json") {
+                return Ok(vec![serde_json::to_string(&status).map_err(|error| {
+                    err_usage(&format!("serialize proxy status: {error}"))
+                })?]);
+            }
+            Ok(vec![format!(
+                "service proxy: enabled={} listen={} relays={} loopback_targets={} alpn={}",
+                status
+                    .get("enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                status
+                    .get("listen")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?"),
+                status
+                    .get("public_relays")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                status
+                    .get("allow_loopback_targets")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                status
+                    .get("service_alpn")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?"),
+            )])
+        }
+        other => Err(err_usage(&format!(
+            "proxy currently supports `status`, not `{other}`"
+        ))),
+    }
+}
+
 async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     let action = args.first().map(String::as_str).unwrap_or("");
     if action == "resolver" {
@@ -1681,6 +1723,7 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     // overrides this for looking at another site's namespace.
     let mut suffix = "myc";
     let mut site = None;
+    let mut zone = "lan";
     let mut delegation_file = None;
     let mut json = false;
     let mut dnsmasq = false;
@@ -1698,7 +1741,12 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
                     .next()
                     .ok_or_else(|| err_usage("--suffix needs a domain"))?
             }
-            "--site" if action == "plan" => {
+            "--zone" if action == "zone" => {
+                zone = rest
+                    .next()
+                    .ok_or_else(|| err_usage("--zone needs `lan`, `overlay`, or `all`"))?;
+            }
+            "--site" => {
                 site = Some(
                     rest.next()
                         .ok_or_else(|| err_usage("--site needs a site"))?
@@ -1746,8 +1794,25 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     if let Some(site) = site {
         bindings.retain(|binding| binding.site == site);
     }
-    let records =
-        dns::derive_records(&topology, &bindings, suffix).map_err(|error| err_usage(&error))?;
+    // LAN zone: `node.site.<suffix>` -> a LAN address reached through a signed
+    // site route. Overlay zone: `node.<suffix>` -> the node's
+    // transport-agnostic overlay address. `all` emits both.
+    if !matches!(zone, "lan" | "overlay" | "all") {
+        return Err(err_usage("--zone must be `lan`, `overlay`, or `all`"));
+    }
+    let mut records = Vec::new();
+    if matches!(zone, "lan" | "all") {
+        records.extend(
+            dns::derive_records(&topology, &bindings, suffix).map_err(|error| err_usage(&error))?,
+        );
+    }
+    if matches!(zone, "overlay" | "all") {
+        records.extend(
+            dns::derive_overlay_records(&topology, suffix).map_err(|error| err_usage(&error))?,
+        );
+    }
+    records.sort();
+    records.dedup();
     if action == "plan" {
         let plan =
             dns::plan(site.unwrap(), suffix, records, delegations).map_err(|e| err_usage(&e))?;

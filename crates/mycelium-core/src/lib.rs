@@ -73,6 +73,6 @@ pub use topology::{
     LeaseRecord, Link, LinkDuplex, LinkMedium, LinkState, MacAddress, MeshControlPlane,
     MeshCoordinator, MeshProtocol, NodeAnnotation, Observation, Origin, OverlayPeerRecord, PortRef,
     Segment, SegmentKind, ServiceAdvertisement, ServiceRecord, ServiceState, TopoNode, Topology,
-    TopologyReport, VlanId,
+    TopologyReport, VlanId, MYCELIUM_OVERLAY_NETWORK,
 };
 pub use value::{IntoValue, Params, Value};

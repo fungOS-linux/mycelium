@@ -217,7 +217,7 @@ fn read_bounded(path: &std::path::Path) -> Result<Vec<u8>, AnyError> {
     Ok(data)
 }
 
-fn transport_key(path: &std::path::Path) -> Result<SecretKey, AnyError> {
+pub(crate) fn transport_key(path: &std::path::Path) -> Result<SecretKey, AnyError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     match std::fs::OpenOptions::new()
         .write(true)
