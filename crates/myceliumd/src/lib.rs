@@ -41,6 +41,7 @@ pub mod siem;
 pub mod software;
 pub mod software_apt;
 pub mod software_service;
+pub mod ssh_health;
 pub mod ssh_renewal;
 pub mod state_change;
 pub mod topology_feed;

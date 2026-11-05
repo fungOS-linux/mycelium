@@ -1931,6 +1931,11 @@ impl Daemon {
                     ))
                 }
             }
+            Request::SshStatus => {
+                let local = self.mesh.local_ssh_health().await;
+                let peers = self.mesh.ssh_healths().await;
+                to_value(serde_json::json!({ "local": local, "peers": peers })).map_err(json_err)
+            }
             Request::SecurityPostureList => {
                 to_value(self.mesh.security_postures().await).map_err(json_err)
             }

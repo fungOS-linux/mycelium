@@ -194,6 +194,8 @@ pub enum Request {
     },
     /// Report the local `.myc` service proxy configuration and listener state.
     ProxyStatus,
+    /// Local SSH access healthcheck plus the SSH health gossiped by peers.
+    SshStatus,
     SecurityPostureList,
     SecurityEventList,
     SecuritySinkList,
