@@ -20,6 +20,7 @@ mod backend;
 mod clock;
 mod error;
 mod lease;
+mod passwords;
 mod reference;
 mod secret;
 mod store;
@@ -29,6 +30,7 @@ pub use backend::{Backend, EnvBackend, MemoryBackend, StoredRecord, UnsupportedB
 pub use clock::{Clock, ManualClock, SharedClock, SystemClock};
 pub use error::GeodeError;
 pub use lease::Lease;
+pub use passwords::{built_in_wordlist, PasswordGenerator, PhraseGenerator, Requirements};
 pub use reference::GeodeRef;
 pub use secret::{CredentialKind, Purpose, SecretBytes, SecretMeta};
 pub use store::{NewCredential, Store, MAX_LEASE, MIN_LEASE};

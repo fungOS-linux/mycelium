@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, StoredRecord};
 use crate::reference::GeodeRef;
-use crate::secret::{CredentialKind, SecretBytes, SecretMeta};
+use crate::secret::{SecretBytes, SecretMeta};
 use crate::GeodeError;
 
 /// Persistent, owner-local credential storage.
@@ -36,11 +36,12 @@ impl DiskBackend {
     /// known-good location.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, GeodeError> {
         let path = path.into();
-        let meta = std::fs::metadata(&path).map_err(|error| {
-            GeodeError::Backend(format!("cannot open {path:?}: {error}"))
-        })?;
+        let meta = std::fs::metadata(&path)
+            .map_err(|error| GeodeError::Backend(format!("cannot open {path:?}: {error}")))?;
         if !meta.is_file() {
-            return Err(GeodeError::Backend(format!("{path:?} is not a regular file")));
+            return Err(GeodeError::Backend(format!(
+                "{path:?} is not a regular file"
+            )));
         }
         Ok(Self { path })
     }
@@ -57,7 +58,7 @@ impl DiskBackend {
                 GeodeError::Backend(format!("cannot create {parent:?}: {error}"))
             })?;
         }
-        let file = std::fs::OpenOptions::new()
+        let _file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -76,10 +77,16 @@ impl DiskBackend {
     /// entries on restart.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, GeodeError> {
         let path = path.into();
-        match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(file) => Ok(Self { path }),
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(_file) => Ok(Self { path }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::create(path),
-            Err(error) => Err(GeodeError::Backend(format!("cannot open {path:?}: {error}"))),
+            Err(error) => Err(GeodeError::Backend(format!(
+                "cannot open {path:?}: {error}"
+            ))),
         }
     }
 
@@ -112,7 +119,8 @@ impl Backend for DiskBackend {
     fn write(&self, reference: &GeodeRef, record: StoredRecord) -> Result<(), GeodeError> {
         let mut doc = load_document(&self.path)?;
         let key = reference.as_reference();
-        doc.secrets.insert(key.clone(), hex_encode(record.secret.expose()));
+        doc.secrets
+            .insert(key.clone(), hex_encode(record.secret.expose()));
         doc.meta.insert(key, record.meta);
         commit_document(&self.path, &doc)?;
         Ok(())
@@ -154,13 +162,16 @@ fn load_document(path: &Path) -> Result<Document, GeodeError> {
             return Ok(Document::default());
         }
         Err(error) => {
-            return Err(GeodeError::Backend(format!("cannot read {path:?}: {error}")));
+            return Err(GeodeError::Backend(format!(
+                "cannot read {path:?}: {error}"
+            )));
         }
     };
     if text.trim().is_empty() {
         return Ok(Document::default());
     }
-    serde_json::from_str(&text).map_err(|error| GeodeError::Backend(format!("invalid {path:?}: {error}")))
+    serde_json::from_str(&text)
+        .map_err(|error| GeodeError::Backend(format!("invalid {path:?}: {error}")))
 }
 
 /// Persist the document with an atomic rename so a concurrent reader never sees
@@ -173,24 +184,21 @@ fn commit_document(path: &Path, doc: &Document) -> Result<(), GeodeError> {
         .lock()
         .expect("disk backend lock poisoned");
 
-    let text = serde_json::to_string_pretty(doc).map_err(|error| {
-        GeodeError::Backend(format!("cannot encode store: {error}"))
-    })?;
+    let text = serde_json::to_string_pretty(doc)
+        .map_err(|error| GeodeError::Backend(format!("cannot encode store: {error}")))?;
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temporary, text).map_err(|error| {
-        GeodeError::Backend(format!("cannot write {temporary:?}: {error}"))
-    })?;
-    std::fs::rename(&temporary, path).map_err(|error| {
-        GeodeError::Backend(format!("cannot persist {path:?}: {error}"))
-    })?;
+    std::fs::write(&temporary, text)
+        .map_err(|error| GeodeError::Backend(format!("cannot write {temporary:?}: {error}")))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|error| GeodeError::Backend(format!("cannot persist {path:?}: {error}")))?;
     Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push(char::from_digit(((byte >> 4) as u32) + (b'0' as u32), 16).unwrap());
-        out.push(char::from_digit(((byte & 0x0f) as u32) + (b'0' as u32), 16).unwrap());
+        out.push(char::from_digit(((byte >> 4) as u32) % 16, 16).unwrap());
+        out.push(char::from_digit(((byte & 0x0f) as u32) % 16, 16).unwrap());
     }
     out
 }

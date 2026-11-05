@@ -1353,6 +1353,7 @@ dependencies = [
 name = "geode"
 version = "0.1.0"
 dependencies = [
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
