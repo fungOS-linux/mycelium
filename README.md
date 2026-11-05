@@ -994,6 +994,10 @@ allowlist and reveals it only through a bounded lease; secrets have a redacting
 `Debug`, no `Serialize`, and zeroize on drop. Credential kind and credential
 expiry are metadata, and no platform backend is selected automatically.
 
+`geoded` serves `geode://` leases to other processes over an owner-only Unix
+socket; the library remains the default for in-process use. See
+[geoded](docs/geoded.md).
+
 Optional connectors keep protocol behaviour out of the store:
 `geode-passkey` (software WebAuthn/ES256), `geode-otp` (TOTP/HOTP 2FA), and
 `geode-oauth` (PKCE, refresh, device authorization, OIDC discovery). Composio and
