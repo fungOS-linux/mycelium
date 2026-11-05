@@ -70,6 +70,7 @@ and fpl-auth handled as reference conventions. See
 | Backend | State | Notes |
 | --- | --- | --- |
 | `MemoryBackend` | implemented | Tests and in-process composition; never durable. |
+| `FileBackend` | implemented | AES-256-GCM file, 0600, key supplied by the host; used by `geoded`. Explicit fallback, not a platform keystore. |
 | `EnvBackend` | implemented | Read-only; `geode://a/b/c` reads `GEODE_A_B_C`; fixed purpose allowlist supplied at construction. Development only. |
 | macOS Keychain | planned | Service `dev.fungos.geode`, `WhenUnlockedThisDeviceOnly`, no iCloud sync. |
 | Linux Secret Service | planned | Desktop hosts. |
@@ -138,10 +139,9 @@ assert_eq!(lease.expose().unwrap(), b"hunter2");
 4. **Linux backend** — Secret Service for desktops, `systemd-creds`/TPM for
    headless hosts, each explicitly selected and tested for cold boot, denied
    access, corrupted blob, and unavailable TPM.
-5. **Optional `geoded`** — an owner-only broker on a Unix socket with peer-cred
-   checks, only if multiple processes need a single audit/rotation point or need
-   a stronger "use without reveal" boundary than in-process Rust can provide.
-   The library boundary is the default; a daemon is a deployment decision.
+5. **`geoded`** — implemented: owner-only Unix socket, same-UID peer check,
+   read-only lease protocol over `FileBackend`. See [geoded](geoded.md). Platform
+   backends and an operator write/rotate CLI are next.
 6. **Composio connector** — a thin client for connect links and connected-account
    state, storing only the API/consumer key. No provider OAuth flow.
 7. **HMAC request signer** — `hmac.sign` over a geode-owned key for webhook and

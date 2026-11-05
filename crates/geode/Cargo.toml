@@ -8,7 +8,12 @@ description = "Owner-local credential store: opaque secrets, explicit purposes, 
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+rand_core.workspace = true
+aes-gcm.workspace = true
+base64.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
+tempfile.workspace = true

@@ -1,4 +1,5 @@
 mod env;
+mod file;
 mod memory;
 
 use std::fmt;
@@ -8,9 +9,11 @@ use crate::secret::{SecretBytes, SecretMeta};
 use crate::GeodeError;
 
 pub use env::EnvBackend;
+pub use file::FileBackend;
 pub use memory::MemoryBackend;
 
 /// One stored item: the secret plus its non-secret description.
+#[derive(Clone)]
 pub struct StoredRecord {
     pub secret: SecretBytes,
     pub meta: SecretMeta,

@@ -25,7 +25,9 @@ mod secret;
 mod store;
 
 pub use audit::{AuditEvent, AuditLog, AuditOutcome, DenyReason};
-pub use backend::{Backend, EnvBackend, MemoryBackend, StoredRecord, UnsupportedBackend};
+pub use backend::{
+    Backend, EnvBackend, FileBackend, MemoryBackend, StoredRecord, UnsupportedBackend,
+};
 pub use clock::{Clock, ManualClock, SharedClock, SystemClock};
 pub use error::GeodeError;
 pub use lease::Lease;

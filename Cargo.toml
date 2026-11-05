@@ -43,7 +43,9 @@ rustls-pemfile = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = { version = "1", features = ["derive"] }
+aes-gcm = "0.10"
 base64 = "0.22"
+tempfile = "3"
 ciborium = "0.2"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 data-encoding = "2"
