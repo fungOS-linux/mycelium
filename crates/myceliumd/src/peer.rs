@@ -12,7 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use mycelium_peer_protocol::{
     decode_hex, encode_hex, local_build_target, local_compatible_targets, sha256_hex, AccessRecord,
-    AccessStatement, AuthorityRecord, AuthorityStatement, EgressObservation, FilesystemHealth,
+    AccessStatement, AuthorityRecord, AuthorityStatement, BatteryState, EgressObservation,
+    FilesystemHealth,
     HardwareSnapshot, HostHealth, PackageManifest, PeerEndpointObservation, PeerEvent, PeerHello,
     PeerInterface, PeerMessage, Platform, ProcessHealth, ReleaseManifest, SecurityEventBatch,
     SecurityPosture, SignedEnvelope, SshHealth, TopologySnapshot, TransportCredentialBinding,
@@ -263,6 +264,7 @@ impl Mesh {
             process_leaders: Vec::new(),
             ssh_listening,
             established_ssh_sessions: 0,
+            battery: None,
             platform_metrics: BTreeMap::new(),
         }))
         .await
@@ -2515,6 +2517,7 @@ fn collect_linux() -> Result<HostHealth, AnyError> {
         ssh_listening: ssh.lines().any(|line| local_port(line, 22)),
         established_ssh_sessions: sessions.lines().filter(|line| local_port(line, 22)).count()
             as u32,
+        battery: collect_battery(),
         platform_metrics,
     })
 }
@@ -2564,8 +2567,124 @@ fn collect_darwin() -> Result<HostHealth, AnyError> {
             .lines()
             .filter(|line| line.contains("(ESTABLISHED)") && darwin_local_port(line, 22))
             .count() as u32,
+        battery: collect_battery(),
         platform_metrics: BTreeMap::new(),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn collect_battery() -> Option<BatteryState> {
+    let root = std::path::Path::new("/sys/class/power_supply");
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut battery = None;
+    let mut ac_online = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let read = |name: &str| {
+            std::fs::read_to_string(path.join(name))
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let supply_type = read("type").unwrap_or_default();
+        match supply_type.as_str() {
+            "Battery" if battery.is_none() => {
+                let percent = read("capacity").and_then(|value| value.parse::<u8>().ok());
+                let raw = read("status").unwrap_or_else(|| "unknown".into());
+                let state = match raw.to_ascii_lowercase().as_str() {
+                    "charging" => "charging",
+                    "discharging" => "discharging",
+                    "full" => "full",
+                    "not charging" => "not_charging",
+                    _ => "unknown",
+                }
+                .to_string();
+                battery = Some(BatteryState {
+                    percent,
+                    state,
+                    ac_online: None,
+                    time_to_empty_secs: None,
+                    time_to_full_secs: None,
+                    source: "sysfs".into(),
+                });
+            }
+            "Mains" | "AC" | "USB" | "USB_C" => {
+                if let Some(online) = read("online") {
+                    ac_online = Some(online == "1");
+                }
+            }
+            _ => {}
+        }
+    }
+    battery.map(|mut state| {
+        state.ac_online = ac_online;
+        state
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn collect_battery() -> Option<BatteryState> {
+    let text = output("/usr/bin/pmset", &["-g", "batt"]).ok()?;
+    let ac_online = text.contains("AC Power");
+    let mut percent = None;
+    let mut state = "unknown".to_string();
+    let mut remaining = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('-') {
+            continue;
+        }
+        if let Some(value) = line.split('%').next().and_then(|prefix| {
+            prefix
+                .split_whitespace()
+                .last()
+                .and_then(|token| token.parse::<u8>().ok())
+        }) {
+            percent = Some(value);
+        }
+        let lower = line.to_ascii_lowercase();
+        state = if lower.contains("discharging") {
+            "discharging"
+        } else if lower.contains("finishing charge") || lower.contains("charging") {
+            "charging"
+        } else if lower.contains("charged") || lower.contains("full") {
+            "full"
+        } else if lower.contains("not charging") || lower.contains("ac attached") {
+            "not_charging"
+        } else {
+            "unknown"
+        }
+        .to_string();
+        // Remaining time is `H:MM remaining`.
+        if let Some(rest) = line.split(';').nth(2) {
+            let rest = rest.trim();
+            if let Some(time) = rest.split_whitespace().next() {
+                if let Some((hours, minutes)) = time.split_once(':') {
+                    if let (Ok(hours), Ok(minutes)) =
+                        (hours.parse::<u64>(), minutes.parse::<u64>())
+                    {
+                        let secs = hours.saturating_mul(3600).saturating_add(minutes * 60);
+                        if secs > 0 {
+                            remaining = Some(secs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    percent.map(|percent| BatteryState {
+        percent: Some(percent),
+        state: state.clone(),
+        ac_online: Some(ac_online),
+        time_to_empty_secs: (state == "discharging").then_some(remaining).flatten(),
+        time_to_full_secs: (state == "charging").then_some(remaining).flatten(),
+        source: "pmset".into(),
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn collect_battery() -> Option<BatteryState> {
+    None
 }
 
 fn output(command: &str, args: &[&str]) -> Result<String, AnyError> {

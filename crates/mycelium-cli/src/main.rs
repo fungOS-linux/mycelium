@@ -844,6 +844,9 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
                         "ssh_certificate": ssh["certificate_state"],
                         "disk_available_bytes": ssh["disk_available_bytes"],
                         "disk_state": ssh["disk_state"],
+                        "battery_percent": health["battery"]["percent"],
+                        "battery_state": health["battery"]["state"],
+                        "battery_ac_online": health["battery"]["ac_online"],
                         "update_state": health["platform_metrics"]["mycelium_update.activation_state"],
                         "release_version": health["platform_metrics"]["mycelium_update.release_version"],
                     })
@@ -855,7 +858,7 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
             let mut lines = vec!["Fleet status:".into()];
             for row in rows {
                 lines.push(format!(
-                    "  {} site={} platform={}/{} ssh={} cert={} verdict={} disk={} free={} daemon={} update={}",
+                    "  {} site={} platform={}/{} ssh={} cert={} verdict={} disk={} free={} battery={} daemon={} update={}",
                     row["hostname"].as_str().unwrap_or("?"),
                     row["site"].as_str().unwrap_or("?"),
                     row["platform"].as_str().unwrap_or("?"),
@@ -872,6 +875,10 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
                             "{}GiB",
                             bytes / (1024 * 1024 * 1024)
                         )),
+                    render_battery(&serde_json::json!({
+                        "percent": row["battery_percent"],
+                        "state": row["battery_state"],
+                    })),
                     row["daemon_version"].as_str().unwrap_or("?"),
                     row["release_version"].as_str().unwrap_or("unrecorded"),
                 ));
@@ -3090,11 +3097,23 @@ fn render_peers(value: &serde_json::Value) -> Vec<String> {
             .as_bool()
             .map(|up| if up { "up" } else { "down" })
             .unwrap_or("-");
+        let battery = render_battery(&health["battery"]);
         lines.push(format!(
-            "  {hostname} site={site} platform={platform} age={age}s load={load} ssh={ssh}"
+            "  {hostname} site={site} platform={platform} age={age}s load={load} ssh={ssh} battery={battery}"
         ));
     }
     lines
+}
+
+fn render_battery(battery: &serde_json::Value) -> String {
+    let Some(percent) = battery.get("percent").and_then(|value| value.as_u64()) else {
+        return "n/a".into();
+    };
+    let state = battery
+        .get("state")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    format!("{percent}% {state}")
 }
 
 async fn resources(args: &[String]) -> Result<Vec<String>, ClientError> {

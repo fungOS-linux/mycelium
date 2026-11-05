@@ -124,6 +124,25 @@ pub struct ProcessHealth {
     pub memory_percent: f32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatteryState {
+    /// Charge percentage when the platform reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    /// `charging`, `discharging`, `full`, `not_charging`, or `unknown`.
+    pub state: String,
+    /// Whether external power is connected, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ac_online: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_empty_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_full_secs: Option<u64>,
+    /// Collector source, for example `sysfs` or `pmset`.
+    #[serde(default)]
+    pub source: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostHealth {
     pub observed_at: u64,
@@ -138,6 +157,9 @@ pub struct HostHealth {
     pub process_leaders: Vec<ProcessHealth>,
     pub ssh_listening: bool,
     pub established_ssh_sessions: u32,
+    /// System battery/charging state. Absent on hosts without a battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<BatteryState>,
     #[serde(default)]
     pub platform_metrics: BTreeMap<String, String>,
 }
@@ -253,6 +275,10 @@ pub enum HardwareKind {
     StorageVolume,
     Accelerator,
     SecurityModule,
+    /// A battery or power supply, including the system battery.
+    Battery,
+    /// A Bluetooth/BLE peripheral or adapter.
+    BluetoothDevice,
     /// A kind introduced by a newer peer. The original wire string is kept
     /// verbatim so a decoded envelope re-serializes to the same bytes and its
     /// signature still verifies when it is gossiped onward. Callers ignore it
@@ -270,6 +296,8 @@ impl HardwareKind {
             Self::StorageVolume => "storage_volume",
             Self::Accelerator => "accelerator",
             Self::SecurityModule => "security_module",
+            Self::Battery => "battery",
+            Self::BluetoothDevice => "bluetooth_device",
             Self::Unknown(value) => value,
         }
     }
@@ -292,6 +320,8 @@ impl<'de> Deserialize<'de> for HardwareKind {
             "storage_volume" => Self::StorageVolume,
             "accelerator" => Self::Accelerator,
             "security_module" => Self::SecurityModule,
+            "battery" => Self::Battery,
+            "bluetooth_device" => Self::BluetoothDevice,
             _ => Self::Unknown(value),
         })
     }
@@ -307,6 +337,7 @@ pub enum HardwareBus {
     Scsi,
     Virtio,
     Thunderbolt,
+    Bluetooth,
     Integrated,
     Unknown,
 }
@@ -1207,6 +1238,48 @@ mod tests {
             serde_json::from_str::<super::HardwareKind>(&encoded).unwrap(),
             super::HardwareKind::SecurityModule
         );
+    }
+
+    #[test]
+    fn battery_and_bluetooth_kinds_round_trip() {
+        for (kind, wire) in [
+            (super::HardwareKind::Battery, "battery"),
+            (super::HardwareKind::BluetoothDevice, "bluetooth_device"),
+        ] {
+            let encoded = serde_json::to_string(&kind).unwrap();
+            assert_eq!(encoded, format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::from_str::<super::HardwareKind>(&encoded).unwrap(),
+                kind
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<super::HardwareBus>("\"bluetooth\"").unwrap(),
+            super::HardwareBus::Bluetooth
+        );
+    }
+
+    #[test]
+    fn battery_state_round_trips_and_is_optional_on_host_health() {
+        let battery = super::BatteryState {
+            percent: Some(82),
+            state: "charging".into(),
+            ac_online: Some(true),
+            time_to_empty_secs: None,
+            time_to_full_secs: Some(1800),
+            source: "pmset".into(),
+        };
+        let encoded = serde_json::to_string(&battery).unwrap();
+        assert_eq!(
+            serde_json::from_str::<super::BatteryState>(&encoded).unwrap(),
+            battery
+        );
+        // A HostHealth from an older peer has no battery field and must decode.
+        let health: super::HostHealth = serde_json::from_str(
+            r#"{"observed_at":1,"uptime_seconds":2,"load_average":[0.0,0.0,0.0],"logical_cpus":1,"memory_total_bytes":1,"memory_available_bytes":1,"swap_total_bytes":0,"swap_free_bytes":0,"filesystems":[],"process_leaders":[],"ssh_listening":true,"established_ssh_sessions":0}"#,
+        )
+        .unwrap();
+        assert!(health.battery.is_none());
     }
 
     #[test]

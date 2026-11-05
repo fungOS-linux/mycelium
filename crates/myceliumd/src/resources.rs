@@ -96,7 +96,9 @@ fn resource_kind_prefix(device: &HardwareDevice) -> Option<&'static str> {
         HardwareKind::PciDevice
         | HardwareKind::UsbDevice
         | HardwareKind::StorageController
-        | HardwareKind::SecurityModule => None,
+        | HardwareKind::SecurityModule
+        | HardwareKind::Battery
+        | HardwareKind::BluetoothDevice => None,
         // Additive kinds from newer peers are ignored, not fatal. The envelope
         // signature still verifies because HardwareKind preserves the raw string.
         HardwareKind::Unknown(kind) => {
@@ -197,9 +199,11 @@ fn transport(device: &HardwareDevice) -> AttachmentTransport {
         HardwareBus::Integrated => AttachmentTransport::Integrated {
             locator: device.locator.clone(),
         },
-        HardwareBus::Thunderbolt | HardwareBus::Unknown => AttachmentTransport::Unknown {
-            locator: device.locator.clone(),
-            attributes: BTreeMap::new(),
+        HardwareBus::Thunderbolt | HardwareBus::Bluetooth | HardwareBus::Unknown => {
+            AttachmentTransport::Unknown {
+                locator: device.locator.clone(),
+                attributes: BTreeMap::new(),
+            }
         },
     }
 }
