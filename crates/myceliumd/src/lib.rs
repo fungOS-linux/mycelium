@@ -21,6 +21,7 @@ pub mod authority;
 pub mod client;
 pub mod credential_map;
 pub mod credential_provider;
+pub mod disk;
 mod execution;
 mod hardware;
 pub mod peer;

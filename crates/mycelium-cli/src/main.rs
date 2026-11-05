@@ -206,6 +206,8 @@ usage:
   mycelium dns zone [--zone lan|overlay|all] [--suffix DOMAIN] [--json]
   mycelium proxy status [--json]
   mycelium ssh status [--json]
+  mycelium disk [--json]
+  mycelium disk prune [--write]
   mycelium security status|events [--json]
   mycelium security scan [--stig-content PATH --stig-profile ID] [--remediation-plan] [--json]
   mycelium security sinks list [--json]
@@ -668,6 +670,7 @@ async fn run(cmd: &str, args: &[String]) -> Result<Vec<String>, ClientError> {
         "dns" => dns_command(args).await,
         "proxy" => proxy_command(args).await,
         "security" => security_command(args).await,
+        "disk" => disk_command(args).await,
         "enroll" => enroll_command(args).await,
         "annotate" => {
             let f = parse_flags(args);
@@ -839,6 +842,8 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
                         "ssh_listening": health["ssh_listening"],
                         "ssh_verdict": ssh["verdict"],
                         "ssh_certificate": ssh["certificate_state"],
+                        "disk_available_bytes": ssh["disk_available_bytes"],
+                        "disk_state": ssh["disk_state"],
                         "update_state": health["platform_metrics"]["mycelium_update.activation_state"],
                         "release_version": health["platform_metrics"]["mycelium_update.release_version"],
                     })
@@ -850,7 +855,7 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
             let mut lines = vec!["Fleet status:".into()];
             for row in rows {
                 lines.push(format!(
-                    "  {} site={} platform={}/{} ssh={} cert={} verdict={} daemon={} update={}",
+                    "  {} site={} platform={}/{} ssh={} cert={} verdict={} disk={} free={} daemon={} update={}",
                     row["hostname"].as_str().unwrap_or("?"),
                     row["site"].as_str().unwrap_or("?"),
                     row["platform"].as_str().unwrap_or("?"),
@@ -860,6 +865,13 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
                         .map_or("unknown", |up| if up { "up" } else { "down" }),
                     row["ssh_certificate"].as_str().unwrap_or("unknown"),
                     row["ssh_verdict"].as_str().unwrap_or("unknown"),
+                    row["disk_state"].as_str().unwrap_or("unknown"),
+                    row["disk_available_bytes"]
+                        .as_u64()
+                        .map_or("unknown".to_string(), |bytes| format!(
+                            "{}GiB",
+                            bytes / (1024 * 1024 * 1024)
+                        )),
                     row["daemon_version"].as_str().unwrap_or("?"),
                     row["release_version"].as_str().unwrap_or("unrecorded"),
                 ));
@@ -1528,7 +1540,7 @@ async fn ssh_health_command(args: &[String]) -> Result<Vec<String>, ClientError>
 fn render_ssh_health(label: &str, health: &serde_json::Value) -> String {
     let get = |key: &str| health.get(key).and_then(|value| value.as_str()).unwrap_or("?");
     format!(
-        "{label}: verdict={} certificate={} listening={} sessions={} renewal_after={} access={} grants={} authorities={}",
+        "{label}: verdict={} certificate={} listening={} sessions={} renewal_after={} access={} grants={} authorities={} disk={} free={}",
         get("verdict"),
         get("certificate_state"),
         health
@@ -1552,7 +1564,63 @@ fn render_ssh_health(label: &str, health: &serde_json::Value) -> String {
             .get("access_authorities")
             .and_then(|value| value.as_u64())
             .unwrap_or(0),
+        get("disk_state"),
+        health
+            .get("disk_available_bytes")
+            .and_then(|value| value.as_u64())
+            .map_or("unknown".to_string(), |bytes| format!("{} MiB", bytes / (1024 * 1024))),
     )
+}
+
+async fn disk_command(args: &[String]) -> Result<Vec<String>, ClientError> {
+    let home = myceliumd::home_dir();
+    if args.first().is_some_and(|argument| argument == "prune") {
+        let now = myceliumd::ssh_health::now();
+        if !args.iter().any(|argument| argument == "--write") {
+            // Report what the guard would remove without touching anything.
+            let artifacts = home.join("artifacts");
+            let mut reclaimable = 0u64;
+            if let Ok(entries) = std::fs::read_dir(&artifacts) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|extension| extension == "part") {
+                        if let Ok(metadata) = std::fs::metadata(&path) {
+                            reclaimable += metadata.len();
+                        }
+                    }
+                }
+            }
+            return Ok(vec![format!(
+                "disk prune (dry run): up to {} MiB of stale partial downloads; rerun with --write",
+                reclaimable / (1024 * 1024)
+            )]);
+        }
+        let (freed, removed) = myceliumd::disk::prune_stale(&home, now, 24 * 3600)
+            .map_err(|error| err_usage(&error))?;
+        return Ok(vec![format!(
+            "disk prune: removed {removed} stale file(s), reclaimed {} MiB",
+            freed / (1024 * 1024)
+        )]);
+    }
+    let available = myceliumd::disk::available_bytes(&home).map_err(|error| err_usage(&error))?;
+    let state = myceliumd::disk::state(available);
+    if args.iter().any(|arg| arg == "--json") {
+        return Ok(vec![serde_json::json!({
+            "available_bytes": available,
+            "state": state.label(),
+            "reserve_bytes": myceliumd::disk::MIN_RESERVE_BYTES,
+            "warn_bytes": myceliumd::disk::WARN_BYTES,
+        })
+        .to_string()]);
+    }
+    Ok(vec![format!(
+        "disk: {} state={} free={} MiB reserve={} MiB warn={} MiB",
+        home.display(),
+        state.label(),
+        available / (1024 * 1024),
+        myceliumd::disk::MIN_RESERVE_BYTES / (1024 * 1024),
+        myceliumd::disk::WARN_BYTES / (1024 * 1024),
+    )])
 }
 
 async fn proxy_command(args: &[String]) -> Result<Vec<String>, ClientError> {

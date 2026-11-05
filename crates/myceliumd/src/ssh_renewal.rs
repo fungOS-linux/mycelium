@@ -115,6 +115,8 @@ fn sign_certificate(
 ) -> Result<String, String> {
     let root = crate::home_dir().join("ssh/renewal-staging");
     fs::create_dir_all(&root).map_err(|error| format!("create renewal staging: {error}"))?;
+    crate::disk::ensure_headroom(&root, request.public_key.len() as u64 + 4096)
+        .map_err(|error| format!("cannot issue SSH certificate: {error}"))?;
     let stem = root.join(&request.request_id);
     let public = stem.with_extension("pub");
     fs::write(&public, &request.public_key).map_err(|error| format!("stage SSH key: {error}"))?;
@@ -202,6 +204,11 @@ pub fn install(response: &SshRenewalResponse, now: u64) -> Result<(), String> {
     }
     let directory = crate::home_dir().join("ssh");
     fs::create_dir_all(&directory).map_err(|error| format!("create SSH state: {error}"))?;
+    // A full volume previously surfaced as an opaque ENOSPC during install.
+    // Refuse early with an actionable message and let the health record carry
+    // the same disk state.
+    crate::disk::ensure_headroom(&directory, certificate.len() as u64)
+        .map_err(|error| format!("cannot renew SSH certificate: {error}"))?;
     let installed = directory.join("user-cert.pub");
     // A unique staging path prevents two concurrent renewals (for example two
     // connected issuers answering the same request) from racing on the same

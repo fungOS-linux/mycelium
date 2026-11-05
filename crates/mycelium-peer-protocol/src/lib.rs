@@ -500,6 +500,12 @@ pub struct SshHealth {
     pub access_authorities: u32,
     /// `ok`, `stale`, `unavailable`, or `unknown` for local host enforcement.
     pub access_enforcement: String,
+    /// Free space on the filesystem that holds the daemon home. A full disk is
+    /// a first-class failure because it silently breaks renewal and updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_available_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_state: String,
     /// One-line operator verdict: `ok`, `warn`, or `fail`.
     pub verdict: String,
 }
@@ -1432,6 +1438,8 @@ mod tests {
                 access_grants: 1,
                 access_authorities: 1,
                 access_enforcement: "ok".into(),
+                disk_available_bytes: Some(10 * 1024 * 1024 * 1024),
+                disk_state: "ok".into(),
                 verdict: "ok".into(),
             }),
         )

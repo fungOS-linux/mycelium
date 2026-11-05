@@ -144,11 +144,17 @@ pub fn collect(
         Vec::new()
     };
     let enforcement = enforcement_state(now);
+    let (disk_available, disk_state) = match crate::disk::available_bytes(&directory) {
+        Ok(available) => (Some(available), crate::disk::state(available).label().to_string()),
+        Err(_) => (None, "unknown".to_string()),
+    };
 
-    let verdict = if !listening || matches!(certificate_state.as_str(), "expired" | "missing" | "error")
+    let verdict = if !listening
+        || matches!(certificate_state.as_str(), "expired" | "missing" | "error")
+        || disk_state == "critical"
     {
         "fail"
-    } else if certificate_state == "due" || enforcement == "stale" {
+    } else if certificate_state == "due" || enforcement == "stale" || disk_state == "low" {
         "warn"
     } else {
         "ok"
@@ -171,6 +177,8 @@ pub fn collect(
         access_grants,
         access_authorities,
         access_enforcement: enforcement,
+        disk_available_bytes: disk_available,
+        disk_state,
         verdict: verdict.to_string(),
     }
 }

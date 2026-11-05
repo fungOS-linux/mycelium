@@ -3300,6 +3300,16 @@ pub async fn serve() -> std::io::Result<()> {
         }
     }
     let listener = UnixListener::bind(&socket)?;
+    // Bound stale partial downloads and interrupted temporaries; a failed
+    // transfer must not pin disk forever. Best effort, never fatal to boot.
+    match crate::disk::prune_stale(&home, crate::peer::now(), 24 * 3600) {
+        Ok((0, _)) => {}
+        Ok((freed, removed)) => eprintln!(
+            "myceliumd: pruned {removed} stale partial file(s), reclaiming {} MiB",
+            freed / (1024 * 1024)
+        ),
+        Err(error) => eprintln!("myceliumd: prune stale files: {error}"),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
