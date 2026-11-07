@@ -1,0 +1,19 @@
+[package]
+name = "geode-passkey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Software WebAuthn passkey credentials owned by geode"
+
+[dependencies]
+geode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+ciborium.workspace = true
+p256.workspace = true
+rand_core.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true

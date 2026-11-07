@@ -386,7 +386,15 @@ impl Mesh {
             .await?;
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             #[cfg(feature = "iroh-sync")]
-            iroh_sync::start(self.clone(), &tls).await?;
+            if let Err(error) = iroh_sync::start(self.clone(), &tls).await {
+                // Iroh sync is a fallback/repair transport. A sync runtime
+                // that cannot start (for example because
+                // MYCELIUM_IROH_SERVER_NAME is missing from the daemon
+                // environment) must not take the peer itself down: TCP
+                // gossip and the peer listener still run. The failure stays
+                // visible in the daemon log instead of aborting startup.
+                eprintln!("myceliumd: Iroh sync unavailable; continuing without it: {error}");
+            }
             if let Some(address) = tls.listen.clone() {
                 let mesh = self.clone();
                 let acceptor = TlsAcceptor::from(Arc::new(tls.server_config()?));
