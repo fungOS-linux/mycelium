@@ -1,6 +1,6 @@
 //! Generic application-owned leases carried by existing signed topology gossip.
 //! No application protocol, Unibus dependency, proxying, or permission issuance.
-use fpl_resource_observation::{SCHEMA_VERSION, ServiceCatalog, ServiceObservation};
+use fpl_resource_observation::{ServiceCatalog, ServiceObservation, SCHEMA_VERSION};
 use mycelium_core::{Observation, Origin, ServiceAdvertisement};
 use std::{collections::BTreeSet, io::Read, path::Path};
 

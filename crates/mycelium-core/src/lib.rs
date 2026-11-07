@@ -24,6 +24,7 @@ pub mod inspection;
 pub mod inventory;
 pub mod primitives;
 pub mod reconcile;
+pub mod site;
 pub mod spec;
 pub mod topology;
 pub mod value;
@@ -65,6 +66,7 @@ pub use reconcile::{
     ExecutionReceipt, ExecutionState, PlanBlocker, PlannedAction, StateChangePlan,
     StateChangeReceipt, VerificationPredicate, VerificationSpec, ACTION_PLAN_SCHEMA_VERSION,
 };
+pub use site::{detect_site, LocalAttachment, SiteMatch, SiteSelection, SiteSource, AUTO_SITE};
 pub use spec::{CapResult, CapSpec, MutationVerification, ParamSpec, ParamType};
 pub use topology::{
     ipv4_in_cidr, Conflict, DiscoveredDevice, DiscoveredService, IpRecord, LeaseRecord, Link,

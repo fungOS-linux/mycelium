@@ -3,8 +3,11 @@
 fn save_config(home: &std::path::Path, config: &myceliumd::peer::SyncConfig) -> Result<(), String> {
     config.validate()?;
     let temporary = home.join("iroh-sync.json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     std::fs::rename(temporary, home.join("iroh-sync.json")).map_err(|e| e.to_string())
 }
 
@@ -30,6 +33,24 @@ pub fn run(args: &[String]) -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())?
         .as_secs();
     match args.first().map(String::as_str) {
+        Some("pkarr") if args.len() == 3 && args[2] == "--write"
+            && matches!(args[1].as_str(), "enable" | "disable") => {
+            let path = home.join("iroh-sync.json");
+            let mut config: SyncConfig = serde_json::from_slice(&read(&path)?)
+                .map_err(|e| e.to_string())?;
+            let enable = args[1] == "enable";
+            config.pkarr.publish = enable;
+            config.pkarr.resolve = enable;
+            if enable {
+                // Publishing to a relay-only Pkarr filter would emit no hints.
+                config.public_relays = true;
+            }
+            save_config(&home, &config)?;
+            Ok(vec![format!(
+                "Pkarr rendezvous {}; restart the managed daemon (discovery only, never an access grant)",
+                args[1]
+            )])
+        }
         Some("relays") if args.len() == 3 && args[2] == "--write"
             && matches!(args[1].as_str(), "enable" | "disable") => {
             let path = home.join("iroh-sync.json");
@@ -84,7 +105,7 @@ pub fn run(args: &[String]) -> Result<Vec<String>, String> {
             Ok(vec!["sync seed saved; restart myceliumd to connect (enrollment and trust are unchanged)".into()])
         }
         _ => Err(
-            "usage: mycelium sync enable --write | export [--qr] | join <rendezvous.json> --write | relays enable|disable --write"
+            "usage: mycelium sync enable --write | export [--qr] | join <rendezvous.json> --write | relays enable|disable --write | pkarr enable|disable --write"
                 .into(),
         ),
     }
@@ -101,8 +122,14 @@ mod tests {
 
     #[test]
     fn relay_policy_roundtrip_preserves_bootstrap_seeds() {
-        let home = std::env::temp_dir().join(format!("mycelium-sync-policy-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let home = std::env::temp_dir().join(format!(
+            "mycelium-sync-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir(&home).unwrap();
         let mut config: myceliumd::peer::SyncConfig = serde_json::from_value(serde_json::json!({
             "public_relays": false,
@@ -111,20 +138,22 @@ mod tests {
                 "alpns": ["mycelium/sync/1"], "direct_addresses": ["127.0.0.1:7444"],
                 "relay_urls": [], "observed_at": 100, "expires_at": 130
             }}]
-        })).unwrap();
+        }))
+        .unwrap();
         let original_seeds = serde_json::to_value(&config.seeds).unwrap();
         for enabled in [true, false] {
             config.public_relays = enabled;
             save_config(&home, &config).unwrap();
-            let saved: myceliumd::peer::SyncConfig = serde_json::from_slice(
-                &std::fs::read(home.join("iroh-sync.json")).unwrap()).unwrap();
+            let saved: myceliumd::peer::SyncConfig =
+                serde_json::from_slice(&std::fs::read(home.join("iroh-sync.json")).unwrap())
+                    .unwrap();
             assert_eq!(saved.public_relays, enabled);
             assert_eq!(serde_json::to_value(saved.seeds).unwrap(), original_seeds);
         }
         config.seeds.push(config.seeds[0].clone());
         assert!(save_config(&home, &config).is_err());
-        let retained: myceliumd::peer::SyncConfig = serde_json::from_slice(
-            &std::fs::read(home.join("iroh-sync.json")).unwrap()).unwrap();
+        let retained: myceliumd::peer::SyncConfig =
+            serde_json::from_slice(&std::fs::read(home.join("iroh-sync.json")).unwrap()).unwrap();
         assert_eq!(retained.seeds.len(), 1);
         std::fs::remove_file(home.join("iroh-sync.json")).unwrap();
         std::fs::remove_dir(home).unwrap();

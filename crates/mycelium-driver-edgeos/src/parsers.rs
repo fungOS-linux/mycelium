@@ -14,7 +14,11 @@ pub struct VersionInfo {
 }
 
 pub fn parse_show_version(text: &str) -> VersionInfo {
-    let mut info = VersionInfo { vendor: None, model: None, firmware: None };
+    let mut info = VersionInfo {
+        vendor: None,
+        model: None,
+        firmware: None,
+    };
     for line in text.lines() {
         let line = line.trim();
         if let Some(v) = line.strip_prefix("Version:") {
@@ -199,9 +203,7 @@ impl EdgeConfig {
         let tail = &rest[2.min(rest.len())..];
         // find optional "vif <id>" segment
         let (vif, tail) = match tail {
-            [v, id, tail @ ..] if v == "vif" => {
-                (id.parse::<u16>().ok(), tail.to_vec())
-            }
+            [v, id, tail @ ..] if v == "vif" => (id.parse::<u16>().ok(), tail.to_vec()),
             _ => (None, tail.to_vec()),
         };
         let key = tail.first().map(|s| s.as_str());
@@ -226,7 +228,9 @@ impl EdgeConfig {
 
         match key {
             Some("address") => {
-                let Some(addr) = tail.get(1).and_then(|s| parse_maybe_cidr(s)) else { return };
+                let Some(addr) = tail.get(1).and_then(|s| parse_maybe_cidr(s)) else {
+                    return;
+                };
                 match vif {
                     None => {
                         cfg.ports.insert(port, addr);
@@ -301,10 +305,7 @@ impl EdgeConfig {
         }
     }
 
-    fn parse_dhcp(
-        subnets: &mut BTreeMap<(String, String), DhcpSubnet>,
-        rest: &[String],
-    ) {
+    fn parse_dhcp(subnets: &mut BTreeMap<(String, String), DhcpSubnet>, rest: &[String]) {
         // rest = shared-network-name NAME subnet CIDR ...
         if rest.len() < 4 || rest[0] != "shared-network-name" || rest[2] != "subnet" {
             return;
@@ -330,14 +331,23 @@ impl EdgeConfig {
                         return;
                     };
                     let existing = match what.as_str() {
-                        "start" => subnet.ranges.iter().position(|r| r.start.is_none() && r.stop.is_none()),
-                        "stop" => subnet.ranges.iter().position(|r| r.start.is_some() && r.stop.is_none()),
+                        "start" => subnet
+                            .ranges
+                            .iter()
+                            .position(|r| r.start.is_none() && r.stop.is_none()),
+                        "stop" => subnet
+                            .ranges
+                            .iter()
+                            .position(|r| r.start.is_some() && r.stop.is_none()),
                         _ => None,
                     };
                     let idx = match existing {
                         Some(i) => i,
                         None => {
-                            subnet.ranges.push(DhcpRange { start: None, stop: None });
+                            subnet.ranges.push(DhcpRange {
+                                start: None,
+                                stop: None,
+                            });
                             subnet.ranges.len() - 1
                         }
                     };
@@ -348,9 +358,13 @@ impl EdgeConfig {
                         _ => {}
                     }
                 }
-                "default-router" => subnet.default_router = tail.first().and_then(|v| v.parse::<IpAddr>().ok()),
+                "default-router" => {
+                    subnet.default_router = tail.first().and_then(|v| v.parse::<IpAddr>().ok())
+                }
                 "domain-name" => subnet.domain_name = tail.first().cloned(),
-                "lease" | "lease-time" => subnet.lease_time = tail.first().and_then(|v| v.parse::<u32>().ok()),
+                "lease" | "lease-time" => {
+                    subnet.lease_time = tail.first().and_then(|v| v.parse::<u32>().ok())
+                }
                 "dns-server" | "name-server" => {
                     if let Some(ip) = tail.first().and_then(|v| v.parse::<IpAddr>().ok()) {
                         if !subnet.name_servers.contains(&ip) {
@@ -364,21 +378,35 @@ impl EdgeConfig {
                         return;
                     };
                     let stop = tail.get(2).and_then(|v| v.parse::<IpAddr>().ok());
-                    subnet.ranges.push(DhcpRange { start: Some(value), stop });
+                    subnet.ranges.push(DhcpRange {
+                        start: Some(value),
+                        stop,
+                    });
                 }
                 "stop" => {
                     if let Some(stop) = tail.first().and_then(|v| v.parse::<IpAddr>().ok()) {
-                        if let Some(open) = subnet.ranges.iter_mut().find(|r| r.start.is_some() && r.stop.is_none()) {
+                        if let Some(open) = subnet
+                            .ranges
+                            .iter_mut()
+                            .find(|r| r.start.is_some() && r.stop.is_none())
+                        {
                             open.stop = Some(stop);
                         } else {
-                            subnet.ranges.push(DhcpRange { start: None, stop: Some(stop) });
+                            subnet.ranges.push(DhcpRange {
+                                start: None,
+                                stop: Some(stop),
+                            });
                         }
                     }
                 }
                 // classic EdgeOS leases: `static-mapping NAME ip-address X` / `mac-address Y`
                 "static-mapping" => {
                     let Some(name) = tail.first() else { return };
-                    let entry = match subnet.static_leases.iter_mut().find(|l| l.name.as_deref() == Some(name.as_str())) {
+                    let entry = match subnet
+                        .static_leases
+                        .iter_mut()
+                        .find(|l| l.name.as_deref() == Some(name.as_str()))
+                    {
                         Some(e) => e,
                         None => {
                             subnet.static_leases.push(StaticLease {
@@ -446,26 +474,36 @@ pub fn parse_arp_table(text: &str) -> Vec<ArpEntry> {
         if cols.len() < 2 {
             continue;
         }
-        let Ok(ip) = cols[0].parse::<IpAddr>() else { continue };
-        let Some(mac_idx) = cols[1..].iter().position(|c| MacAddress::parse(c).is_some()) else {
+        let Ok(ip) = cols[0].parse::<IpAddr>() else {
+            continue;
+        };
+        let Some(mac_idx) = cols[1..]
+            .iter()
+            .position(|c| MacAddress::parse(c).is_some())
+        else {
             continue;
         };
         let mac_idx = mac_idx + 1;
         let mac = MacAddress::parse(cols[mac_idx]).unwrap();
-        let (iface, kind) = if cols.get(mac_idx + 1) == Some(&"C") || cols.get(mac_idx + 1) == Some(&"R")
-        {
-            // ip neigh: flags then iface
-            (
-                cols.get(mac_idx + 2).unwrap_or(&"?").to_string(),
-                "dynamic".to_string(),
-            )
-        } else {
-            (
-                cols.get(mac_idx + 1).unwrap_or(&"?").to_string(),
-                cols.get(mac_idx + 2).unwrap_or(&"dynamic").to_string(),
-            )
-        };
-        out.push(ArpEntry { ip, mac, iface, kind });
+        let (iface, kind) =
+            if cols.get(mac_idx + 1) == Some(&"C") || cols.get(mac_idx + 1) == Some(&"R") {
+                // ip neigh: flags then iface
+                (
+                    cols.get(mac_idx + 2).unwrap_or(&"?").to_string(),
+                    "dynamic".to_string(),
+                )
+            } else {
+                (
+                    cols.get(mac_idx + 1).unwrap_or(&"?").to_string(),
+                    cols.get(mac_idx + 2).unwrap_or(&"dynamic").to_string(),
+                )
+            };
+        out.push(ArpEntry {
+            ip,
+            mac,
+            iface,
+            kind,
+        });
     }
     out
 }
@@ -574,7 +612,10 @@ garbage line here
 
     #[test]
     fn parses_host_name() {
-        assert_eq!(parse_host_name("Host name: er-10x").as_deref(), Some("er-10x"));
+        assert_eq!(
+            parse_host_name("Host name: er-10x").as_deref(),
+            Some("er-10x")
+        );
     }
 
     // The classic EdgeOS 2.x dialect, captured from a live EdgeRouter 6P.

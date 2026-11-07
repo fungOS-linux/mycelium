@@ -14,15 +14,20 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     if use_iroh && (value(args, "--advertise").is_some() || value(args, "--listen").is_some()) {
         return Err("--iroh uses its own rendezvous; omit HTTP --advertise and --listen".into());
     }
-    if use_iroh && (kind != crate::invite::InvitationKind::Peer
-        || value(args, "--uses").is_some_and(|uses| uses != "1")) {
+    if use_iroh
+        && (kind != crate::invite::InvitationKind::Peer
+            || value(args, "--uses").is_some_and(|uses| uses != "1"))
+    {
         return Err("Iroh pairing requires --kind peer and a single-use claim".into());
     }
     #[cfg(feature = "iroh-sync")]
     if use_iroh {
         crate::pair_iroh::fresh_sync()?;
         let name = value(args, "--name").ok_or("pairing requires --name")?;
-        if !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte)) {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte))
+        {
             return Err("Iroh peer name must be a DNS name or IP suitable for a TLS SAN".into());
         }
     }
@@ -71,11 +76,19 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     let created = crate::invite::create(&create_args)?;
     #[cfg(feature = "iroh-sync")]
     if use_iroh {
-        crate::pair_iroh::serve(ca, enrollment_ca, store, created,
+        crate::pair_iroh::serve(
+            ca,
+            enrollment_ca,
+            store,
+            created,
             value(args, "--name").expect("invitation requires name"),
             args.iter().any(|argument| argument == "--public-relays"),
-            args.iter().any(|argument| argument == "--qr")).await?;
-        return Ok(vec!["peer enrollment complete; Iroh pairing endpoint closed".into()]);
+            args.iter().any(|argument| argument == "--qr"),
+        )
+        .await?;
+        return Ok(vec![
+            "peer enrollment complete; Iroh pairing endpoint closed".into(),
+        ]);
     }
     let claim = crate::invite::encode_pair_claim(
         &advertise,

@@ -253,6 +253,48 @@ impl ServiceAdvertisement {
 pub struct NodeAnnotation {
     pub name: Option<String>,
     pub kind: Option<String>,
+    /// Operator-supplied physical site binding, independent of credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// Operator-selected site-to-site WireGuard gateway role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_gateway: Option<SiteGatewayAnnotation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SiteGatewayRole {
+    Hub,
+    Spoke,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteGatewayAnnotation {
+    pub interface: String,
+    pub role: SiteGatewayRole,
+    /// Explicit edge/service CIDRs exported by this gateway. Empty means the
+    /// future reconciler must derive them from the local site edge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefixes: Vec<String>,
+}
+
+/// A site label is one canonical DNS label. It is a routing/name boundary, not
+/// an ACL or an OIDC scope.
+pub fn valid_site_binding(site: &str) -> bool {
+    !site.is_empty()
+        && site.len() <= 63
+        && site
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        && site
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && site
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,7 +503,7 @@ pub struct Topology {
     pub resource_attachments:
         BTreeMap<fpl_resource_observation::ResourceId, fpl_resource_observation::Attachment>,
     pub conflicts: Vec<Conflict>,
-    pub updated_from: Vec<Origin>,
+    pub updated_from: BTreeSet<Origin>,
 }
 
 fn origin_key(o: &Origin) -> String {
@@ -545,11 +587,7 @@ impl Topology {
                 self.conflicts.push(conflict);
             }
         }
-        for origin in other.updated_from {
-            if !self.updated_from.contains(&origin) {
-                self.updated_from.push(origin);
-            }
-        }
+        self.updated_from.extend(other.updated_from);
     }
 
     pub fn observe_all(&mut self, obs: impl IntoIterator<Item = Observation>) -> TopologyReport {
@@ -1109,7 +1147,7 @@ impl Topology {
                 }
             }
         }
-        self.updated_from.push(obs_origin);
+        self.updated_from.insert(obs_origin);
     }
 
     fn device_node(
@@ -1250,6 +1288,12 @@ fn merge_node(target: &mut TopoNode, source: TopoNode) {
     if target.annotation.kind.is_none() {
         target.annotation.kind = source.annotation.kind;
     }
+    if target.annotation.site.is_none() {
+        target.annotation.site = source.annotation.site;
+    }
+    if target.annotation.site_gateway.is_none() {
+        target.annotation.site_gateway = source.annotation.site_gateway;
+    }
     target.facts.extend(source.facts);
 }
 
@@ -1366,6 +1410,22 @@ mod tests {
             .nodes
             .values()
             .any(|node| node.hostnames.contains("pi-visible")));
+    }
+
+    #[test]
+    fn repeated_provenance_does_not_grow_on_merge() {
+        let origin = Origin::new("peer", "scan").at_site("home");
+        let mut left = Topology::empty();
+        for _ in 0..10_000 {
+            left.updated_from.insert(origin.clone());
+        }
+        let mut right = Topology::empty();
+        for _ in 0..10_000 {
+            right.updated_from.insert(origin.clone());
+        }
+        left.merge_snapshot(right);
+        assert_eq!(left.updated_from.len(), 1);
+        assert!(left.updated_from.contains(&origin));
     }
 
     #[test]

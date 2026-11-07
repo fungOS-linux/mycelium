@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use fpl_resource_observation::{
     Confidence, Provenance, Service, ServiceCatalog, ServiceId, ServiceObservation, SCHEMA_VERSION,
 };
-use mycelium_core::{ServiceRecord, Topology};
+use mycelium_core::{ServiceAdvertisement, ServiceRecord, Topology};
 
 const SERVICE_TTL_SECONDS: u64 = 15 * 60;
 
@@ -32,15 +32,17 @@ pub fn project(topology: &Topology) -> ServiceCatalog {
             let Some((kind, confidence)) = recognize(service) else {
                 continue;
             };
+            let endpoint_scheme = application_scheme(service, &kind);
             // A listener observation identifies software, not its routability.
             // In particular Kubo RPC is administrative and loopback-only here.
             let endpoints = node
                 .ips
                 .keys()
                 .filter(|_| kind != "ipfs")
-                .map(|ip| endpoint(&service.transport, ip.to_string(), service.port))
+                .map(|ip| endpoint(endpoint_scheme, ip.to_string(), service.port))
                 .collect();
             let mut protocols = BTreeSet::from([service.transport.to_lowercase()]);
+            protocols.insert(endpoint_scheme.into());
             if kind == "mcp" {
                 protocols.insert("json-rpc".into());
             }
@@ -117,8 +119,164 @@ pub fn project(topology: &Topology) -> ServiceCatalog {
             });
         }
     }
+    for advertisement in topology.advertisements.values() {
+        let Some((kind, confidence)) = recognize_advertisement(advertisement) else {
+            continue;
+        };
+        let Some(port) = advertisement.port else {
+            continue;
+        };
+        let advertised_target = advertisement
+            .target
+            .as_deref()
+            .map(|target| target.trim_end_matches('.').trim_end_matches(".local"));
+        let matched_node = topology
+            .nodes
+            .iter()
+            .filter_map(|(node_id, node)| {
+                let address_match = advertisement
+                    .addresses
+                    .iter()
+                    .any(|address| node.ips.contains_key(address));
+                let listener_match = node.services.values().any(|service| {
+                    service.port == port && service.state == mycelium_core::ServiceState::Up
+                });
+                let identity_match = advertised_target.is_some_and(|target| {
+                    node_id.eq_ignore_ascii_case(target)
+                        || node
+                            .hostnames
+                            .iter()
+                            .any(|hostname| hostname.eq_ignore_ascii_case(target))
+                        || node
+                            .annotation
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(target))
+                });
+                let site_match = advertised_target.is_some_and(|target| {
+                    node.sites
+                        .iter()
+                        .any(|site| site.eq_ignore_ascii_case(target))
+                });
+                (address_match || listener_match || identity_match || site_match).then_some((
+                    (address_match, listener_match, identity_match, site_match),
+                    node_id,
+                    node,
+                ))
+            })
+            .max_by_key(|(rank, node_id, _)| (*rank, std::cmp::Reverse((*node_id).clone())))
+            .map(|(_, node_id, node)| (node_id, node));
+        let node_id = matched_node
+            .map(|(node_id, _)| node_id.clone())
+            .unwrap_or_else(|| {
+                advertisement
+                    .target
+                    .as_deref()
+                    .unwrap_or(&advertisement.instance)
+                    .trim_end_matches(".local")
+                    .trim_end_matches('.')
+                    .to_lowercase()
+            });
+        let scheme = advertisement_scheme(advertisement, &kind);
+        let addresses = if advertisement.addresses.is_empty() {
+            matched_node
+                .map(|(_, node)| node.ips.keys().copied().collect::<BTreeSet<_>>())
+                .unwrap_or_default()
+        } else {
+            advertisement.addresses.clone()
+        };
+        let endpoints = addresses
+            .iter()
+            .map(|address| endpoint(scheme, address.to_string(), port))
+            .collect();
+        let mut protocols = BTreeSet::from(["tcp".into(), scheme.into()]);
+        if kind == "mcp" {
+            protocols.insert("json-rpc".into());
+        }
+        let mut attributes = BTreeMap::from([
+            ("node_id".into(), node_id.clone()),
+            ("service_name".into(), advertisement.instance.clone()),
+            ("service_type".into(), advertisement.service_type.clone()),
+        ]);
+        if let Some(target) = &advertisement.target {
+            attributes.insert("target".into(), target.clone());
+        }
+        catalog.observations.push(ServiceObservation {
+            schema_version: SCHEMA_VERSION,
+            service_id: ServiceId(format!("service/{node_id}/{kind}/tcp/{port}")),
+            observed_at: advertisement.last_seen,
+            expires_at: advertisement.last_seen.saturating_add(
+                advertisement
+                    .ttl
+                    .map(u64::from)
+                    .unwrap_or(SERVICE_TTL_SECONDS),
+            ),
+            provenance: Provenance {
+                provider: "mycelium-topology".into(),
+                observer: advertisement
+                    .origins
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".into()),
+                source_id: Some(advertisement.key()),
+            },
+            confidence,
+            value: Service {
+                kind,
+                endpoints,
+                protocols,
+                formats: BTreeSet::new(),
+                attributes,
+            },
+        });
+    }
     catalog.normalize();
     catalog
+}
+
+fn recognize_advertisement(advertisement: &ServiceAdvertisement) -> Option<(String, Confidence)> {
+    let evidence = format!(
+        "{} {} {}",
+        advertisement.service_type, advertisement.instance, advertisement.domain
+    );
+    let service = ServiceRecord {
+        name: evidence,
+        transport: if advertisement.service_type.contains("._udp") {
+            "udp".into()
+        } else {
+            "tcp".into()
+        },
+        port: advertisement.port?,
+        product: None,
+        state: mycelium_core::ServiceState::Up,
+        observed_at: advertisement.last_seen,
+        origin: mycelium_core::Origin::new("advertisement", "dns-sd"),
+    };
+    recognize(&service)
+}
+
+fn advertisement_scheme<'a>(advertisement: &'a ServiceAdvertisement, kind: &str) -> &'a str {
+    advertisement
+        .txt
+        .iter()
+        .find_map(|entry| entry.strip_prefix("scheme="))
+        .filter(|scheme| matches!(*scheme, "http" | "https"))
+        .unwrap_or(if matches!(kind, "mcp" | "dcp") {
+            "http"
+        } else {
+            "tcp"
+        })
+}
+
+fn application_scheme<'a>(service: &'a ServiceRecord, kind: &str) -> &'a str {
+    if matches!(kind, "mcp" | "dcp")
+        && matches!(service.name.to_ascii_lowercase().as_str(), "http" | "https")
+    {
+        &service.name
+    } else {
+        &service.transport
+    }
 }
 
 fn endpoint(transport: &str, host: String, port: u16) -> String {
@@ -332,5 +490,157 @@ mod tests {
             .value
             .endpoints
             .contains("tcp://[2001:db8::10]:9443"));
+    }
+
+    #[test]
+    fn application_protocol_endpoints_do_not_leak_tcp_as_the_url_scheme() {
+        let mut topology = Topology::default();
+        let mut node = TopoNode {
+            id: "peer-a".into(),
+            ..TopoNode::default()
+        };
+        let address = "127.0.0.1".parse::<IpAddr>().unwrap();
+        node.ips.insert(
+            address,
+            IpRecord {
+                addr: address,
+                prefix: None,
+                vlan: None,
+                origins: BTreeSet::new(),
+            },
+        );
+        node.services.insert(
+            "tcp:8792/http".into(),
+            service("http", Some("DCP server"), 8792),
+        );
+        topology.nodes.insert(node.id.clone(), node);
+
+        let catalog = project(&topology);
+        assert_eq!(catalog.observations[0].value.kind, "dcp");
+        assert_eq!(
+            catalog.observations[0].value.endpoints,
+            BTreeSet::from(["http://127.0.0.1:8792".into()])
+        );
+        assert!(catalog.observations[0].value.protocols.contains("http"));
+    }
+
+    #[test]
+    fn explicit_dcp_advertisement_promotes_an_existing_listener() {
+        let mut topology = Topology::default();
+        let address = "192.168.10.74".parse::<IpAddr>().unwrap();
+        let mut node = TopoNode {
+            id: "linux-home-pi".into(),
+            ..TopoNode::default()
+        };
+        node.ips.insert(
+            address,
+            IpRecord {
+                addr: address,
+                prefix: None,
+                vlan: None,
+                origins: BTreeSet::new(),
+            },
+        );
+        node.services
+            .insert("tcp:7893/unknown".into(), service("unknown", None, 7893));
+        topology.nodes.insert(node.id.clone(), node);
+        topology.advertisements.insert(
+            "synesthesia._dcp._tcp.local".into(),
+            ServiceAdvertisement {
+                instance: "Synesthesia Studio".into(),
+                service_type: "_dcp._tcp".into(),
+                domain: "local".into(),
+                target: Some("home-pi.local".into()),
+                addresses: BTreeSet::from([address]),
+                port: Some(7893),
+                txt: BTreeSet::from(["scheme=http".into(), "path=/.well-known/dcp".into()]),
+                interface: Some("eth0".into()),
+                ttl: Some(120),
+                first_seen: 90,
+                last_seen: 100,
+                origins: BTreeSet::from(["home-pi:avahi-browse".into()]),
+            },
+        );
+
+        let catalog = project(&topology);
+        assert_eq!(catalog.observations.len(), 1);
+        let observation = &catalog.observations[0];
+        assert_eq!(observation.value.kind, "dcp");
+        assert_eq!(
+            observation.service_id.0,
+            "service/linux-home-pi/dcp/tcp/7893"
+        );
+        assert!(observation
+            .value
+            .endpoints
+            .contains("http://192.168.10.74:7893"));
+        assert_eq!(observation.expires_at, 220);
+    }
+
+    #[test]
+    fn advertisement_target_resolves_missing_addresses_from_topology() {
+        let mut topology = Topology::default();
+        let address = "192.168.10.74".parse::<IpAddr>().unwrap();
+        let mut node = TopoNode {
+            id: "linux-home-pi".into(),
+            hostnames: BTreeSet::from(["home-pi".into()]),
+            ..TopoNode::default()
+        };
+        node.ips.insert(
+            address,
+            IpRecord {
+                addr: address,
+                prefix: None,
+                vlan: None,
+                origins: BTreeSet::new(),
+            },
+        );
+        node.services
+            .insert("tcp:7893/unknown".into(), service("unknown", None, 7893));
+        topology.nodes.insert(node.id.clone(), node);
+        topology.nodes.insert(
+            "ip:100.76.214.103".into(),
+            TopoNode {
+                id: "ip:100.76.214.103".into(),
+                hostnames: BTreeSet::from(["home-pi".into()]),
+                ips: BTreeMap::from([(
+                    "100.76.214.103".parse::<IpAddr>().unwrap(),
+                    IpRecord {
+                        addr: "100.76.214.103".parse().unwrap(),
+                        prefix: None,
+                        vlan: None,
+                        origins: BTreeSet::new(),
+                    },
+                )]),
+                ..TopoNode::default()
+            },
+        );
+        topology.advertisements.insert(
+            "synesthesia-dcp._http._tcp.local".into(),
+            ServiceAdvertisement {
+                instance: "Synesthesia DCP".into(),
+                service_type: "_http._tcp".into(),
+                domain: "local".into(),
+                target: Some("home-pi.local".into()),
+                addresses: BTreeSet::new(),
+                port: Some(7893),
+                txt: BTreeSet::from(["scheme=http".into()]),
+                interface: None,
+                ttl: None,
+                first_seen: 90,
+                last_seen: 100,
+                origins: BTreeSet::new(),
+            },
+        );
+
+        let catalog = project(&topology);
+        assert_eq!(
+            catalog.observations[0].service_id.0,
+            "service/linux-home-pi/dcp/tcp/7893"
+        );
+        assert!(catalog.observations[0]
+            .value
+            .endpoints
+            .contains("http://192.168.10.74:7893"));
     }
 }

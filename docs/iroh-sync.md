@@ -8,6 +8,8 @@ Build the optional CLI/daemon runtime:
 
 ```sh
 cargo install --path crates/mycelium-cli --features iroh-sync --locked
+# Pkarr rendezvous is a separate opt-in feature:
+cargo install --path crates/mycelium-cli --features pkarr --locked
 ```
 
 On each already-enrolled peer, retain the existing `MYCELIUM_PEER_CA`,
@@ -79,7 +81,7 @@ mycelium sync relays enable --write
 # Restart the existing systemd user service or LaunchAgent.
 ```
 
-Use `relays disable --write` to restore direct-only policy. No public DNS record,
+Use `relays disable --write` to restore direct-only policy. No `.myc` DNS record,
 UPnP mapping, cloud firewall rule, WireGuard route, or ACL is changed. Removing
 TCP access alone does not guarantee Iroh connectivity: direct UDP must work or
 relay policy must be enabled. TLS SAN checks and both TLS/Iroh signed bindings
@@ -161,6 +163,50 @@ yet issued by enrollment and do not replace mTLS.
 ```
 
 Public n0 relays are opt-in via `public_relays: true` followed by restart.
+
+## Pkarr rendezvous (optional)
+
+Pkarr is a public rendezvous: a signed endpoint record maps an Iroh endpoint ID
+to relay/direct hints. It is discovery, **not** an access grant, and it is
+independent of Mycelium `.myc` DNS and the signed sync hints in gossip.
+
+Build with the `pkarr` feature (it enables `iroh-sync`):
+
+```sh
+cargo build --release -p mycelium-cli --features pkarr
+```
+
+Enable only resolution:
+
+```json
+{
+  "public_relays": false,
+  "seeds": [],
+  "pkarr": {
+    "publish": false,
+    "resolve": true,
+    "relay": "https://dns.iroh.link/pkarr",
+    "include_direct_addresses": false
+  }
+}
+```
+
+Publishing adds this endpoint to the public relay. It requires either
+`public_relays: true` or explicit `include_direct_addresses: true`; the default
+filter publishes relay URLs only, never LAN addresses. The CLI shortcut enables
+both discovery directions and public relays:
+
+```sh
+mycelium sync pkarr enable --write
+# Restart the existing systemd user service or LaunchAgent.
+mycelium sync pkarr disable --write
+```
+
+A binary built without `--features pkarr` fails loudly if the JSON enables
+Publish or resolve, rather than silently ignoring the section. The relay is a
+deployment choice; `https://dns.iroh.link/pkarr` is only the n0 default.
+Pkarr records do not replace the TLS name/identity binding, enrollment, access
+grants, or the post-dial `mycelium/sync/1` authentication.
 With them disabled, this slice requires reachable direct addresses (LAN or
 an existing routed overlay). WAN/NAT hole-punch and relay behavior has not
 been qualified across the fleet. Public DNS endpoint lookup/publication and
@@ -182,10 +228,52 @@ restarting disables the runtime; retain the transport key for stable identity.
 
 ```sh
 cargo check -p mycelium-cli --features iroh-sync --tests
+cargo check -p mycelium-cli --features pkarr --tests
 cargo test -p myceliumd --features iroh-sync iroh_sync
+cargo test -p myceliumd --features pkarr iroh_sync
 cargo test -p myceliumd peer_framing_bounds_and_cancellation
 cargo test -p mycelium-cli --features iroh-sync pair_iroh -- --test-threads=1
 ```
 
 Tests use isolated loopback Iroh endpoints and freshly generated test mTLS
 certificates; they do not need relays, fleet credentials, or production peers.
+
+## Gossiped fleet index
+
+`mycelium index` publishes a signed fleet directory over the existing
+authenticated peer gossip. It is an Iroh endpoint discovery hint, not an access
+grant and not a replacement for each endpoint's own Pkarr record.
+
+```sh
+mycelium index publish --write
+mycelium index list
+mycelium index list --json
+```
+
+The publisher is the local node. The record is carried in the same signed peer
+envelope and mTLS transport as Hello, topology, access, and authority records:
+
+- only an authenticated fleet peer can inject gossip;
+- the record names its publisher's node ID and is validated against the
+  envelope origin;
+- there is no separate index signing key, encryption key, pointer, HTTP
+  service, or public Pkarr entry;
+- a record expires after 24 hours and `list` marks an expired snapshot.
+
+The index contains endpoint IDs, hostnames, sites, and the owning Mycelium node
+ID. It is visible only to peers that can authenticate to the mesh. Pkarr's
+public relay continues to carry only per-endpoint Iroh rendezvous hints, never
+the fleet directory.
+
+No out-of-band key is required. The fleet CA and the existing peer identity are
+the trust anchor. Per-endpoint Pkarr packets remain authoritative for actual
+connection hints; the gossiped index only tells a peer which endpoint IDs exist.
+
+A future slice can add a narrow authority capability (for example
+`index_publish`) if the fleet wants only designated publishers. Today the
+record is a discovery hint and any authenticated peer can publish one; consumers
+should treat it as advisory and verify each endpoint's own record before use.
+
+Mixed-version fleets: an older daemon treats `fleet_index` as an unknown event
+and does not store or forward it. Upgrade the peers before expecting fleet-wide
+index convergence.

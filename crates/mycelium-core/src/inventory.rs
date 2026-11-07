@@ -89,7 +89,11 @@ pub struct InvokeResult {
 
 impl InvokeResult {
     pub fn new(device: DeviceId, capability: impl Into<String>, result: CapResult) -> Self {
-        Self { device, capability: capability.into(), result }
+        Self {
+            device,
+            capability: capability.into(),
+            result,
+        }
     }
 }
 
@@ -212,7 +216,10 @@ mod tests {
 
         // happy path
         let ctx = ExecContext::readonly("test.echo");
-        let out = dev.invoke(&ctx, "test.echo", params!("msg" => "hi")).await.unwrap();
+        let out = dev
+            .invoke(&ctx, "test.echo", params!("msg" => "hi"))
+            .await
+            .unwrap();
         assert_eq!(out.output, Value::Str("test.echo:1".into()));
 
         // unknown cap
@@ -220,13 +227,22 @@ mod tests {
         assert!(matches!(err, MyceliumError::UnknownCapability(_)));
 
         // missing required param
-        let err = dev.invoke(&ctx, "test.echo", Params::new()).await.unwrap_err();
+        let err = dev
+            .invoke(&ctx, "test.echo", Params::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, MyceliumError::Validation(_)));
 
         // write gate refuses mutation without allow_writes
-        let gated =
-            ExecContext { capability: "test.apply".into(), allow_writes: false, dry_run: false };
-        let err = dev.invoke(&gated, "test.apply", Params::new()).await.unwrap_err();
+        let gated = ExecContext {
+            capability: "test.apply".into(),
+            allow_writes: false,
+            dry_run: false,
+        };
+        let err = dev
+            .invoke(&gated, "test.apply", Params::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, MyceliumError::WritesNotPermitted(_)));
 
         // Planning a mutation never requires write permission.

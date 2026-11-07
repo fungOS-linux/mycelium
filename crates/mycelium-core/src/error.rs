@@ -42,6 +42,9 @@ pub enum MyceliumError {
 
 impl MyceliumError {
     pub fn unsupported(device: impl Into<String>, capability: impl Into<String>) -> Self {
-        MyceliumError::Unsupported { device: device.into(), capability: capability.into() }
+        MyceliumError::Unsupported {
+            device: device.into(),
+            capability: capability.into(),
+        }
     }
 }

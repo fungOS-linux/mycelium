@@ -85,9 +85,7 @@ impl TopologyFeed {
         Ok(Self { generations, path })
     }
 
-    pub fn observe(&mut self, mut topology: Topology) -> Result<&TopologyGeneration, String> {
-        topology.updated_from.sort_by_key(origin_key);
-        topology.updated_from.dedup();
+    pub fn observe(&mut self, topology: Topology) -> Result<&TopologyGeneration, String> {
         let generation = topology_digest(&topology)?;
         if self
             .generations
@@ -104,7 +102,7 @@ impl TopologyFeed {
                 sequence,
                 observed_at: now(),
                 complete: true,
-                provenance: topology.updated_from.clone(),
+                provenance: topology.updated_from.iter().cloned().collect(),
                 topology,
             });
             while self.generations.len() > MAX_RETAINED_GENERATIONS {
@@ -152,15 +150,6 @@ impl TopologyFeed {
         .map_err(|error| error.to_string())?;
         atomic_write(&self.path, &bytes)
     }
-}
-
-fn origin_key(origin: &Origin) -> String {
-    format!(
-        "{}/{}/{}",
-        origin.site.as_deref().unwrap_or(""),
-        origin.device,
-        origin.source
-    )
 }
 
 fn topology_digest(topology: &Topology) -> Result<String, String> {

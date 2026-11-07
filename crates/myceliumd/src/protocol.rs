@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     Hello,
     NodeObserve,
-    NodeRefresh { write: bool },
+    NodeRefresh {
+        write: bool,
+    },
+    /// Current site selected from local attachment + persisted topology.
+    Site,
     /// Registered drivers (builtin + Lua plugins).
     Drivers,
     /// Recognize + open a device. `driver` pins the class; otherwise each
@@ -178,6 +182,12 @@ pub enum Request {
     },
     /// Return the locally converged view of signed peer observations.
     PeerList,
+    /// Return the latest gossiped fleet Iroh index, if one is present.
+    FleetIndexList,
+    /// Publish the local node's signed fleet Iroh index through peer gossip.
+    FleetIndexPublish {
+        snapshot: mycelium_peer_protocol::FleetIndexSnapshot,
+    },
     EgressList,
     EgressPublish {
         observation: mycelium_peer_protocol::EgressObservation,
@@ -346,6 +356,30 @@ pub enum Request {
         name: Option<String>,
         #[serde(default)]
         kind: Option<String>,
+        #[serde(default)]
+        write: bool,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// List operator-selected site WireGuard gateways from converged topology.
+    SiteGatewayList,
+    /// Mark one node as its site's WireGuard hub or spoke gateway.
+    SiteGatewaySet {
+        selector: String,
+        #[serde(default)]
+        site: Option<String>,
+        interface: String,
+        role: mycelium_core::topology::SiteGatewayRole,
+        #[serde(default)]
+        prefixes: Vec<String>,
+        #[serde(default)]
+        write: bool,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// Remove the site gateway role from one node.
+    SiteGatewayClear {
+        selector: String,
         #[serde(default)]
         write: bool,
         #[serde(default)]

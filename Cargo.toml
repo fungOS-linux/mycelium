@@ -32,6 +32,7 @@ semver = "1"
 indexmap = { version = "2", features = ["serde"] }
 jsonwebtoken = "9"
 memchr = "2"
+object = { version = "0.37", default-features = false, features = ["read_core", "elf"] }
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 thiserror = "2"

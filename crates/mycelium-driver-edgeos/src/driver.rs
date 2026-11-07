@@ -17,7 +17,9 @@ pub struct EdgeOsDriver {
 
 impl Default for EdgeOsDriver {
     fn default() -> Self {
-        Self { connect_timeout: Duration::from_secs(8) }
+        Self {
+            connect_timeout: Duration::from_secs(8),
+        }
     }
 }
 

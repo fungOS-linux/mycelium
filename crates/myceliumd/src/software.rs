@@ -761,16 +761,27 @@ fn activate_from(
 
 /// Reuse checked activation and rollback with caller-owned roots. Privileged
 /// callers must first authorize the signer and protect both directories.
-pub fn activate_in(manifest: &PackageManifest, artifacts: &Path, software: &Path, lifecycle: Option<&dyn crate::software_service::Lifecycle>) -> Result<ActivatedPackage, AnyError> {
-    activate_transaction(manifest,artifacts,software,lifecycle)
+pub fn activate_in(
+    manifest: &PackageManifest,
+    artifacts: &Path,
+    software: &Path,
+    lifecycle: Option<&dyn crate::software_service::Lifecycle>,
+) -> Result<ActivatedPackage, AnyError> {
+    activate_transaction(manifest, artifacts, software, lifecycle)
 }
 
-pub fn recover_in(name: &str, software: &Path, lifecycle: &dyn crate::software_service::Lifecycle) -> Result<(), AnyError> {
-    validate_label("package",name)?;
+pub fn recover_in(
+    name: &str,
+    software: &Path,
+    lifecycle: &dyn crate::software_service::Lifecycle,
+) -> Result<(), AnyError> {
+    validate_label("package", name)?;
     let directory = software.join(name);
-    if !directory.exists() {return Ok(());}
+    if !directory.exists() {
+        return Ok(());
+    }
     let _lock = activation_lock(&directory)?;
-    recover_activation(&directory,name,Some(lifecycle))
+    recover_activation(&directory, name, Some(lifecycle))
 }
 
 fn activate_transaction(

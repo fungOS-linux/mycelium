@@ -65,8 +65,10 @@ pub(crate) fn sign_csr(
     std::fs::write(&csr, csr_pem).map_err(|error| format!("stage peer CSR: {error}"))?;
     std::fs::write(
         &extensions,
-        format!("[mycelium_peer]\nextendedKeyUsage=serverAuth,clientAuth\n{}\n",
-            subject_alt_name(&std::collections::BTreeSet::from([expected_name]))),
+        format!(
+            "[mycelium_peer]\nextendedKeyUsage=serverAuth,clientAuth\n{}\n",
+            subject_alt_name(&std::collections::BTreeSet::from([expected_name]))
+        ),
     )
     .map_err(|error| format!("stage peer certificate extensions: {error}"))?;
     openssl_string(&[
@@ -293,7 +295,9 @@ pub fn install(bundle: &Path, home: &Path) -> Result<Vec<String>, ClientError> {
         )?,
     )
     .map_err(ClientError::Io)?;
-    if packaged { owner_only(&home.join("node.env"))?; }
+    if packaged {
+        owner_only(&home.join("node.env"))?;
+    }
     let service = if packaged {
         crate::packaged::service_path()
     } else if cfg!(target_os = "macos") {
@@ -322,7 +326,15 @@ pub fn install(bundle: &Path, home: &Path) -> Result<Vec<String>, ClientError> {
     };
     Ok(vec![
         format!("installed enrolled peer under {}", home.display()),
-        format!("{} {}; service was not started", if packaged { "retained package-owned" } else { "wrote" }, service.display()),
+        format!(
+            "{} {}; service was not started",
+            if packaged {
+                "retained package-owned"
+            } else {
+                "wrote"
+            },
+            service.display()
+        ),
     ])
 }
 
@@ -359,7 +371,8 @@ pub(crate) fn install_peer_material(
             &std::env::current_exe().map_err(|error| format!("locate current binary: {error}"))?,
             &bin,
             0o755,
-        ).map_err(|error| error.to_string())?;
+        )
+        .map_err(|error| error.to_string())?;
     }
     copy_mode(key, &pki.join("node-key.pem"), 0o600).map_err(|error| error.to_string())?;
     std::fs::write(pki.join("node.pem"), certificate_pem)
@@ -372,19 +385,26 @@ pub(crate) fn install_peer_material(
     let peers = peers.join(",");
     std::fs::write(
         home.join("node.env"),
-        format!("{}{}", resolved_env(
-            home,
-            site,
-            &peers,
-            &authority_keys,
-            &release_keys,
-            &access_keys,
-        )
-        .map_err(|error| error.to_string())?, iroh_server_name
-            .map(|name| format!("MYCELIUM_IROH_SERVER_NAME={name}\n")).unwrap_or_default()),
+        format!(
+            "{}{}",
+            resolved_env(
+                home,
+                site,
+                &peers,
+                &authority_keys,
+                &release_keys,
+                &access_keys,
+            )
+            .map_err(|error| error.to_string())?,
+            iroh_server_name
+                .map(|name| format!("MYCELIUM_IROH_SERVER_NAME={name}\n"))
+                .unwrap_or_default()
+        ),
     )
     .map_err(|error| format!("write node environment: {error}"))?;
-    if packaged { owner_only(&home.join("node.env")).map_err(|error| error.to_string())?; }
+    if packaged {
+        owner_only(&home.join("node.env")).map_err(|error| error.to_string())?;
+    }
     let service = write_peer_service(
         home,
         site,
@@ -865,8 +885,14 @@ mod tests {
     fn system_service_uses_the_system_manager() {
         assert_eq!(
             systemd_start_commands(true),
-            &[&["daemon-reload"][..], &["enable", "--now", "mycelium.service"]]
+            &[
+                &["daemon-reload"][..],
+                &["enable", "--now", "mycelium.service"]
+            ]
         );
-        assert_eq!(systemd_start_commands(false)[0], &["--user", "daemon-reload"]);
+        assert_eq!(
+            systemd_start_commands(false)[0],
+            &["--user", "daemon-reload"]
+        );
     }
 }

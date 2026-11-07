@@ -15,7 +15,10 @@ pub const MAX_SSH_RENEWAL_DELIVERIES: usize = 32;
 /// Stable, presentation-independent SSH principal. Roles alone are not human
 /// identity: two operators must not impersonate each other's Unix accounts.
 pub fn ssh_role_principal(principal: &str, role: &str) -> String {
-    format!("mycelium-principal-{}-{role}",sha256_hex(principal.as_bytes()))
+    format!(
+        "mycelium-principal-{}-{role}",
+        sha256_hex(principal.as_bytes())
+    )
 }
 
 /// The Rust target of the currently running binary. Publication uses this
@@ -104,6 +107,90 @@ pub struct SyncHints {
     pub expires_at: u64,
 }
 
+pub const MAX_FLEET_INDEX_ENDPOINTS: usize = 4096;
+
+/// One Iroh endpoint in a gossiped fleet directory. The endpoint's own signed
+/// Pkarr record remains authoritative for connection hints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetIndexEndpoint {
+    pub node_id: String,
+    pub hostname: String,
+    pub site: String,
+    pub endpoint_id: String,
+}
+
+/// A node's signed view of the fleet's Iroh endpoints. Gossip is the transport;
+/// the enclosing peer envelope authenticates the publisher. This is discovery,
+/// never an access grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetIndexSnapshot {
+    pub node_id: String,
+    pub generated_at: u64,
+    pub expires_at: u64,
+    pub endpoints: Vec<FleetIndexEndpoint>,
+}
+
+impl FleetIndexSnapshot {
+    pub fn validate_for(&self, origin: &str) -> Result<(), String> {
+        if self.node_id != origin {
+            return Err("fleet index owner mismatch".into());
+        }
+        if self.endpoints.len() > MAX_FLEET_INDEX_ENDPOINTS {
+            return Err("fleet index exceeds endpoint limit".into());
+        }
+        if self.generated_at >= self.expires_at {
+            return Err("fleet index expiry must follow generation".into());
+        }
+        if self.expires_at.saturating_sub(self.generated_at) > 7 * 24 * 60 * 60 {
+            return Err("fleet index lifetime exceeds seven days".into());
+        }
+        let mut endpoints = BTreeSet::new();
+        for endpoint in &self.endpoints {
+            if !valid_index_key(&endpoint.node_id) || !valid_index_key(&endpoint.endpoint_id) {
+                return Err("fleet index keys must be 32-byte hex values".into());
+            }
+            if endpoint.hostname.is_empty()
+                || endpoint.hostname.len() > 253
+                || !endpoint
+                    .hostname
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic())
+            {
+                return Err("fleet index hostname is invalid".into());
+            }
+            if !valid_index_site(&endpoint.site) {
+                return Err("fleet index site is not a canonical DNS label".into());
+            }
+            if !endpoints.insert(&endpoint.endpoint_id) {
+                return Err("fleet index contains a duplicate endpoint".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_index_key(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_index_site(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressObservation {
     pub node_id: String,
@@ -161,6 +248,7 @@ pub enum PeerEvent {
     Authority(AuthorityRecord),
     Endpoint(PeerEndpointObservation),
     Egress(EgressObservation),
+    FleetIndex(FleetIndexSnapshot),
     Access(AccessRecord),
     SshCredentialRequest(SshRenewalRequest),
     SshCredentialResponses(Vec<SshRenewalDelivery>),
@@ -186,6 +274,7 @@ enum KnownPeerEvent {
     Authority(AuthorityRecord),
     Endpoint(PeerEndpointObservation),
     Egress(EgressObservation),
+    FleetIndex(FleetIndexSnapshot),
     Access(AccessRecord),
     SshCredentialRequest(SshRenewalRequest),
     SshCredentialResponses(Vec<SshRenewalDelivery>),
@@ -214,6 +303,7 @@ impl<'de> Deserialize<'de> for PeerEvent {
                     | "authority"
                     | "endpoint"
                     | "egress"
+                    | "fleet_index"
                     | "access"
                     | "ssh_credential_request"
                     | "ssh_credential_responses"
@@ -239,6 +329,7 @@ impl<'de> Deserialize<'de> for PeerEvent {
             KnownPeerEvent::Authority(value) => Self::Authority(value),
             KnownPeerEvent::Endpoint(value) => Self::Endpoint(value),
             KnownPeerEvent::Egress(value) => Self::Egress(value),
+            KnownPeerEvent::FleetIndex(value) => Self::FleetIndex(value),
             KnownPeerEvent::Access(value) => Self::Access(value),
             KnownPeerEvent::SshCredentialRequest(value) => Self::SshCredentialRequest(value),
             KnownPeerEvent::SshCredentialResponses(value) => Self::SshCredentialResponses(value),
@@ -1133,6 +1224,38 @@ fn decode_array<const N: usize>(text: &str) -> Result<[u8; N], String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fleet_index_validates_owner_labels_and_duplicates() {
+        let node_id = "a".repeat(64);
+        let endpoint_id = "b".repeat(64);
+        let snapshot = FleetIndexSnapshot {
+            node_id: node_id.clone(),
+            generated_at: 100,
+            expires_at: 200,
+            endpoints: vec![FleetIndexEndpoint {
+                node_id: node_id.clone(),
+                hostname: "home-pi".into(),
+                site: "wagar-house".into(),
+                endpoint_id: endpoint_id.clone(),
+            }],
+        };
+        assert!(snapshot.validate_for(&node_id).is_ok());
+        assert!(snapshot.validate_for(&"c".repeat(64)).is_err());
+
+        let mut bad_site = snapshot.clone();
+        bad_site.endpoints[0].site = "Wagar House".into();
+        assert!(bad_site.validate_for(&node_id).is_err());
+
+        let mut duplicate = snapshot.clone();
+        duplicate.endpoints.push(snapshot.endpoints[0].clone());
+        assert!(duplicate.validate_for(&node_id).is_err());
+
+        let event = PeerEvent::FleetIndex(snapshot.clone());
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["kind"], "fleet_index");
+        assert_eq!(serde_json::from_value::<PeerEvent>(encoded).unwrap(), event);
+    }
+
     #[test]
     fn security_module_kind_round_trips() {
         let encoded = serde_json::to_string(&super::HardwareKind::SecurityModule).unwrap();

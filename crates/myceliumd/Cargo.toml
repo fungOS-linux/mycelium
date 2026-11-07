@@ -13,6 +13,7 @@ path = "src/lib.rs"
 default = []
 iroh-discovery = ["dep:mycelium-iroh-discovery"]
 iroh-sync = ["iroh-discovery", "dep:iroh"]
+pkarr = ["iroh-sync", "dep:url"]
 
 [[bin]]
 name = "myceliumd"
@@ -40,9 +41,13 @@ rumqttc = "0.25"
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+url = { version = "2", optional = true }
 ed25519-dalek.workspace = true
 rand_core.workspace = true
 ssh-key = { version = "=0.7.0-rc.11", features = ["crypto"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 rcgen = "0.13"

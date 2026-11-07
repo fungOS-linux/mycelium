@@ -13,6 +13,8 @@ movement detection; adjacent systems remain replaceable adapters.
 
 Optional [Iroh peer sync](docs/iroh-sync.md) carries existing authenticated
 gossip over QUIC, with expiring public rendezvous QR codes for enrolled peers.
+A separate `pkarr` feature adds opt-in Pkarr endpoint discovery; it is never an
+access grant and does not replace `.myc` DNS.
 
 Desired state follows one boundary: intent produces read-only proposals, and
 supported proposals lower into the single vendor-neutral `ActionPlan` executor.

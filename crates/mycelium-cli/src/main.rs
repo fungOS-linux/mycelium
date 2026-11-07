@@ -8,14 +8,15 @@
 mod completions;
 mod dns;
 mod enroll;
+mod fleet_index;
 mod host_access;
 mod host_supervisor;
 mod invite;
 mod node;
 mod oidc;
 mod oidc_gateway;
-mod pair;
 mod packaged;
+mod pair;
 #[cfg(feature = "iroh-sync")]
 mod pair_iroh;
 mod setup;
@@ -40,8 +41,14 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // PAM account checks are synchronous, offline and do not need Tokio's
     // per-core thread pool or package/daemon startup configuration.
-    if args.get(0).is_some_and(|v|v=="access") && args.get(1).is_some_and(|v|v=="host") && args.get(2).is_some_and(|v|v=="pam-check") {
-        if let Err(error)=host_access::pam_check(&args[2..]) {eprintln!("mycelium: PAM account denied: {error}");std::process::exit(2);}
+    if args.get(0).is_some_and(|v| v == "access")
+        && args.get(1).is_some_and(|v| v == "host")
+        && args.get(2).is_some_and(|v| v == "pam-check")
+    {
+        if let Err(error) = host_access::pam_check(&args[2..]) {
+            eprintln!("mycelium: PAM account denied: {error}");
+            std::process::exit(2);
+        }
         return;
     }
     if let Err(error) = packaged::configure_cli() {
@@ -79,8 +86,13 @@ fn main() {
 }
 
 fn self_check() -> String {
-    format!("mycelium {} protocol {} iroh-sync={}", env!("CARGO_PKG_VERSION"),
-        mycelium_peer_protocol::PROTOCOL_VERSION, cfg!(feature = "iroh-sync"))
+    format!(
+        "mycelium {} protocol {} iroh-sync={} pkarr={}",
+        env!("CARGO_PKG_VERSION"),
+        mycelium_peer_protocol::PROTOCOL_VERSION,
+        cfg!(feature = "iroh-sync"),
+        cfg!(feature = "pkarr")
+    )
 }
 
 fn rt_block<'a, F>(fut: F) -> Result<Vec<String>, ClientError>
@@ -102,6 +114,9 @@ usage:
   mycelium completions zsh|bash|fish
   mycelium sync enable --write | export [--qr] | join <rendezvous.json> --write
   mycelium sync relays enable|disable --write
+  mycelium sync pkarr enable|disable --write
+  mycelium index publish --write [--json]
+  mycelium index list [--json]
   mycelium pair --kind peer --iroh --qr --name NAME --site SITE [--public-relays] [--ttl 15m]
   mycelium setup [--gateway HTTPS-URL] [--claim CODE|--claim-file PATH] [--system-service] [--ttl 8h] [--key PATH] [--certificate PATH]
   mycelium setup --repair [--site SITE] [--path MYCELIUM-HOME] [--system-service]
@@ -162,6 +177,7 @@ usage:
   mycelium software apt apply PLAN.json DIGEST --write
   mycelium software apt recover --write
   mycelium software apt health PACKAGE /usr/bin/EXECUTABLE
+  mycelium site [--json]
   mycelium node status [--json]
   mycelium node plan INTENT.json [--json]
   mycelium node apply --plan PLAN.json (--write | --dry-run) [--json]
@@ -229,6 +245,10 @@ usage:
   mycelium enroll install --bundle DIR [--path MYCELIUM-HOME] --write
   mycelium map [--json]
   mycelium annotate <node> [--name NAME] [--kind KIND] --write [--dry-run]
+  mycelium site gateway list [--json]
+  mycelium site gateway plan [--interface mycelium0] [--json]
+  mycelium site gateway set <node> --role hub|spoke [--site SITE] [--interface mycelium0] [--subnet CIDR]... --write [--dry-run] [--json]
+  mycelium site gateway clear <node> --write [--dry-run] [--json]
   mycelium boot-path <device> --target <IP-or-URL>... [--json]
   mycelium nbde plan <device> --tang <IP-or-URL>... --threshold N [--json]
   mycelium tunnel <target>:<port> [--via DEVICE] [--local-port N] [--write] [--json]
@@ -662,6 +682,7 @@ async fn run(cmd: &str, args: &[String]) -> Result<Vec<String>, ClientError> {
         "releases" => releases(args).await,
         "packages" => packages(args).await,
         "software" => software(args).await,
+        "site" => site(args).await,
         "node" => node::run(args).await.map_err(access_error),
         "access" => access(args).await,
         "authority" => authority(args).await,
@@ -669,6 +690,7 @@ async fn run(cmd: &str, args: &[String]) -> Result<Vec<String>, ClientError> {
         "wireguard" => wireguard_command(args).await,
         "egress" => egress_command(args).await,
         "dns" => dns_command(args).await,
+        "index" => fleet_index::run(args).await,
         "security" => security_command(args).await,
         "enroll" => enroll_command(args).await,
         "annotate" => {
@@ -789,6 +811,210 @@ async fn topology_watch(args: &[String]) -> Result<Vec<String>, ClientError> {
     }
 }
 
+async fn site(args: &[String]) -> Result<Vec<String>, ClientError> {
+    if args.first().is_some_and(|argument| argument == "gateway") {
+        return site_gateway(&args[1..]).await;
+    }
+    if args.iter().any(|argument| argument != "--json") {
+        return Err(err_usage("site accepts only --json"));
+    }
+    let json = args.iter().any(|argument| argument == "--json");
+    let mut client = connect().await?;
+    let value = client.call(&Request::Site).await?;
+    if json {
+        return Ok(vec![value.to_string()]);
+    }
+    let mut lines = vec![format!(
+        "site: {} (source={})",
+        value["site"].as_str().unwrap_or("unknown"),
+        value["source"].as_str().unwrap_or("unknown"),
+    )];
+    if let Some(reason) = value["reason"].as_str() {
+        lines.push(format!("reason: {reason}"));
+    }
+    for matched in value["matches"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "match: segment={} interface={} address={} observers={}",
+            matched["segment"].as_str().unwrap_or("?"),
+            matched["interface"].as_str().unwrap_or("?"),
+            matched["address"].as_str().unwrap_or("?"),
+            matched["observers"]
+                .as_array()
+                .map(|observers| observers
+                    .iter()
+                    .filter_map(|observer| observer.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","))
+                .unwrap_or_default(),
+        ));
+    }
+    Ok(lines)
+}
+
+async fn site_gateway(args: &[String]) -> Result<Vec<String>, ClientError> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let value = |flag: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].clone())
+    };
+    let has = |flag: &str| args.iter().any(|argument| argument == flag);
+    let json = has("--json");
+    let prefixes = args
+        .windows(2)
+        .filter(|pair| pair[0] == "--subnet")
+        .map(|pair| pair[1].clone())
+        .collect::<Vec<_>>();
+    let mut client = connect().await?;
+    match action {
+        "list" => {
+            let gateways = client.call(&Request::SiteGatewayList).await?;
+            if json {
+                return Ok(vec![gateways.to_string()]);
+            }
+            let mut lines = vec!["Site gateways:".into()];
+            for gateway in gateways.as_array().into_iter().flatten() {
+                lines.push(format!(
+                    "  {} site={} role={} interface={}",
+                    gateway["hostname"].as_str().unwrap_or("?"),
+                    gateway["site"].as_str().unwrap_or("?"),
+                    gateway["role"].as_str().unwrap_or("?"),
+                    gateway["interface"].as_str().unwrap_or("?"),
+                ));
+            }
+            Ok(lines)
+        }
+        "set" => {
+            let selector = args
+                .get(1)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or_else(|| err_usage("site gateway set needs NODE"))?;
+            let role = match value("--role").as_deref().unwrap_or("spoke") {
+                "hub" => mycelium_core::topology::SiteGatewayRole::Hub,
+                "spoke" => mycelium_core::topology::SiteGatewayRole::Spoke,
+                other => {
+                    return Err(err_usage(&format!(
+                        "--role must be `hub` or `spoke`, got `{other}`"
+                    )))
+                }
+            };
+            let interface = value("--interface").unwrap_or_else(|| "mycelium0".into());
+            let result = client
+                .call(&Request::SiteGatewaySet {
+                    selector: selector.to_owned(),
+                    site: value("--site"),
+                    interface,
+                    role,
+                    prefixes,
+                    write: has("--write"),
+                    dry_run: has("--dry-run"),
+                })
+                .await?;
+            if json {
+                Ok(vec![result.to_string()])
+            } else {
+                Ok(vec![format!(
+                    "site gateway {} site={} role={} interface={}{}",
+                    result["node"].as_str().unwrap_or("?"),
+                    result["site"].as_str().unwrap_or("?"),
+                    result["role"].as_str().unwrap_or("?"),
+                    result["interface"].as_str().unwrap_or("?"),
+                    if result["dry_run"].as_bool() == Some(true) {
+                        " (dry run)"
+                    } else {
+                        ""
+                    },
+                )])
+            }
+        }
+        "plan" => {
+            let gateways = client.call(&Request::SiteGatewayList).await?;
+            let rows = gateways
+                .as_array()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let hub = rows
+                .iter()
+                .find(|gateway| gateway["role"].as_str() == Some("hub"))
+                .ok_or_else(|| err_usage("site gateway plan needs exactly one hub gateway"))?;
+            let hub_node = hub["node"]
+                .as_str()
+                .ok_or_else(|| err_usage("hub gateway has no node id"))?;
+            let interface = value("--interface").unwrap_or_else(|| "mycelium0".into());
+            let mut links = Vec::new();
+            for spoke in rows
+                .iter()
+                .filter(|gateway| gateway["role"].as_str() == Some("spoke"))
+            {
+                let Some(spoke_node) = spoke["node"].as_str() else {
+                    continue;
+                };
+                let output = wireguard_command(&[
+                    "plan".into(),
+                    hub_node.to_owned(),
+                    spoke_node.to_owned(),
+                    "--interface".into(),
+                    interface.clone(),
+                    "--json".into(),
+                ])
+                .await?;
+                if let Some(plan) = output.first() {
+                    links.push(
+                        serde_json::from_str::<serde_json::Value>(plan).map_err(|error| {
+                            err_usage(&format!("decode WireGuard plan: {error}"))
+                        })?,
+                    );
+                }
+            }
+            let result = serde_json::json!({"hub": hub, "links": links});
+            if json {
+                Ok(vec![result.to_string()])
+            } else {
+                let mut lines = vec![format!(
+                    "Site gateway star: hub={} spokes={}",
+                    hub["hostname"].as_str().unwrap_or("?"),
+                    links.len()
+                )];
+                for link in &links {
+                    lines.push(format!(
+                        "  {} -> {} ready={} path={}",
+                        link["left"]["local"]["hostname"].as_str().unwrap_or("?"),
+                        link["right"]["local"]["hostname"].as_str().unwrap_or("?"),
+                        link["ready"].as_bool().unwrap_or(false),
+                        link["path"].as_str().unwrap_or("?"),
+                    ));
+                }
+                Ok(lines)
+            }
+        }
+        "clear" => {
+            let selector = args
+                .get(1)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or_else(|| err_usage("site gateway clear needs NODE"))?;
+            let result = client
+                .call(&Request::SiteGatewayClear {
+                    selector: selector.to_owned(),
+                    write: has("--write"),
+                    dry_run: has("--dry-run"),
+                })
+                .await?;
+            if json {
+                Ok(vec![result.to_string()])
+            } else {
+                Ok(vec![format!(
+                    "cleared site gateway {}",
+                    result["node"].as_str().unwrap_or("?")
+                )])
+            }
+        }
+        other => Err(err_usage(&format!(
+            "unknown site gateway action `{other}`; use list, set, or clear"
+        ))),
+    }
+}
+
 async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
     let action = args.first().map(String::as_str).unwrap_or("status");
     let value_after = |flag: &str| {
@@ -897,14 +1123,28 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
 
 async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
     if args.first().is_some_and(|value| value == "host") {
-        if args.get(1).is_some_and(|v|v=="pam-check") {return host_access::pam_check(&args[1..]).map_err(access_error);}
-        if args.get(1).is_some_and(|v|v=="install-timer") && args.iter().any(|a|a=="--updates") {
-            if args.iter().any(|a|a=="--dry-run") {return Err(access_error("timer installation does not support --dry-run; inspect access host plan instead".into()));}
-            if !args.iter().any(|a|a=="--write") {return Err(access_error("timer installation requires --write".into()));}
+        if args.get(1).is_some_and(|v| v == "pam-check") {
+            return host_access::pam_check(&args[1..]).map_err(access_error);
+        }
+        if args.get(1).is_some_and(|v| v == "install-timer")
+            && args.iter().any(|a| a == "--updates")
+        {
+            if args.iter().any(|a| a == "--dry-run") {
+                return Err(access_error("timer installation does not support --dry-run; inspect access host plan instead".into()));
+            }
+            if !args.iter().any(|a| a == "--write") {
+                return Err(access_error("timer installation requires --write".into()));
+            }
             ssh_access::require_root("root host cache subscription").map_err(access_error)?;
-            let source=host_supervisor::placement_hint(&args[1..]).map_err(access_error)?;
-            let mut client=connect().await?;
-            client.call(&Request::SoftwarePolicySet {policy:source.to_string_lossy().into_owned(),write:true,dry_run:false}).await?;
+            let source = host_supervisor::placement_hint(&args[1..]).map_err(access_error)?;
+            let mut client = connect().await?;
+            client
+                .call(&Request::SoftwarePolicySet {
+                    policy: source.to_string_lossy().into_owned(),
+                    write: true,
+                    dry_run: false,
+                })
+                .await?;
         }
         if args.get(1).is_some_and(|value| value == "supervise") {
             let snapshot = async {
@@ -912,20 +1152,30 @@ async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
                 let access = client.call(&Request::AccessList).await?;
                 let authority = client.call(&Request::AuthorityList).await?;
                 let packages = client.call(&Request::PackageList).await?;
-                Ok::<_,ClientError>((access,authority,packages))
-            }.await;
-            let (access,authority,packages) = match snapshot {
+                Ok::<_, ClientError>((access, authority, packages))
+            }
+            .await;
+            let (access, authority, packages) = match snapshot {
                 Ok(values) => values,
-                Err(error) => {eprintln!("mycelium: package carrier unavailable ({error}); enforcing cached access without updating binaries");(serde_json::Value::Null,serde_json::Value::Null,serde_json::Value::Null)}
+                Err(error) => {
+                    eprintln!("mycelium: package carrier unavailable ({error}); enforcing cached access without updating binaries");
+                    (
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                    )
+                }
             };
-            return host_supervisor::run(&args[1..],&access,&authority,&packages).map_err(access_error);
+            return host_supervisor::run(&args[1..], &access, &authority, &packages)
+                .map_err(access_error);
         }
         let snapshot = async {
             let mut client = connect().await?;
             let access = client.call(&Request::AccessList).await?;
             let authority = client.call(&Request::AuthorityList).await?;
             Ok::<_, ClientError>((access, authority))
-        }.await;
+        }
+        .await;
         return match snapshot {
             Ok((access, authority)) => host_access::run(&args[1..], &access, &authority),
             Err(error) => {
@@ -935,15 +1185,30 @@ async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
         }.map_err(access_error);
     }
     if args.first().is_some_and(|value| value == "ssh") {
-        if args.get(1).is_some_and(|value| value == "renewal-authorize") {
+        if args
+            .get(1)
+            .is_some_and(|value| value == "renewal-authorize")
+        {
             let mut client = connect().await?;
             let state = client.call(&Request::AccessList).await?;
-            let (statement, key) = ssh_access::renewal_statement(&args[1..],&state).map_err(access_error)?;
+            let (statement, key) =
+                ssh_access::renewal_statement(&args[1..], &state).map_err(access_error)?;
             let directory = myceliumd::home_dir().join("ssh");
             std::fs::create_dir_all(&directory).map_err(|e| access_error(e.to_string()))?;
-            let path = directory.join(format!("renewal-authorization-{}.json",std::process::id()));
-            std::fs::write(&path,serde_json::to_vec(&statement).map_err(|e| access_error(e.to_string()))?).map_err(|e| access_error(e.to_string()))?;
-            let result = client.call(&Request::AccessPublish {statement:path.to_string_lossy().into_owned(),signing_key:key.to_string_lossy().into_owned(),write:true,dry_run:false}).await;
+            let path = directory.join(format!("renewal-authorization-{}.json", std::process::id()));
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&statement).map_err(|e| access_error(e.to_string()))?,
+            )
+            .map_err(|e| access_error(e.to_string()))?;
+            let result = client
+                .call(&Request::AccessPublish {
+                    statement: path.to_string_lossy().into_owned(),
+                    signing_key: key.to_string_lossy().into_owned(),
+                    write: true,
+                    dry_run: false,
+                })
+                .await;
             let _ = std::fs::remove_file(path);
             return result.map(|value| vec![value.to_string()]);
         }
@@ -1145,7 +1410,9 @@ async fn enroll_command(args: &[String]) -> Result<Vec<String>, ClientError> {
                 .ok_or(err_usage("enroll install needs --bundle DIR"))?;
             let home = match flags.path {
                 Some(path) => std::path::PathBuf::from(path),
-                None if packaged::current().map_err(|error| err_usage(&error))? => std::path::PathBuf::from(packaged::HOME),
+                None if packaged::current().map_err(|error| err_usage(&error))? => {
+                    std::path::PathBuf::from(packaged::HOME)
+                }
                 None => myceliumd::home_dir(),
             };
             enroll::install(std::path::Path::new(bundle), &home)
@@ -2009,8 +2276,28 @@ async fn wireguard_command(args: &[String]) -> Result<Vec<String>, ClientError> 
     if left_prefixes.is_empty() || right_prefixes.is_empty() {
         let topology: Topology = serde_json::from_value(client.call(&Request::Topology).await?)
             .map_err(|error| err_usage(&format!("invalid topology response: {error}")))?;
+        let site_prefixes = |node_id: &str| -> Vec<wireguard::Prefix> {
+            topology
+                .nodes
+                .get(node_id)
+                .and_then(|node| node.annotation.site_gateway.as_ref())
+                .map(|gateway| {
+                    gateway
+                        .prefixes
+                        .iter()
+                        .filter_map(|prefix| wireguard::parse_prefix(prefix).ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if left_prefixes.is_empty() {
+            left_prefixes = site_prefixes(&left_identity.node_id);
+        }
         if left_prefixes.is_empty() {
             left_prefixes = wireguard::derive_physical_prefixes(&topology, &left_identity.hostname);
+        }
+        if right_prefixes.is_empty() {
+            right_prefixes = site_prefixes(&right_identity.node_id);
         }
         if right_prefixes.is_empty() {
             right_prefixes =
@@ -2098,9 +2385,11 @@ async fn update(args: &[String]) -> Result<Vec<String>, ClientError> {
     let action = flags.rest.first().map(String::as_str).unwrap_or("status");
     if action == "apply" {
         let executable = std::env::current_exe().map_err(ClientError::Io)?;
-        myceliumd::software_apt::require_native_executable(&executable).map_err(|error| err_usage(&error.to_string()))?;
+        myceliumd::software_apt::require_native_executable(&executable)
+            .map_err(|error| err_usage(&error.to_string()))?;
         if let Some(path) = flags.path.as_deref() {
-            myceliumd::software_apt::require_native_executable(std::path::Path::new(path)).map_err(|error| err_usage(&error.to_string()))?;
+            myceliumd::software_apt::require_native_executable(std::path::Path::new(path))
+                .map_err(|error| err_usage(&error.to_string()))?;
         }
     }
     let channel = flags.channel.unwrap_or_else(|| "canary".into());
@@ -2261,7 +2550,10 @@ fn update_policy_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     let mut policy = myceliumd::read_update_policy();
     match action {
         "enable" => {
-            myceliumd::software_apt::require_native_executable(&std::env::current_exe().map_err(ClientError::Io)?).map_err(|error| err_usage(&error.to_string()))?;
+            myceliumd::software_apt::require_native_executable(
+                &std::env::current_exe().map_err(ClientError::Io)?,
+            )
+            .map_err(|error| err_usage(&error.to_string()))?;
             policy.enabled = true;
             if let Some(channel) = update_arg(args, "--channel") {
                 policy.channel = channel.to_owned();
@@ -2309,7 +2601,10 @@ fn update_policy_command(args: &[String]) -> Result<Vec<String>, ClientError> {
 }
 
 async fn update_auto_run() -> Result<Vec<String>, ClientError> {
-    myceliumd::software_apt::require_native_executable(&std::env::current_exe().map_err(ClientError::Io)?).map_err(|error| err_usage(&error.to_string()))?;
+    myceliumd::software_apt::require_native_executable(
+        &std::env::current_exe().map_err(ClientError::Io)?,
+    )
+    .map_err(|error| err_usage(&error.to_string()))?;
     let policy = myceliumd::read_update_policy();
     policy.validate().map_err(|error| err_usage(&error))?;
     if !policy.enabled {
@@ -2632,7 +2927,8 @@ async fn activate_update(
     artifact: &std::path::Path,
     destination: &std::path::Path,
 ) -> Result<(), ClientError> {
-    myceliumd::software_apt::require_native_executable(destination).map_err(|error| err_usage(&error.to_string()))?;
+    myceliumd::software_apt::require_native_executable(destination)
+        .map_err(|error| err_usage(&error.to_string()))?;
     use std::os::unix::fs::PermissionsExt;
     let parent = destination
         .parent()
@@ -5094,8 +5390,20 @@ mod ssh_command_tests {
     #[test]
     fn self_check_reports_compiled_transport_capability() {
         let value = super::self_check();
-        assert!(value.starts_with(concat!("mycelium ", env!("CARGO_PKG_VERSION"), " protocol ")));
-        assert!(value.ends_with(if cfg!(feature = "iroh-sync") { "iroh-sync=true" } else { "iroh-sync=false" }));
+        assert!(value.starts_with(concat!(
+            "mycelium ",
+            env!("CARGO_PKG_VERSION"),
+            " protocol "
+        )));
+        assert!(value.ends_with(if cfg!(feature = "iroh-sync") {
+            if cfg!(feature = "pkarr") {
+                "iroh-sync=true pkarr=true"
+            } else {
+                "iroh-sync=true pkarr=false"
+            }
+        } else {
+            "iroh-sync=false pkarr=false"
+        }));
     }
     use super::*;
 

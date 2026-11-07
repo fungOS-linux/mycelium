@@ -299,6 +299,7 @@ pub(crate) fn install_seed(
     let config = SyncConfig {
         public_relays,
         seeds: vec![seed],
+        pkarr: Default::default(),
     };
     config.validate()?;
     std::fs::create_dir_all(home).map_err(|e| e.to_string())?;

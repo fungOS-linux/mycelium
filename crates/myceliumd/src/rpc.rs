@@ -54,12 +54,21 @@ fn validate_cidr(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn wg_command() -> Command {
+    for path in ["/opt/homebrew/bin/wg", "/usr/local/bin/wg", "/usr/bin/wg"] {
+        if std::path::Path::new(path).is_file() {
+            return Command::new(path);
+        }
+    }
+    Command::new("wg")
+}
+
 fn load_or_create_wireguard_key() -> Result<String> {
     let path = crate::wireguard_private_key_path();
     let private = match std::fs::read_to_string(&path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let output = Command::new("wg").arg("genkey").output().map_err(|error| {
+            let output = wg_command().arg("genkey").output().map_err(|error| {
                 MyceliumError::Validation(format!(
                     "WireGuard runtime is unavailable (`wg genkey`): {error}"
                 ))
@@ -92,7 +101,7 @@ fn load_or_create_wireguard_key() -> Result<String> {
         }
         Err(error) => return Err(error.into()),
     };
-    let mut child = Command::new("wg")
+    let mut child = wg_command()
         .arg("pubkey")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -148,6 +157,7 @@ pub struct Daemon {
     networks: Mutex<BTreeMap<String, LogicalNetwork>>,
     network_bindings: Mutex<BTreeMap<String, NetworkBinding>>,
     dhcp_scopes: Mutex<BTreeMap<String, DhcpScopeIntent>>,
+    scan_lock: Mutex<()>,
     pub mesh: Arc<crate::peer::Mesh>,
 }
 
@@ -330,6 +340,7 @@ impl Daemon {
             networks: Mutex::new(networks),
             network_bindings: Mutex::new(network_bindings),
             dhcp_scopes: Mutex::new(dhcp_scopes),
+            scan_lock: Mutex::new(()),
             mesh,
         };
         Ok(me)
@@ -388,6 +399,87 @@ impl Daemon {
             serde_json::to_string_pretty(&rules).map_err(json_err)?,
         )?;
         Ok(())
+    }
+
+    async fn resolve_site_gateway_target(
+        &self,
+        selector: &str,
+        site_override: Option<String>,
+    ) -> Result<(String, String, String)> {
+        let views = self.mesh.views().await;
+        let mut matches = views
+            .iter()
+            .filter_map(|view| view.hello.as_ref())
+            .filter(|hello| {
+                hello.hostname.eq_ignore_ascii_case(selector) || hello.node_id.starts_with(selector)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        matches.dedup_by(|left, right| left.node_id == right.node_id);
+        let (node_id, hostname, observed_site) = match matches.as_slice() {
+            [hello] => (
+                hello.node_id.clone(),
+                hello.hostname.clone(),
+                hello.site.clone(),
+            ),
+            [] => {
+                let topology = self.topology.lock().await;
+                let local = topology
+                    .nodes
+                    .iter()
+                    .filter(|(id, node)| node_matches(id, node, selector))
+                    .map(|(id, node)| {
+                        (
+                            id.clone(),
+                            node.annotation
+                                .name
+                                .clone()
+                                .or_else(|| node.hostnames.iter().next().cloned())
+                                .unwrap_or_else(|| id.clone()),
+                            node.annotation
+                                .site
+                                .clone()
+                                .or_else(|| node.sites.iter().next().cloned()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                match local.as_slice() {
+                    [(id, hostname, site)] if id.len() == 64 => (
+                        id.clone(),
+                        hostname.clone(),
+                        site.clone().unwrap_or_default(),
+                    ),
+                    [] => return Err(MyceliumError::UnknownDevice(selector.into())),
+                    _ => {
+                        return Err(MyceliumError::Validation(format!(
+                            "site gateway selector `{selector}` is ambiguous"
+                        )))
+                    }
+                }
+            }
+            _ => {
+                return Err(MyceliumError::Validation(format!(
+                    "site gateway selector `{selector}` matched multiple peer identities"
+                )))
+            }
+        };
+        let topology = self.topology.lock().await;
+        let site = site_override
+            .or_else(|| {
+                topology.nodes.get(&node_id).and_then(|node| {
+                    node.annotation
+                        .site
+                        .clone()
+                        .or_else(|| node.sites.iter().next().cloned())
+                })
+            })
+            .unwrap_or(observed_site);
+        if !mycelium_core::topology::valid_site_binding(&site) {
+            return Err(MyceliumError::Validation(format!(
+                "site gateway site `{site}` is not a canonical DNS label; pass --site"
+            )));
+        }
+        Ok((node_id, hostname, site))
     }
 
     async fn persist_topology(&self) -> Result<()> {
@@ -845,13 +937,28 @@ impl Daemon {
         use serde_json::to_value;
         match req {
             Request::NodeObserve => {
-                let intent = crate::node_profile::read().map_err(|error| MyceliumError::Validation(error.to_string()))?;
-                to_value(serde_json::json!({ "hello": self.mesh.local_hello().await, "intent": intent })).map_err(json_err)
+                let intent = crate::node_profile::read()
+                    .map_err(|error| MyceliumError::Validation(error.to_string()))?;
+                to_value(
+                    serde_json::json!({ "hello": self.mesh.local_hello().await, "intent": intent }),
+                )
+                .map_err(json_err)
             }
             Request::NodeRefresh { write } => {
-                if !write { return Err(MyceliumError::WritesNotPermitted("node observation refresh requires --write".into())); }
-                to_value(self.mesh.refresh_local_hello().await.map_err(|error| MyceliumError::Validation(error.to_string()))?).map_err(json_err)
+                if !write {
+                    return Err(MyceliumError::WritesNotPermitted(
+                        "node observation refresh requires --write".into(),
+                    ));
+                }
+                to_value(
+                    self.mesh
+                        .refresh_local_hello()
+                        .await
+                        .map_err(|error| MyceliumError::Validation(error.to_string()))?,
+                )
+                .map_err(json_err)
             }
+            Request::Site => to_value(self.mesh.site_selection()).map_err(json_err),
             Request::Hello => to_value(serde_json::json!({
                 "version": crate::VERSION,
                 "pid": std::process::id(),
@@ -1085,6 +1192,7 @@ impl Daemon {
                 to_value(crate::execution::list_receipts()?).map_err(json_err)
             }
             Request::Scan => {
+                let _scan = self.scan_lock.lock().await;
                 let (discovered_targets, mut warnings) = match tokio::time::timeout(
                     std::time::Duration::from_secs(20),
                     self.discover_managed_targets(),
@@ -1099,7 +1207,9 @@ impl Daemon {
                 };
                 let mut observations = Vec::new();
                 match crate::local_services::observe_file(
-                    &crate::home_dir().join("application-services.json"), self.mesh.node_id(), unix_now(),
+                    &crate::home_dir().join("application-services.json"),
+                    self.mesh.node_id(),
+                    unix_now(),
                 ) {
                     Ok(local) => observations.extend(local),
                     Err(error) => warnings.push(format!("application discovery: {error}")),
@@ -1857,6 +1967,14 @@ impl Daemon {
                     .map_err(json_err)
             }
             Request::PeerList => to_value(self.mesh.views().await).map_err(json_err),
+            Request::FleetIndexList => to_value(self.mesh.fleet_index().await).map_err(json_err),
+            Request::FleetIndexPublish { snapshot } => {
+                self.mesh
+                    .publish_fleet_index(snapshot.clone())
+                    .await
+                    .map_err(|error| MyceliumError::Validation(error.to_string()))?;
+                to_value(snapshot).map_err(json_err)
+            }
             Request::EgressList => {
                 to_value(self.mesh.egress_observations().await).map_err(json_err)
             }
@@ -2419,6 +2537,124 @@ impl Daemon {
                     self.persist_topology().await?;
                 }
                 Ok(plan)
+            }
+            Request::SiteGatewayList => {
+                let topology = self.converged_topology().await?;
+                let gateways = topology
+                    .nodes
+                    .values()
+                    .filter_map(|node| {
+                        let gateway = node.annotation.site_gateway.as_ref()?;
+                        Some(serde_json::json!({
+                            "node": node.id,
+                            "hostname": node.annotation.name.as_deref()
+                                .or_else(|| node.hostnames.iter().next().map(String::as_str)),
+                            "site": node.annotation.site.as_deref()
+                                .or_else(|| node.sites.iter().next().map(String::as_str)),
+                            "interface": gateway.interface,
+                            "role": gateway.role,
+                            "prefixes": gateway.prefixes,
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+                to_value(gateways).map_err(json_err)
+            }
+            Request::SiteGatewaySet {
+                selector,
+                site,
+                interface,
+                role,
+                prefixes,
+                write,
+                dry_run,
+            } => {
+                validate_site_gateway_interface(&interface)?;
+                if prefixes.len() > 32
+                    || prefixes
+                        .iter()
+                        .any(|prefix| mycelium_core::parse_cidr(prefix).is_none())
+                {
+                    return Err(MyceliumError::Validation(
+                        "site gateway prefixes must be 0..32 valid CIDRs".into(),
+                    ));
+                }
+                if !write && !dry_run {
+                    return Err(MyceliumError::WritesNotPermitted(
+                        "site gateway set requires --write".into(),
+                    ));
+                }
+                let (node_id, hostname, site) =
+                    self.resolve_site_gateway_target(&selector, site).await?;
+                let response = serde_json::json!({
+                    "node": node_id,
+                    "hostname": hostname,
+                    "site": site,
+                    "interface": interface,
+                    "role": role,
+                    "prefixes": prefixes,
+                    "dry_run": dry_run,
+                });
+                if !dry_run {
+                    let mut topology = self.topology.lock().await;
+                    let node = topology.nodes.entry(node_id.clone()).or_insert_with(|| {
+                        mycelium_core::topology::TopoNode {
+                            id: node_id.clone(),
+                            ..Default::default()
+                        }
+                    });
+                    node.hostnames.insert(hostname.clone());
+                    node.sites.insert(site.clone());
+                    node.annotation.site = Some(site.clone());
+                    node.annotation.site_gateway =
+                        Some(mycelium_core::topology::SiteGatewayAnnotation {
+                            interface,
+                            role,
+                            prefixes,
+                        });
+                    drop(topology);
+                    self.persist_topology().await?;
+                    let snapshot = self.topology.lock().await.clone();
+                    self.mesh
+                        .publish_topology(&snapshot)
+                        .await
+                        .map_err(|error| {
+                            MyceliumError::Validation(format!(
+                                "publish site gateway topology: {error}"
+                            ))
+                        })?;
+                }
+                to_value(response).map_err(json_err)
+            }
+            Request::SiteGatewayClear {
+                selector,
+                write,
+                dry_run,
+            } => {
+                if !write && !dry_run {
+                    return Err(MyceliumError::WritesNotPermitted(
+                        "site gateway clear requires --write".into(),
+                    ));
+                }
+                let (node_id, _, _) = self.resolve_site_gateway_target(&selector, None).await?;
+                let response = serde_json::json!({"node": node_id, "dry_run": dry_run});
+                if !dry_run {
+                    let mut topology = self.topology.lock().await;
+                    if let Some(node) = topology.nodes.get_mut(&node_id) {
+                        node.annotation.site_gateway = None;
+                    }
+                    drop(topology);
+                    self.persist_topology().await?;
+                    let snapshot = self.topology.lock().await.clone();
+                    self.mesh
+                        .publish_topology(&snapshot)
+                        .await
+                        .map_err(|error| {
+                            MyceliumError::Validation(format!(
+                                "publish site gateway topology: {error}"
+                            ))
+                        })?;
+                }
+                to_value(response).map_err(json_err)
             }
             Request::TunnelPlan {
                 target,
@@ -3072,6 +3308,20 @@ fn preferred_ssh_address(
     addresses.into_iter().next()
 }
 
+fn validate_site_gateway_interface(interface: &str) -> Result<()> {
+    if interface.is_empty()
+        || interface.len() > 63
+        || !interface
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(MyceliumError::Validation(
+            "site gateway interface must be a bounded interface name".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_annotation(name: Option<&str>, kind: Option<&str>) -> Result<()> {
     if name.is_none() && kind.is_none() {
         return Err(MyceliumError::Validation(
@@ -3158,12 +3408,21 @@ pub fn cap_result_json(
     })
 }
 
-/// Serve forever on the daemon socket. Removes a stale socket file if no
-/// live daemon owns it (pid check).
+/// Serve forever, retaining exclusive profile ownership throughout startup
+/// and the accept loop. Socket connection failures alone do not prove that
+/// another daemon has stopped: its listener may be backlogged during boot.
 pub async fn serve() -> std::io::Result<()> {
     let home = crate::home_dir();
-    std::fs::create_dir_all(&home)?;
+    let _owner = crate::daemon_owner::DaemonOwner::acquire(&home)?;
     crate::load_service_env()?;
+    // Loading credentials must not silently select another identity's state
+    // after acquiring ownership. Select the profile in the startup environment.
+    if crate::home_dir() != home {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "service environment must not change the locked daemon profile; set MYCELIUM_HOME before starting myceliumd",
+        ));
+    }
     let socket = crate::socket_path();
     if socket.exists() {
         match UnixStream::connect(&socket).await {
@@ -3199,11 +3458,68 @@ pub async fn serve() -> std::io::Result<()> {
             .reconnect_saved(std::time::Duration::from_secs(30))
             .await
     });
-    daemon
-        .mesh
-        .start()
-        .await
-        .map_err(|error| std::io::Error::other(format!("peer mesh failed: {error}")))?;
+    // Fleet scan cadence: every node scans on its own jittered schedule, so the
+    // fleet's effective observation rate scales without synchronized gossip.
+    let scan_seconds = std::env::var("MYCELIUM_SCAN_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(120);
+    if scan_seconds > 0 {
+        let scan_jitter = std::env::var("MYCELIUM_SCAN_JITTER_PCT")
+            .ok()
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(25)
+            .min(50);
+        let scan_timeout = std::env::var("MYCELIUM_SCAN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(90)
+            .max(1);
+        let scan_daemon = daemon.clone();
+        tokio::spawn(async move {
+            // Full-interval initial spread prevents boot-time scan alignment.
+            tokio::time::sleep(crate::peer::jittered_duration(
+                std::time::Duration::from_secs(scan_seconds),
+                100,
+            ))
+            .await;
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(scan_timeout),
+                    scan_daemon.dispatch(Request::Scan),
+                )
+                .await
+                {
+                    Ok(response) if !response.ok => {
+                        eprintln!(
+                            "myceliumd: periodic scan failed: {}",
+                            response.error.unwrap_or_else(|| "unknown error".into())
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(_) => eprintln!(
+                        "myceliumd: periodic scan exceeded {scan_timeout}s; scheduling next"
+                    ),
+                }
+                tokio::time::sleep(crate::peer::jittered_duration(
+                    std::time::Duration::from_secs(scan_seconds),
+                    scan_jitter,
+                ))
+                .await;
+            }
+        });
+    }
+    // The IPC control plane must become available even when peer discovery or
+    // authorization is slow. Mesh startup is a background liveness concern,
+    // not a precondition for local inspection.
+    {
+        let mesh = daemon.clone();
+        tokio::spawn(async move {
+            if let Err(error) = mesh.mesh.start().await {
+                eprintln!("myceliumd: peer mesh failed: {error}");
+            }
+        });
+    }
     eprintln!(
         "myceliumd {} listening on {}",
         crate::VERSION,
@@ -3211,14 +3527,19 @@ pub async fn serve() -> std::io::Result<()> {
     );
     // Native recovery can wait on systemd/application readiness. Keep it off
     // the control/gossip event loop and never turn boot into an update trigger.
-    tokio::task::spawn_blocking(|| match crate::software::recover_interrupted_activations() {
-        Ok(names) if !names.is_empty() => eprintln!("myceliumd: restored interrupted packages: {}", names.join(", ")),
-        Ok(_) => {},
-        Err(error) => eprintln!("myceliumd: {error}"),
-    });
+    tokio::task::spawn_blocking(
+        || match crate::software::recover_interrupted_activations() {
+            Ok(names) if !names.is_empty() => eprintln!(
+                "myceliumd: restored interrupted packages: {}",
+                names.join(", ")
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!("myceliumd: {error}"),
+        },
+    );
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = crate::ipc_accept::accept(&listener).await?;
         let daemon = daemon.clone();
         tokio::spawn(async move {
             handle_conn(stream, daemon).await;
@@ -3421,6 +3742,7 @@ mod tests {
             networks: Mutex::new(BTreeMap::new()),
             network_bindings: Mutex::new(BTreeMap::new()),
             dhcp_scopes: Mutex::new(BTreeMap::new()),
+            scan_lock: Mutex::new(()),
             mesh: crate::peer::Mesh::ephemeral_for_test(),
         }
     }

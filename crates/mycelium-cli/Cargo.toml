@@ -7,6 +7,7 @@ description = "mycelium control-plane CLI: talks to myceliumd over its Unix sock
 
 [features]
 iroh-sync = ["myceliumd/iroh-sync", "dep:qrcode"]
+pkarr = ["iroh-sync", "myceliumd/pkarr"]
 
 [[bin]]
 name = "mycelium"

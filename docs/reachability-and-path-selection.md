@@ -201,6 +201,14 @@ Pkarr is public rendezvous: endpoint key to relay/direct hints.
 - Consumers must pin the iroh key and verify the binding; a Pkarr record alone
   is not authorization.
 
+Implementation: iroh 1.3 already provides a Pkarr publisher/resolver. Mycelium
+exposes it behind the separate `pkarr` Cargo feature and the `pkarr` section of
+`iroh-sync.json`; it is off by default, publishes relay hints only unless
+direct addresses are explicitly opted in, and never replaces the `myc` DNS
+projection or a signed access grant. The fleet directory is gossiped over the
+existing authenticated peer mesh, so endpoint names stay off the public Pkarr
+relay and require no out-of-band key. See `docs/iroh-sync.md`.
+
 ### 6.4 WireGuard site links
 
 Mycelium plans and supervises links. Each link exports only what is required:
