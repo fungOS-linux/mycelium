@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::path::Path;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,7 +77,287 @@ fn platform_devices(node_id: &str) -> Result<Vec<HardwareDevice>, AnyError> {
     collect_linux_usb(node_id, &mut devices)?;
     collect_linux_storage(node_id, &mut devices)?;
     collect_linux_tpm(node_id, Path::new("/sys/class/tpm"), &mut devices)?;
+    collect_linux_battery(node_id, Path::new("/sys/class/power_supply"), &mut devices)?;
+    collect_linux_bluetooth(node_id, Path::new("/sys/class/bluetooth"), &mut devices)?;
     Ok(devices)
+}
+
+/// System batteries and their reported health counters from sysfs.
+#[cfg(target_os = "linux")]
+fn collect_linux_battery(
+    node_id: &str,
+    root: &Path,
+    out: &mut Vec<HardwareDevice>,
+) -> Result<(), AnyError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if read_trim(path.join("type")).as_deref() != Some("Battery") {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let locator = format!("power:{name}");
+        let mut properties = BTreeMap::new();
+        for (key, file) in [
+            ("status", "status"),
+            ("capacity_percent", "capacity"),
+            ("cycle_count", "cycle_count"),
+            ("health", "health"),
+            ("energy_now", "energy_now"),
+            ("energy_full", "energy_full"),
+            ("charge_now", "charge_now"),
+            ("charge_full", "charge_full"),
+            ("voltage_now", "voltage_now"),
+            ("power_now", "power_now"),
+            ("model_name", "model_name"),
+            ("manufacturer", "manufacturer"),
+        ] {
+            if let Some(value) = read_trim(path.join(file)) {
+                properties.insert(key.into(), value);
+            }
+        }
+        out.push(HardwareDevice {
+            id: hardware_id(node_id, &locator),
+            parent: None,
+            locator,
+            kind: HardwareKind::Battery,
+            bus: HardwareBus::Integrated,
+            vendor: read_trim(path.join("manufacturer")),
+            model: read_trim(path.join("model_name")).or(Some(name.clone())),
+            serial_hash: serial_hash(read_trim(path.join("serial_number"))),
+            capabilities: BTreeSet::from(["battery".into()]),
+            properties,
+        });
+    }
+    Ok(())
+}
+
+/// An adapter or connected peripheral observed via sysfs and BlueZ's
+/// `bluetoothctl`. Peripheral battery is the controller's own report; it is a
+/// discovery hint, not an attestation. Raw Bluetooth addresses are hashed.
+#[cfg(target_os = "linux")]
+fn collect_linux_bluetooth(
+    node_id: &str,
+    root: &Path,
+    out: &mut Vec<HardwareDevice>,
+) -> Result<(), AnyError> {
+    // Adapters first, so a host with no peripherals still reports its radio.
+    match fs::read_dir(root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = entry.path();
+                let locator = format!("bluetooth:{}", name.to_ascii_lowercase());
+                let mut properties =
+                    BTreeMap::from([("transport".into(), "bluetooth".into())]);
+                if let Some(address) = read_trim(path.join("address")) {
+                    properties.insert("address".into(), address);
+                }
+                out.push(HardwareDevice {
+                    id: hardware_id(node_id, &locator),
+                    parent: None,
+                    locator,
+                    kind: HardwareKind::BluetoothDevice,
+                    bus: HardwareBus::Bluetooth,
+                    vendor: None,
+                    model: Some(name.clone()),
+                    serial_hash: None,
+                    capabilities: BTreeSet::from(["wireless".into()]),
+                    properties,
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // `bluetoothctl` is optional. Absence is normal on headless images and is
+    // not an error; the adapter records above remain.
+    let mut listed = bluetoothctl(&["devices", "Connected"])
+        .map(|text| parse_bluetoothctl_device_list(&text))
+        .unwrap_or_default();
+    if listed.is_empty() {
+        // Older BlueZ builds do not accept the `Connected` filter; fall back to
+        // the full known-device list and trust each `info` connection flag.
+        listed = bluetoothctl(&["devices"])
+            .map(|text| parse_bluetoothctl_device_list(&text))
+            .unwrap_or_default();
+    }
+    listed.truncate(64);
+    for (address, label) in listed {
+        let Some(info) = bluetoothctl(&["info", &address])
+            .map(|text| parse_bluetoothctl_info(&text))
+        else {
+            continue;
+        };
+        if !info.connected {
+            continue;
+        }
+        out.push(bluetooth_peripheral(node_id, &address, Some(label), &info));
+    }
+    Ok(())
+}
+
+/// Build a peripheral device record from parsed `bluetoothctl info` output.
+/// Kept separate so the construction is type-checked and tested on every host.
+#[cfg(any(target_os = "linux", test))]
+fn bluetooth_peripheral(
+    node_id: &str,
+    address: &str,
+    label: Option<String>,
+    info: &BluetoothInfo,
+) -> HardwareDevice {
+    let locator = format!("bluetooth:{}", address.to_ascii_lowercase());
+    let mut properties = BTreeMap::from([
+        ("transport".into(), "bluetooth".into()),
+        ("connected".into(), "true".into()),
+    ]);
+    if let Some(icon) = &info.icon {
+        properties.insert("icon".into(), icon.clone());
+    }
+    if let Some(alias) = &info.alias {
+        properties.insert("alias".into(), alias.clone());
+    }
+    if let Some(paired) = info.paired {
+        properties.insert("paired".into(), paired.to_string());
+    }
+    if let Some(percent) = info.battery_percent {
+        properties.insert("battery_percent".into(), percent.to_string());
+    }
+    let mut capabilities = BTreeSet::from(["wireless".to_string()]);
+    if info.battery_percent.is_some() {
+        capabilities.insert("battery-reported".into());
+    }
+    HardwareDevice {
+        id: hardware_id(node_id, &locator),
+        parent: None,
+        locator,
+        kind: HardwareKind::BluetoothDevice,
+        bus: HardwareBus::Bluetooth,
+        vendor: None,
+        model: info
+            .alias
+            .clone()
+            .or_else(|| info.name.clone())
+            .or(label)
+            .or_else(|| Some(address.to_string())),
+        serial_hash: Some(sha256_hex(address.as_bytes())),
+        capabilities,
+        properties,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bluetoothctl(args: &[&str]) -> Option<String> {
+    // `--timeout` bounds a wedged or absent bluetoothd. An older build that
+    // rejects the flag exits non-zero and we simply skip.
+    let mut command = Command::new("bluetoothctl");
+    command.args(["--timeout", "3"]).args(args);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(strip_ansi(&String::from_utf8_lossy(&output.stdout)))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            out.push(character);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `Device AA:BB:CC:DD:EE:FF Name` lines from `bluetoothctl devices`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_bluetoothctl_device_list(text: &str) -> Vec<(String, String)> {
+    let mut devices = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let mut fields = line.splitn(3, char::is_whitespace);
+        if fields.next() != Some("Device") {
+            continue;
+        }
+        let Some(address) = fields.next().map(str::trim).filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let label = fields.next().unwrap_or("").trim().to_string();
+        devices.push((address.to_string(), label));
+    }
+    devices
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BluetoothInfo {
+    name: Option<String>,
+    alias: Option<String>,
+    icon: Option<String>,
+    connected: bool,
+    paired: Option<bool>,
+    battery_percent: Option<u8>,
+}
+
+/// Parse the `key: value` block from `bluetoothctl info <addr>`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_bluetoothctl_info(text: &str) -> BluetoothInfo {
+    let mut info = BluetoothInfo::default();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "Name" => info.name = Some(value.to_string()),
+            "Alias" => info.alias = Some(value.to_string()),
+            "Icon" => info.icon = Some(value.to_string()),
+            "Connected" => info.connected = value.eq_ignore_ascii_case("yes"),
+            "Paired" => info.paired = Some(value.eq_ignore_ascii_case("yes")),
+            "Battery Percentage" => info.battery_percent = parse_battery_percent(value),
+            _ => {}
+        }
+    }
+    info
+}
+
+/// BlueZ prints either `75`, `0x4B`, or `0x4B (75)` depending on version.
+#[cfg(any(target_os = "linux", test))]
+fn parse_battery_percent(value: &str) -> Option<u8> {
+    if let Some(open) = value.rfind('(') {
+        if let Some(close) = value[open + 1..].find(')') {
+            if let Ok(percent) = value[open + 1..open + 1 + close].trim().parse::<u8>() {
+                return (percent <= 100).then_some(percent);
+            }
+        }
+    }
+    let value = value.split_whitespace().next()?;
+    let percent = if let Some(hex) = value.strip_prefix("0x") {
+        u8::from_str_radix(hex, 16).ok()?
+    } else {
+        value.parse::<u8>().ok()?
+    };
+    (percent <= 100).then_some(percent)
 }
 
 /// Observe registered TPMs without opening a character device or issuing commands.
@@ -358,6 +638,8 @@ fn platform_devices(node_id: &str) -> Result<Vec<HardwareDevice>, AnyError> {
             "SPUSBDataType",
             "SPNVMeDataType",
             "SPStorageDataType",
+            "SPBluetoothDataType",
+            "SPPowerDataType",
             "-json",
             "-detailLevel",
             "mini",
@@ -405,7 +687,145 @@ fn parse_darwin_profiler(node_id: &str, root: &serde_json::Value) -> Vec<Hardwar
             walk_darwin_items(node_id, section, items, None, kind, bus, &mut out);
         }
     }
+    parse_darwin_bluetooth(node_id, root, &mut out);
+    parse_darwin_power(node_id, root, &mut out);
     out
+}
+
+/// BLE/Bluetooth peripherals from `system_profiler`. Battery level is a hint,
+/// not an attestation: it is the controller's own report.
+#[cfg(target_os = "macos")]
+fn parse_darwin_bluetooth(
+    node_id: &str,
+    root: &serde_json::Value,
+    out: &mut Vec<HardwareDevice>,
+) {
+    let Some(controllers) = root
+        .get("SPBluetoothDataType")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for controller in controllers {
+        let Some(fields) = controller.as_object() else {
+            continue;
+        };
+        for key in ["device_connected", "device_not_connected"] {
+            let connected = key == "device_connected";
+            let Some(devices) = fields.get(key).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for entry in devices {
+                let Some(entry) = entry.as_object() else {
+                    continue;
+                };
+                for (name, details) in entry {
+                    let details = details.as_object();
+                    let address = details.and_then(|fields| {
+                        string_field(fields, &["device_address", "device_addressString"])
+                    });
+                    let locator = format!(
+                        "darwin:bluetooth:{}",
+                        address.clone().unwrap_or_else(|| name.clone())
+                    );
+                    let mut properties = BTreeMap::from([
+                        ("connected".into(), connected.to_string()),
+                        ("transport".into(), "bluetooth".into()),
+                    ]);
+                    if let Some(details) = details {
+                        for (field, label) in [
+                            ("device_batteryLevel", "battery_percent"),
+                            ("device_batteryLevelCase", "case_battery_percent"),
+                            ("device_minorType", "minor_type"),
+                            ("device_manufacturer", "manufacturer"),
+                        ] {
+                            if let Some(value) = string_field(details, &[field]) {
+                                properties.insert(label.to_string(), value);
+                            }
+                        }
+                    }
+                    let mut capabilities = BTreeSet::from(["wireless".to_string()]);
+                    if details
+                        .and_then(|fields| string_field(fields, &["device_batteryLevel"]))
+                        .is_some()
+                    {
+                        capabilities.insert("battery-reported".into());
+                    }
+                    out.push(HardwareDevice {
+                        id: hardware_id(node_id, &locator),
+                        parent: None,
+                        locator,
+                        kind: HardwareKind::BluetoothDevice,
+                        bus: HardwareBus::Bluetooth,
+                        vendor: details
+                            .and_then(|fields| string_field(fields, &["device_manufacturer"])),
+                        model: Some(name.clone()),
+                        serial_hash: address.map(|value| sha256_hex(value.as_bytes())),
+                        capabilities,
+                        properties,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The system battery and its reported health counters.
+#[cfg(target_os = "macos")]
+fn parse_darwin_power(
+    node_id: &str,
+    root: &serde_json::Value,
+    out: &mut Vec<HardwareDevice>,
+) {
+    let Some(items) = root
+        .get("SPPowerDataType")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for item in items {
+        let Some(fields) = item.as_object() else {
+            continue;
+        };
+        let info = fields
+            .get("sppower_battery_health_info")
+            .and_then(serde_json::Value::as_object);
+        let model = fields
+            .get("sppower_battery_model_info")
+            .and_then(serde_json::Value::as_object);
+        let device_name = model
+            .and_then(|fields| string_field(fields, &["sppower_battery_model", "_name"]))
+            .unwrap_or_else(|| "battery".into());
+        let serial = model.and_then(|fields| {
+            string_field(fields, &["sppower_battery_serial_number", "sppower_battery_serial"])
+        });
+        let locator = format!("darwin:power:{device_name}");
+        let mut properties = BTreeMap::from([("source".into(), "system_profiler".into())]);
+        if let Some(info) = info {
+            for (field, label) in [
+                ("sppower_battery_cycle_count", "cycle_count"),
+                ("sppower_battery_health", "health"),
+                ("sppower_battery_charge_capacity", "charge_capacity"),
+                ("sppower_battery_full_charge_capacity", "full_charge_capacity"),
+            ] {
+                if let Some(value) = string_field(info, &[field]) {
+                    properties.insert(label.to_string(), value);
+                }
+            }
+        }
+        out.push(HardwareDevice {
+            id: hardware_id(node_id, &locator),
+            parent: None,
+            locator,
+            kind: HardwareKind::Battery,
+            bus: HardwareBus::Integrated,
+            vendor: None,
+            model: Some(device_name),
+            serial_hash: serial.map(|value| sha256_hex(value.as_bytes())),
+            capabilities: BTreeSet::from(["battery".into()]),
+            properties,
+        });
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -611,6 +1031,130 @@ mod tests {
         // A malformed root must surface as an error, not reported absence.
         fs::write(root.join("not-a-directory"), "").unwrap();
         assert!(collect_linux_tpm("peer", &root.join("not-a-directory"), &mut absent).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_bluetooth_and_battery_are_discovered() {
+        let report = serde_json::json!({
+            "SPBluetoothDataType": [{
+                "device_connected": [{
+                    "Magic Trackpad": {
+                        "device_address": "AA:BB:CC:DD:EE:FF",
+                        "device_batteryLevel": "64%",
+                        "device_minorType": "Trackpad"
+                    }
+                }],
+                "device_not_connected": []
+            }],
+            "SPPowerDataType": [{
+                "sppower_battery_health_info": {
+                    "sppower_battery_cycle_count": "123",
+                    "sppower_battery_health": "Good"
+                },
+                "sppower_battery_model_info": {
+                    "sppower_battery_model": "bq20z451",
+                    "sppower_battery_serial_number": "SECRET-BATTERY"
+                }
+            }]
+        });
+        let devices = parse_darwin_profiler("peer", &report);
+        let trackpad = devices
+            .iter()
+            .find(|device| device.kind == HardwareKind::BluetoothDevice)
+            .expect("bluetooth device");
+        assert_eq!(trackpad.bus, HardwareBus::Bluetooth);
+        assert_eq!(trackpad.model.as_deref(), Some("Magic Trackpad"));
+        assert_eq!(trackpad.properties["connected"], "true");
+        assert_eq!(trackpad.properties["battery_percent"], "64%");
+        assert!(trackpad.capabilities.contains("battery-reported"));
+        // The Bluetooth address is hashed, never gossiped raw.
+        assert!(trackpad.serial_hash.is_some());
+        assert!(!trackpad.properties.values().any(|v| v.contains("AA:BB")));
+        let battery = devices
+            .iter()
+            .find(|device| device.kind == HardwareKind::Battery)
+            .expect("battery device");
+        assert_eq!(battery.properties["cycle_count"], "123");
+        assert_eq!(battery.properties["health"], "Good");
+        assert!(battery.serial_hash.as_deref().is_some_and(|h| h != "SECRET-BATTERY"));
+    }
+
+    #[test]
+    fn bluetoothctl_lists_and_parses_connected_peripherals() {
+        let listed = parse_bluetoothctl_device_list(
+            "Device AA:BB:CC:DD:EE:FF Magic Trackpad\nDevice 11:22:33:44:55:66 Keyboard\n",
+        );
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].0, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(listed[0].1, "Magic Trackpad");
+
+        // Newer BlueZ hex+decimal form.
+        let info = parse_bluetoothctl_info(
+            "Device AA:BB:CC:DD:EE:FF (public)\n\tName: Trackpad\n\tAlias: Magic Trackpad\n\tIcon: input-mouse\n\tPaired: yes\n\tConnected: yes\n\tBattery Percentage: 0x4B (75)\n",
+        );
+        assert_eq!(info.name.as_deref(), Some("Trackpad"));
+        assert_eq!(info.alias.as_deref(), Some("Magic Trackpad"));
+        assert_eq!(info.icon.as_deref(), Some("input-mouse"));
+        assert!(info.connected);
+        assert_eq!(info.paired, Some(true));
+        assert_eq!(info.battery_percent, Some(75));
+
+        // Older plain percentage and a disconnected device.
+        let info = parse_bluetoothctl_info(
+            "Device 11:22:33:44:55:66\n\tName: Keyboard\n\tConnected: no\n\tBattery Percentage: 40\n",
+        );
+        assert!(!info.connected);
+        assert_eq!(info.battery_percent, Some(40));
+
+        assert_eq!(parse_battery_percent("0x64 (100)"), Some(100));
+        assert_eq!(parse_battery_percent("0xFF (255)"), None);
+        assert_eq!(strip_ansi("\u{1b}[0;94mDevice\u{1b}[0m AA"), "Device AA");
+
+        let info = parse_bluetoothctl_info(
+            "Device AA:BB:CC:DD:EE:FF\n\tAlias: Magic Trackpad\n\tIcon: input-mouse\n\tConnected: yes\n\tBattery Percentage: 0x4B (75)\n",
+        );
+        let device = bluetooth_peripheral(
+            "peer",
+            "AA:BB:CC:DD:EE:FF",
+            Some("Trackpad".into()),
+            &info,
+        );
+        assert_eq!(device.kind, HardwareKind::BluetoothDevice);
+        assert_eq!(device.bus, HardwareBus::Bluetooth);
+        assert_eq!(device.model.as_deref(), Some("Magic Trackpad"));
+        assert_eq!(device.properties["battery_percent"], "75");
+        assert_eq!(device.properties["icon"], "input-mouse");
+        assert!(device.capabilities.contains("battery-reported"));
+        // Address is hashed, never stored raw in the gossiped record.
+        assert!(device.serial_hash.as_deref().is_some_and(|hash| hash.len() == 64));
+        assert!(!device.properties.values().any(|value| value.contains("AA:BB")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_battery_is_discovered_without_a_device_file() {
+        let root = std::env::temp_dir().join(format!(
+            "mycelium-battery-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("BAT0")).unwrap();
+        fs::write(root.join("BAT0/type"), "Battery\n").unwrap();
+        fs::write(root.join("BAT0/capacity"), "77\n").unwrap();
+        fs::write(root.join("BAT0/status"), "Discharging\n").unwrap();
+        fs::write(root.join("BAT0/cycle_count"), "42\n").unwrap();
+        let mut devices = Vec::new();
+        collect_linux_battery("peer", &root, &mut devices).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].kind, HardwareKind::Battery);
+        assert_eq!(devices[0].properties["capacity_percent"], "77");
+        assert_eq!(devices[0].properties["status"], "Discharging");
+        assert_eq!(devices[0].properties["cycle_count"], "42");
         fs::remove_dir_all(&root).unwrap();
     }
 }
