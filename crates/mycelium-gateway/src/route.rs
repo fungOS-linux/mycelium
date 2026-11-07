@@ -90,7 +90,9 @@ mod tests {
         Route {
             name: name.into(),
             hosts: hosts.iter().map(|value| (*value).into()).collect(),
-            upstream: format!("http://127.0.0.1/{name}"),
+            upstream: Some(format!("http://127.0.0.1/{name}")),
+            service_kind: None,
+            remote_token_env: None,
             priority,
         }
     }

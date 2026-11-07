@@ -285,3 +285,98 @@ async fn refuses_to_start_with_missing_inputs() {
     let result = server::run(address, Some(missing_config), None, 0).await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn falls_back_to_a_discovered_local_service() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream.local_addr()?;
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(
+            upstream,
+            Router::new().route(
+                "/hello",
+                get(|| async { Json(json!({"backend": "discovered"})) }),
+            ),
+        )
+        .await
+        .expect("upstream serve should succeed");
+    });
+
+    let closed = TcpListener::bind("127.0.0.1:0").await?;
+    let closed_port = closed.local_addr()?.port();
+    drop(closed);
+
+    let dir = temp_path("discovery").with_extension("d");
+    fs::create_dir_all(&dir)?;
+    let catalog = dir.join("catalog.json");
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 3600;
+    fs::write(
+        &catalog,
+        format!(
+            r#"{{"observations":[{{
+                "expires_at": {expires_at},
+                "provenance": {{"observer": "local"}},
+                "value": {{
+                    "kind": "ai",
+                    "endpoints": ["http://127.0.0.1:{}"],
+                    "attributes": {{"node_id": "local"}}
+                }}
+            }}]}}"#,
+            upstream_addr.port()
+        ),
+    )?;
+    let fake = dir.join("mycelium");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+case "$1" in
+  node) printf '%s\n' '{"node":{"hello":{"node_id":"local"}}}' ;;
+  services) cat "$dir/catalog.json" ;;
+  *) exit 2 ;;
+esac
+"#,
+    )?;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755))?;
+
+    let route_path = dir.join("routes.json");
+    fs::write(
+        &route_path,
+        format!(
+            r#"{{
+              "mycelium_bin": "{}",
+              "service_refresh_secs": 5,
+              "routes": [{{
+                "name": "ai",
+                "hosts": ["ai.myc"],
+                "upstream": "http://127.0.0.1:{}",
+                "service_kind": "ai"
+              }}]
+            }}"#,
+            fake.display(),
+            closed_port
+        ),
+    )?;
+
+    let (addr, gateway) = start_gateway(route_path, None).await?;
+    let client = Client::new();
+    assert!(wait_health(&addr, &client).await);
+    let response = client
+        .get(format!("http://127.0.0.1:{}/hello", addr.port()))
+        .header("host", "ai.myc")
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["backend"], json!("discovered"));
+
+    gateway.abort();
+    upstream_handle.abort();
+    let _ = fs::remove_dir_all(dir);
+    Ok(())
+}
