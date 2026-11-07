@@ -1110,6 +1110,7 @@ mod tests {
                 interfaces: Vec::new(),
             }),
             health: None,
+            ssh: None,
             hardware: None,
             transports: vec![],
             observed_endpoints: vec![],

@@ -160,6 +160,7 @@ pub enum PeerEvent {
     Hardware(HardwareSnapshot),
     SecurityPosture(SecurityPosture),
     SecurityEvents(SecurityEventBatch),
+    SshHealth(SshHealth),
     /// A future event kind this binary does not understand. Receivers discard
     /// it without rejecting the other independently signed observations.
     Unknown,
@@ -183,6 +184,7 @@ enum KnownPeerEvent {
     Hardware(HardwareSnapshot),
     SecurityPosture(SecurityPosture),
     SecurityEvents(SecurityEventBatch),
+    SshHealth(SshHealth),
 }
 
 impl<'de> Deserialize<'de> for PeerEvent {
@@ -209,6 +211,7 @@ impl<'de> Deserialize<'de> for PeerEvent {
                     | "hardware"
                     | "security_posture"
                     | "security_events"
+                    | "ssh_health"
             )
         );
         if !known {
@@ -232,6 +235,7 @@ impl<'de> Deserialize<'de> for PeerEvent {
             KnownPeerEvent::Hardware(value) => Self::Hardware(value),
             KnownPeerEvent::SecurityPosture(value) => Self::SecurityPosture(value),
             KnownPeerEvent::SecurityEvents(value) => Self::SecurityEvents(value),
+            KnownPeerEvent::SshHealth(value) => Self::SshHealth(value),
         })
     }
 }
@@ -461,6 +465,49 @@ pub struct SecurityEventBatch {
     pub site: String,
     pub observed_at: u64,
     pub events: Vec<SecurityEvent>,
+}
+
+/// A gossiped SSH access healthcheck. It is derived locally from installed
+/// credentials and locally verified signed access/authority records; it never
+/// asserts an access grant by itself. Peers merge it as a signed observation,
+/// so the fleet can see an expired or unrenewed certificate before an operator
+/// discovers it by failing to log in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHealth {
+    pub schema_version: u16,
+    pub node_id: String,
+    pub hostname: String,
+    pub site: String,
+    pub observed_at: u64,
+    /// sshd is accepting connections on the local host.
+    pub listening: bool,
+    pub established_sessions: u32,
+    /// `valid`, `due`, `expired`, `missing`, or `error`.
+    pub certificate_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_not_before: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_not_after: Option<u64>,
+    #[serde(default)]
+    pub certificate_principals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_error: Option<String>,
+    /// Active signed access grants and trusted authority records observed via
+    /// the fleet feed. These are counts, not an authorization assertion.
+    pub access_grants: u32,
+    pub access_authorities: u32,
+    /// `ok`, `stale`, `unavailable`, or `unknown` for local host enforcement.
+    pub access_enforcement: String,
+    /// Free space on the filesystem that holds the daemon home. A full disk is
+    /// a first-class failure because it silently breaks renewal and updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_available_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_state: String,
+    /// One-line operator verdict: `ok`, `warn`, or `fail`.
+    pub verdict: String,
 }
 
 /// A narrowly scoped transport credential bound to a stable Mycelium peer.
@@ -1362,6 +1409,47 @@ mod tests {
         envelope.verify().unwrap();
         if let PeerEvent::Hardware(snapshot) = &mut envelope.event {
             snapshot.devices[0].capabilities.insert("tampered".into());
+        }
+        assert!(envelope.verify().is_err());
+    }
+
+    #[test]
+    fn ssh_health_round_trips_and_is_signature_covered() {
+        let key = SigningKey::from_bytes(&[24; 32]);
+        let node_id = encode_hex(key.verifying_key().as_bytes());
+        let mut envelope = SignedEnvelope::sign(
+            &key,
+            1,
+            1,
+            PeerEvent::SshHealth(SshHealth {
+                schema_version: 1,
+                node_id,
+                hostname: "gateway".into(),
+                site: "home".into(),
+                observed_at: 1,
+                listening: true,
+                established_sessions: 0,
+                certificate_state: "valid".into(),
+                certificate_not_before: None,
+                certificate_not_after: Some(2),
+                certificate_principals: vec!["mycelium-role-network-admin".into()],
+                renewal_after: Some(1),
+                renewal_error: None,
+                access_grants: 1,
+                access_authorities: 1,
+                access_enforcement: "ok".into(),
+                disk_available_bytes: Some(10 * 1024 * 1024 * 1024),
+                disk_state: "ok".into(),
+                verdict: "ok".into(),
+            }),
+        )
+        .unwrap();
+        envelope.verify().unwrap();
+        let encoded = serde_json::to_string(&envelope).unwrap();
+        let decoded: SignedEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(decoded.event, PeerEvent::SshHealth(_)));
+        if let PeerEvent::SshHealth(ssh) = &mut envelope.event {
+            ssh.verdict = "fail".into();
         }
         assert!(envelope.verify().is_err());
     }

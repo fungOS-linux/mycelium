@@ -15,8 +15,8 @@ use mycelium_peer_protocol::{
     AccessStatement, AuthorityRecord, AuthorityStatement, EgressObservation, FilesystemHealth,
     HardwareSnapshot, HostHealth, PackageManifest, PeerEndpointObservation, PeerEvent, PeerHello,
     PeerInterface, PeerMessage, Platform, ProcessHealth, ReleaseManifest, SecurityEventBatch,
-    SecurityPosture, SignedEnvelope, TopologySnapshot, TransportCredentialBinding, TransportKind,
-    WireGuardBinding, MAX_SECURITY_EVENTS, MAX_SECURITY_FINDINGS, PROTOCOL_VERSION,
+    SecurityPosture, SignedEnvelope, SshHealth, TopologySnapshot, TransportCredentialBinding,
+    TransportKind, WireGuardBinding, MAX_SECURITY_EVENTS, MAX_SECURITY_FINDINGS, PROTOCOL_VERSION,
 };
 use rand_core::OsRng;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -53,6 +53,7 @@ pub struct PeerView {
     pub origin: String,
     pub hello: Option<PeerHello>,
     pub health: Option<HostHealth>,
+    pub ssh: Option<SshHealth>,
     pub hardware: Option<HardwareSnapshot>,
     pub transports: Vec<TransportCredentialBinding>,
     pub observed_endpoints: Vec<PeerEndpointObservation>,
@@ -364,8 +365,34 @@ impl Mesh {
                                 if ready { "ready" } else { "downloading" }.into(),
                             );
                         }
-                        if let Err(error) = collector.publish(PeerEvent::Health(health)).await {
+                        if let Err(error) = collector.publish(PeerEvent::Health(health.clone())).await {
                             eprintln!("myceliumd: publish local health: {error}");
+                        }
+                        // SSH health rides the same signed fleet feed. It is
+                        // derived from local certificate state plus locally
+                        // verified grant/authority counts; it never asserts an
+                        // access grant on its own.
+                        let now = now();
+                        let active_grants = collector
+                            .access_view(now)
+                            .await
+                            .grants
+                            .iter()
+                            .filter(|grant| grant.active)
+                            .count() as u32;
+                        let authorities = collector.authority_records().await.len() as u32;
+                        let ssh = crate::ssh_health::collect(
+                            collector.node_id(),
+                            &collector.hello.hostname,
+                            &collector.hello.site,
+                            now,
+                            health.ssh_listening,
+                            health.established_ssh_sessions,
+                            active_grants,
+                            authorities,
+                        );
+                        if let Err(error) = collector.publish(PeerEvent::SshHealth(ssh)).await {
+                            eprintln!("myceliumd: publish SSH health: {error}");
                         }
                     }
                     Ok(Err(error)) => eprintln!("myceliumd: collect local health: {error}"),
@@ -467,6 +494,7 @@ impl Mesh {
                 origin: envelope.origin.clone(),
                 hello: None,
                 health: None,
+                ssh: None,
                 hardware: None,
                 transports: Vec::new(),
                 observed_endpoints: Vec::new(),
@@ -476,6 +504,7 @@ impl Mesh {
             match &envelope.event {
                 PeerEvent::Hello(hello) => view.hello = Some(hello.clone()),
                 PeerEvent::Health(health) => view.health = Some(health.clone()),
+                PeerEvent::SshHealth(ssh) => view.ssh = Some(ssh.clone()),
                 PeerEvent::Topology(_) => {}
                 PeerEvent::Release(_) => {}
                 PeerEvent::Package(_) => {}
@@ -625,6 +654,50 @@ impl Mesh {
                 _ => None,
             })
             .collect()
+    }
+
+    pub async fn ssh_healths(&self) -> Vec<SshHealth> {
+        self.observations
+            .lock()
+            .await
+            .values()
+            .filter_map(|envelope| match &envelope.event {
+                PeerEvent::SshHealth(ssh) => Some(ssh.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Recompute the local SSH healthcheck from current local state. This is
+    /// the same shape that is gossiped, so an operator sees what the fleet sees.
+    pub async fn local_ssh_health(&self) -> SshHealth {
+        let now = now();
+        let (listening, sessions) = self
+            .views()
+            .await
+            .into_iter()
+            .find(|view| view.origin == self.node_id())
+            .and_then(|view| view.health)
+            .map(|health| (health.ssh_listening, health.established_ssh_sessions))
+            .unwrap_or((false, 0));
+        let active_grants = self
+            .access_view(now)
+            .await
+            .grants
+            .iter()
+            .filter(|grant| grant.active)
+            .count() as u32;
+        let authorities = self.authority_records().await.len() as u32;
+        crate::ssh_health::collect(
+            self.node_id(),
+            &self.hello.hostname,
+            &self.hello.site,
+            now,
+            listening,
+            sessions,
+            active_grants,
+            authorities,
+        )
     }
 
     pub async fn security_events(&self) -> Vec<SecurityEventBatch> {
@@ -1818,6 +1891,7 @@ fn event_is_authorized(
         PeerEvent::SecurityEvents(events) => {
             events.node_id == envelope.origin && events.events.len() <= MAX_SECURITY_EVENTS
         }
+        PeerEvent::SshHealth(ssh) => ssh.node_id == envelope.origin && ssh.schema_version == 1,
         _ => true,
     }
 }
@@ -1864,6 +1938,7 @@ fn event_key(envelope: &SignedEnvelope) -> String {
         PeerEvent::Hardware(_) => format!("{}:hardware", envelope.origin),
         PeerEvent::SecurityPosture(_) => format!("{}:security-posture", envelope.origin),
         PeerEvent::SecurityEvents(_) => format!("{}:security-events", envelope.origin),
+        PeerEvent::SshHealth(_) => format!("{}:ssh-health", envelope.origin),
         PeerEvent::Unknown => format!("{}:unknown", envelope.origin),
     }
 }
@@ -1885,6 +1960,7 @@ fn event_origin_matches(envelope: &SignedEnvelope) -> bool {
         PeerEvent::Hardware(snapshot) => snapshot.validate_for(&envelope.origin).is_ok(),
         PeerEvent::SecurityPosture(posture) => posture.node_id == envelope.origin,
         PeerEvent::SecurityEvents(events) => events.node_id == envelope.origin,
+        PeerEvent::SshHealth(ssh) => ssh.node_id == envelope.origin,
         PeerEvent::Unknown => false,
     }
 }

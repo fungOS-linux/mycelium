@@ -115,6 +115,8 @@ fn sign_certificate(
 ) -> Result<String, String> {
     let root = crate::home_dir().join("ssh/renewal-staging");
     fs::create_dir_all(&root).map_err(|error| format!("create renewal staging: {error}"))?;
+    crate::disk::ensure_headroom(&root, request.public_key.len() as u64 + 4096)
+        .map_err(|error| format!("cannot issue SSH certificate: {error}"))?;
     let stem = root.join(&request.request_id);
     let public = stem.with_extension("pub");
     fs::write(&public, &request.public_key).map_err(|error| format!("stage SSH key: {error}"))?;
@@ -202,8 +204,21 @@ pub fn install(response: &SshRenewalResponse, now: u64) -> Result<(), String> {
     }
     let directory = crate::home_dir().join("ssh");
     fs::create_dir_all(&directory).map_err(|error| format!("create SSH state: {error}"))?;
+    // A full volume previously surfaced as an opaque ENOSPC during install.
+    // Refuse early with an actionable message and let the health record carry
+    // the same disk state.
+    crate::disk::ensure_headroom(&directory, certificate.len() as u64)
+        .map_err(|error| format!("cannot renew SSH certificate: {error}"))?;
     let installed = directory.join("user-cert.pub");
-    let staged = directory.join("user-cert.renewal-staging.pub");
+    // A unique staging path prevents two concurrent renewals (for example two
+    // connected issuers answering the same request) from racing on the same
+    // file and turning a successful install into a spurious ENOENT rename.
+    static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staged = directory.join(format!(
+        "user-cert.renewal-staging-{}-{sequence}.pub",
+        std::process::id()
+    ));
     fs::write(&staged, certificate)
         .map_err(|error| format!("stage renewed certificate: {error}"))?;
     let validation = validate_replacement(&installed, &staged);
@@ -211,8 +226,16 @@ pub fn install(response: &SshRenewalResponse, now: u64) -> Result<(), String> {
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
-    fs::rename(&staged, &installed)
-        .map_err(|error| format!("install renewed certificate: {error}"))?;
+    if let Err(error) = fs::rename(&staged, &installed) {
+        let _ = fs::remove_file(&staged);
+        // Another writer may have installed an equivalent certificate first.
+        let already_installed = fs::read(&installed)
+            .ok()
+            .is_some_and(|bytes| bytes == certificate.as_bytes());
+        if !already_installed {
+            return Err(format!("install renewed certificate: {error}"));
+        }
+    }
     let lifetime = expires_at.saturating_sub(now);
     let state = RenewalState {
         expires_at,
@@ -225,6 +248,12 @@ pub fn install(response: &SshRenewalResponse, now: u64) -> Result<(), String> {
 }
 
 fn validate_replacement(installed: &Path, staged: &Path) -> Result<(), String> {
+    // A first-time install has nothing to compare against; the certificate is
+    // still validated for shape and expiry by `install`. A renewal must not
+    // change the issuing CA or public key binding of an existing certificate.
+    if !installed.is_file() {
+        return Ok(());
+    }
     let inspect = |path: &Path| -> Result<String, String> {
         let output = Command::new("ssh-keygen")
             .args(["-L", "-f"])

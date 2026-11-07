@@ -1931,6 +1931,11 @@ impl Daemon {
                     ))
                 }
             }
+            Request::SshStatus => {
+                let local = self.mesh.local_ssh_health().await;
+                let peers = self.mesh.ssh_healths().await;
+                to_value(serde_json::json!({ "local": local, "peers": peers })).map_err(json_err)
+            }
             Request::SecurityPostureList => {
                 to_value(self.mesh.security_postures().await).map_err(json_err)
             }
@@ -3295,6 +3300,16 @@ pub async fn serve() -> std::io::Result<()> {
         }
     }
     let listener = UnixListener::bind(&socket)?;
+    // Bound stale partial downloads and interrupted temporaries; a failed
+    // transfer must not pin disk forever. Best effort, never fatal to boot.
+    match crate::disk::prune_stale(&home, crate::peer::now(), 24 * 3600) {
+        Ok((0, _)) => {}
+        Ok((freed, removed)) => eprintln!(
+            "myceliumd: pruned {removed} stale partial file(s), reclaiming {} MiB",
+            freed / (1024 * 1024)
+        ),
+        Err(error) => eprintln!("myceliumd: prune stale files: {error}"),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
