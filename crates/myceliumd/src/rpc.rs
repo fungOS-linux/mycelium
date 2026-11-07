@@ -1907,6 +1907,30 @@ impl Daemon {
                     .map_err(|error| MyceliumError::Validation(error.to_string()))?;
                 to_value(binding).map_err(json_err)
             }
+            Request::ProxyStatus => {
+                #[cfg(feature = "iroh-sync")]
+                {
+                    match crate::proxy::load_config(&crate::home_dir()) {
+                        Ok(config) => to_value(serde_json::json!({
+                            "enabled": config.enabled,
+                            "listen": config.listen,
+                            "public_relays": config.public_relays,
+                            "allow_loopback_targets": config.allow_loopback_targets,
+                            "service_alpn": String::from_utf8_lossy(crate::service::SERVICE_ALPN),
+                        }))
+                        .map_err(json_err),
+                        Err(error) => {
+                            Err(MyceliumError::Validation(format!("proxy config: {error}")))
+                        }
+                    }
+                }
+                #[cfg(not(feature = "iroh-sync"))]
+                {
+                    Err(MyceliumError::Validation(
+                        "service proxy requires the iroh-sync feature".into(),
+                    ))
+                }
+            }
             Request::SecurityPostureList => {
                 to_value(self.mesh.security_postures().await).map_err(json_err)
             }
@@ -3196,6 +3220,61 @@ pub fn cap_result_json(
 
 /// Serve forever on the daemon socket. Removes a stale socket file if no
 /// live daemon owns it (pid check).
+/// Resolve a `.myc` target to a peer's iroh address and a loopback service
+/// request, using the expiring sync hints the records feed already carried.
+/// Hints nominate a path only; reaching this resolver is not an access grant.
+#[cfg(feature = "iroh-sync")]
+struct MeshTargetResolver {
+    mesh: Arc<crate::peer::Mesh>,
+}
+
+#[cfg(feature = "iroh-sync")]
+#[async_trait::async_trait]
+impl crate::proxy::TargetResolver for MeshTargetResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Option<crate::proxy::ProxyTarget> {
+        let label = host
+            .trim_end_matches('.')
+            .trim_end_matches(".mycelium")
+            .to_ascii_lowercase();
+        let views = self.mesh.views().await;
+        let hints = self.mesh.sync_hints().await;
+        for view in views {
+            let Some(hello) = view.hello.as_ref() else {
+                continue;
+            };
+            let matches = hello.hostname.eq_ignore_ascii_case(&label)
+                || hello.node_id == label
+                || view.origin == label;
+            if !matches {
+                continue;
+            }
+            let Some(hint) = hints.iter().find(|hint| hint.node_id == view.origin) else {
+                continue;
+            };
+            let Ok(endpoint_id) = hint.endpoint_id.parse() else {
+                continue;
+            };
+            let mut peer = iroh::EndpointAddr::new(endpoint_id);
+            for address in &hint.direct_addresses {
+                peer = peer.with_ip_addr(*address);
+            }
+            for relay in &hint.relay_urls {
+                if let Ok(url) = relay.parse() {
+                    peer = peer.with_relay_url(url);
+                }
+            }
+            return Some(crate::proxy::ProxyTarget {
+                peer,
+                request: crate::service::ServiceRequest {
+                    host: "127.0.0.1".into(),
+                    port,
+                },
+            });
+        }
+        None
+    }
+}
+
 pub async fn serve() -> std::io::Result<()> {
     let home = crate::home_dir();
     std::fs::create_dir_all(&home)?;
@@ -3240,6 +3319,21 @@ pub async fn serve() -> std::io::Result<()> {
         .start()
         .await
         .map_err(|error| std::io::Error::other(format!("peer mesh failed: {error}")))?;
+    // The service proxy is opt-in. A broken or absent config disables it; it
+    // must never keep the daemon (and gossip) down, mirroring the sync rule.
+    #[cfg(feature = "iroh-sync")]
+    match crate::proxy::load_config(&crate::home_dir()) {
+        Ok(config) if config.enabled => {
+            let resolver = Arc::new(MeshTargetResolver {
+                mesh: daemon.mesh.clone(),
+            });
+            if let Err(error) = crate::proxy::start(crate::home_dir(), config, resolver).await {
+                eprintln!("myceliumd: service proxy not started: {error}");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("myceliumd: service proxy config: {error}"),
+    }
     eprintln!(
         "myceliumd {} listening on {}",
         crate::VERSION,

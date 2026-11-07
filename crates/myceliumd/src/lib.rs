@@ -28,10 +28,13 @@ pub mod peer;
 pub use iroh as iroh_transport;
 pub mod node_profile;
 pub mod protocol;
+#[cfg(feature = "iroh-sync")]
+pub mod proxy;
 pub mod resources;
 pub mod rpc;
 mod security;
 mod service_env;
+pub mod service;
 pub mod services;
 pub mod local_services;
 pub mod siem;

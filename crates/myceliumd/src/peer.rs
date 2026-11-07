@@ -44,6 +44,8 @@ type AnyError = Box<dyn Error + Send + Sync>;
 #[cfg(feature = "iroh-sync")]
 mod iroh_sync;
 #[cfg(feature = "iroh-sync")]
+pub(crate) use iroh_sync::transport_key;
+#[cfg(feature = "iroh-sync")]
 pub use iroh_sync::{SyncConfig, SyncRendezvous, SyncStatus};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -547,6 +549,20 @@ impl Mesh {
             .values()
             .filter_map(|envelope| match &envelope.event {
                 PeerEvent::WireGuard(binding) => Some(binding.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Expiring iroh connection hints per owning peer, for the service proxy's
+    /// resolver. Hints nominate a path only; they never grant access.
+    pub async fn sync_hints(&self) -> Vec<mycelium_peer_protocol::SyncHints> {
+        self.observations
+            .lock()
+            .await
+            .values()
+            .filter_map(|envelope| match &envelope.event {
+                PeerEvent::SyncHints(hints) => Some(hints.clone()),
                 _ => None,
             })
             .collect()
