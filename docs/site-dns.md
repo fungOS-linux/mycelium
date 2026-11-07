@@ -126,6 +126,14 @@ server implementation. Embedded nodes can leave it off and use LAN DNS. Modes:
 | `localhost-only` | Explicit loopback listeners | macOS user LaunchAgent or Linux user systemd unit; OS routing is separate |
 | `lan-serving` | Explicit interface addresses | Plan only; verified client-network firewall policy is required before activation |
 
+In `localhost-only` mode the generated dnsmasq configuration includes a
+`address=/.SUFFIX/127.0.0.1` fallback. Unclaimed capability names such as
+`ai.myc` or `home.myc` therefore point at the local gateway, while explicit host
+records (discovered nodes and service aliases) remain more specific and win.
+This is DNS bootstrap, not remote anycast selection: the local gateway decides
+which local or remote service to use. `lan-serving` mode never emits the
+loopback fallback because `127.0.0.1` would be wrong for a LAN client.
+
 The companion also builds as `mycelium-dns-resolver`; it exposes the same actions
 without requiring an installed CLI upgrade. Linux installs an owned
 `~/.config/systemd/user/mycelium-dns.service`, verifies DNS answers after startup,

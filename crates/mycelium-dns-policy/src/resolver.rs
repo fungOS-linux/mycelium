@@ -127,6 +127,14 @@ impl ResolverConfig {
         for server in &self.upstreams {
             config.push_str(&format!("server={}#{}\n", server.ip(), server.port()));
         }
+        // A localhost-only resolver is the bootstrap for local capability
+        // gateways: unknown `.myc` names mean "use the local gateway", while
+        // explicit host records (including discovered node and service names)
+        // remain more specific. A LAN-serving resolver must not return its own
+        // loopback to clients.
+        if self.mode == ResolverMode::LocalhostOnly {
+            config.push_str(&format!("address=/.{}/127.0.0.1\n", zone.suffix));
+        }
         config.push_str(&zone.dnsmasq);
         if self.namespace_owners.len() > 8 {
             return Err("too many owned DNS namespaces".into());
@@ -305,6 +313,33 @@ mod tests {
         let mut c = config();
         c.mode = ResolverMode::Off;
         assert_eq!(c.render(vec![]).unwrap(), "");
+    }
+    #[test]
+    fn localhost_only_bootstraps_unknown_capability_names_to_loopback() {
+        let c = config();
+        let text = c.render(vec![]).unwrap();
+        assert!(text.contains("address=/.myc/127.0.0.1\n"));
+    }
+    #[test]
+    fn lan_serving_never_returns_its_own_loopback() {
+        let mut c = config();
+        c.mode = ResolverMode::LanServing;
+        c.listen = vec!["192.0.2.10:1053".parse().unwrap()];
+        let text = c.render(vec![]).unwrap();
+        assert!(!text.contains("address=/.myc/127.0.0.1"));
+    }
+    #[test]
+    fn explicit_host_record_wins_over_local_anycast_fallback() {
+        let c = config();
+        let record = DnsRecord {
+            name: "neo.lab.myc".into(),
+            site: "lab".into(),
+            node: "neo".into(),
+            address: "192.0.2.20".parse().unwrap(),
+        };
+        let text = c.render(vec![record]).unwrap();
+        assert!(text.contains("address=/.myc/127.0.0.1\n"));
+        assert!(text.contains("host-record=neo.lab.myc,192.0.2.20\n"));
     }
     #[test]
     fn localhost_guard_and_split_namespace() {

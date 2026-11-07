@@ -1,5 +1,6 @@
 //! DNS is optional and replaceable. This adapter manages dnsmasq, not a new DNS server.
 //! macOS activation is scoped to a suffix; DHCP/default DNS remain router policy.
+use fpl_resource_observation::ServiceCatalog;
 use mycelium_core::{
     ActionRisk, CapResult, CapSpec, Device, DeviceId, DeviceKind, DeviceMeta, ExecContext,
     MyceliumError, Params,
@@ -8,7 +9,6 @@ use mycelium_dns_policy::resolver::{usable_address, ResolverConfig, ResolverMode
 use mycelium_dns_policy::{canonical_domain, DnsRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use fpl_resource_observation::ServiceCatalog;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
