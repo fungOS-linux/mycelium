@@ -42,6 +42,7 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 ed25519-dalek.workspace = true
 rand_core.workspace = true
+base64 = "0.22"
 
 [dev-dependencies]
 rcgen = "0.13"

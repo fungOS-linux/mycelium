@@ -632,15 +632,49 @@ pub fn run(args: &[String], access: &Value, authority: &Value) -> Result<Vec<Str
     }
     let bundle = base.join(format!("ssh-bundle-{}-{now}", std::process::id()));
     let krl = base.join("revoked.krl");
-    let krl_args = vec![
-        "krl".into(),
-        "--ca-public".into(),
-        policy.ca_public.clone(),
-        "--path".into(),
-        krl.display().to_string(),
-        "--write".into(),
-    ];
-    crate::ssh_access::run(&krl_args, &verified)?;
+    if plan.ssh_ca_mode == "delegated" {
+        // A single KRL can carry sections for several CAs. Build into a staging
+        // file and add each trusted CA's section before atomically installing.
+        let staging = base.join("revoked.krl.staging");
+        let _ = fs::remove_file(&staging);
+        let mut ca_files = Vec::new();
+        if policy.ssh_ca.keep_installed {
+            ca_files.push(Path::new(&policy.ca_public).to_path_buf());
+        }
+        for (index, ca) in plan.ssh_user_cas.iter().enumerate() {
+            let file = base.join(format!("ssh-ca-{index}.pub"));
+            install(
+                &file,
+                (ssh_ed25519_line(&ca.subject)? + "\n").as_bytes(),
+                0o644,
+            )?;
+            ca_files.push(file);
+        }
+        for file in ca_files {
+            let krl_args = vec![
+                "krl".into(),
+                "--ca-public".into(),
+                file.to_string_lossy().into_owned(),
+                "--path".into(),
+                staging.display().to_string(),
+                "--write".into(),
+            ];
+            crate::ssh_access::run(&krl_args, &verified)?;
+        }
+        if staging.exists() {
+            fs::rename(&staging, &krl).map_err(|e| e.to_string())?;
+        }
+    } else {
+        let krl_args = vec![
+            "krl".into(),
+            "--ca-public".into(),
+            policy.ca_public.clone(),
+            "--path".into(),
+            krl.display().to_string(),
+            "--write".into(),
+        ];
+        crate::ssh_access::run(&krl_args, &verified)?;
+    }
     let mut bundle_args = vec![
         "host-bundle".into(),
         "--ca-public".into(),

@@ -118,12 +118,15 @@ Add a `ssh_ca` block to the root-owned `/etc/mycelium/access.json`:
    `/var/lib/mycelium/access/ssh-user-ca.pub` (unioning the legacy CA when
    `keep_installed`), and passes that file to `host-bundle`. `plan` shows the
    mode, source, and active delegates. No empty trust file is ever installed.
-3. Issuance gate: only a currently authorized delegate may sign user
-   certificates; bind the certificate key ID to the delegation.
+3. **Implemented:** issuance gate. With `MYCELIUM_SSH_CA_MODE=delegated`
+   (default `legacy`), the daemon refuses to sign unless the CA public key is an
+   active `ssh_user_ca` delegate and the binding's roles/users stay inside the
+   delegation's constraints. The certificate `Key ID` becomes
+   `mycelium:renew:<delegation_id>:<node_id>`, binding each certificate to the
+   delegation that authorized it. Host reconciliation now builds the revocation
+   KRL by adding a section per trusted CA (delegates, plus legacy while
+   `keep_installed`) into one staged KRL.
 4. Migrate the existing CA: keep it trusted, add the first delegate, let hosts
    reconcile, then retire the old key.
 5. Backup/restore and root-rotation runbook with a scratch-host rehearsal.
-
-Known gap for phase 3: the revocation KRL (`krl`) is still built from the
-legacy `ca_public`; per-delegate KRL scoping follows with the issuance gate.
 

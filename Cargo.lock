@@ -2575,6 +2575,7 @@ name = "myceliumd"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "ed25519-dalek 2.2.0",
  "fpl-resource-observation",
  "iroh",
