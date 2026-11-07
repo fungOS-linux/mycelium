@@ -84,16 +84,46 @@ host role policy.
   its delegations first, then remove the old root after drain. Treat this as a
   staged operation, not a single record.
 
+## Host policy
+
+Add a `ssh_ca` block to the root-owned `/etc/mycelium/access.json`:
+
+```json
+{
+  "version": 1,
+  "authority_roots": ["ROOT_PUBLIC_KEY_HEX"],
+  "accepted_roles": ["network-admin"],
+  "ca_public": "/etc/ssh/mycelium/legacy-ca.pub",
+  "ssh_ca": { "mode": "delegated", "keep_installed": true }
+}
+```
+
+- `mode: "legacy"` (default) trusts `ca_public` verbatim — current behavior.
+- `mode: "delegated"` derives the trusted CA set from active `ssh_user_ca`
+  delegations and writes a root-owned
+  `/var/lib/mycelium/access/ssh-user-ca.pub`, which `host-bundle` installs as
+  `TrustedUserCAKeys`.
+- `keep_installed: true` (default) also keeps the CA already in `ca_public`
+  during migration. Set it to `false` only after the old CA is retired; with no
+  active delegate the apply then **fails closed** instead of writing an empty
+  trust file and locking out SSH.
+
 ## Phases
 
-1. **Implemented (this change):** `AuthorityCapability::SshUserCa` with
-   `roles`/`unix_users` constraints, `permits_ssh_user_ca`, and
-   `AuthorityResolver::ssh_user_cas()` / `ssh_user_ca()` returning the active,
-   unrevoked, deterministic delegate set. No behavior change on its own.
-2. Host materialization: write the active delegate set into `TrustedUserCAKeys`,
-   keep the legacy single `ca_public` during migration.
+1. **Implemented:** `AuthorityCapability::SshUserCa` with `roles`/`unix_users`
+   constraints, `permits_ssh_user_ca`, and `AuthorityResolver::ssh_user_cas()` /
+   `ssh_user_ca()` returning the active, unrevoked, deterministic delegate set.
+2. **Implemented:** host materialization. `access host apply` in `delegated`
+   mode renders each delegate subject as an `ssh-ed25519` line into
+   `/var/lib/mycelium/access/ssh-user-ca.pub` (unioning the legacy CA when
+   `keep_installed`), and passes that file to `host-bundle`. `plan` shows the
+   mode, source, and active delegates. No empty trust file is ever installed.
 3. Issuance gate: only a currently authorized delegate may sign user
    certificates; bind the certificate key ID to the delegation.
 4. Migrate the existing CA: keep it trusted, add the first delegate, let hosts
    reconcile, then retire the old key.
 5. Backup/restore and root-rotation runbook with a scratch-host rehearsal.
+
+Known gap for phase 3: the revocation KRL (`krl`) is still built from the
+legacy `ca_public`; per-delegate KRL scoping follows with the issuance gate.
+
