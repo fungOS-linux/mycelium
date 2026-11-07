@@ -1,0 +1,29 @@
+{
+  "default_route": "bifrost",
+  "routes": [
+    {
+      "name": "bifrost",
+      "hosts": ["*"],
+      "upstream": "http://127.0.0.1:4000",
+      "priority": 0
+    },
+    {
+      "name": "mcp",
+      "hosts": ["mcp.myc", "*.mcp"],
+      "upstream": "http://127.0.0.1:8000",
+      "priority": 10
+    },
+    {
+      "name": "home",
+      "hosts": ["home.myc", "*.home"],
+      "upstream": "http://127.0.0.1:8080",
+      "priority": 10
+    },
+    {
+      "name": "webhook",
+      "hosts": ["webhook.myc", "confluence.myc"],
+      "upstream": "http://127.0.0.1:8090",
+      "priority": 10
+    }
+  ]
+}
