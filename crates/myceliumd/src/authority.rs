@@ -48,6 +48,19 @@ pub struct AuthorityDecision {
     pub reason: String,
 }
 
+/// An active delegation that authorizes an Ed25519 key to sign OpenSSH user
+/// certificates. The `subject` is the hex-encoded Ed25519 public key; hosts
+/// render it into `TrustedUserCAKeys` while the delegation is active.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuthorizedSshCa {
+    pub subject: String,
+    pub delegation_id: String,
+    pub roles: BTreeSet<String>,
+    pub unix_users: BTreeSet<String>,
+    pub not_before: u64,
+    pub not_after: u64,
+}
+
 /// Resolves root, delegated, revoked, and legacy authorization consistently.
 ///
 /// Invalid records are ignored. Revocation wins over delegation regardless of
@@ -178,6 +191,54 @@ impl<'a> AuthorityResolver<'a> {
             |capability| capability.permits_package_fields(name, channel, target),
             self.legacy_release,
         )
+    }
+
+    /// Checks permission to sign OpenSSH user certificates.
+    pub fn ssh_user_ca(&self, signer: &str) -> AuthorityDecision {
+        self.decide(
+            signer,
+            "ssh.user-ca",
+            |capability| matches!(capability, AuthorityCapability::SshUserCa { .. }),
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Every currently active, unrevoked `ssh_user_ca` delegation, sorted so
+    /// the trusted-CA set materializes deterministically. Roots are not
+    /// included: they sign authority statements, not user certificates.
+    pub fn ssh_user_cas(&self) -> Vec<AuthorizedSshCa> {
+        let mut subjects = Vec::new();
+        for (delegation_id, delegation) in &self.delegations {
+            if self.revoked.contains(delegation_id)
+                || self.now < delegation.not_before
+                || self.now >= delegation.not_after
+            {
+                continue;
+            }
+            for capability in &delegation.capabilities {
+                let AuthorityCapability::SshUserCa { roles, unix_users } = capability else {
+                    continue;
+                };
+                // An unconstrained SSH CA is refused, matching the issuance gate.
+                if roles.is_empty() && unix_users.is_empty() {
+                    continue;
+                }
+                subjects.push(AuthorizedSshCa {
+                    subject: delegation.subject.clone(),
+                    delegation_id: delegation_id.clone(),
+                    roles: roles.clone(),
+                    unix_users: unix_users.clone(),
+                    not_before: delegation.not_before,
+                    not_after: delegation.not_after,
+                });
+            }
+        }
+        subjects.sort_by(|left, right| {
+            left.subject
+                .cmp(&right.subject)
+                .then(left.delegation_id.cmp(&right.delegation_id))
+        });
+        subjects
     }
 
     fn decide(
@@ -371,5 +432,100 @@ mod tests {
         let empty = BTreeSet::new();
         let resolver = AuthorityResolver::new(&roots, &empty, &empty, [&grant], 100);
         assert!(!resolver.access(&id(&subject)).authorized);
+    }
+
+    #[test]
+    fn ssh_user_ca_delegation_is_enumerated_with_constraints() {
+        let root = key(1);
+        let subject = key(7);
+        let grant = delegation(
+            &root,
+            &subject,
+            AuthorityCapability::SshUserCa {
+                roles: BTreeSet::from(["network-admin".into()]),
+                unix_users: BTreeSet::new(),
+            },
+        );
+        let roots = BTreeSet::from([id(&root)]);
+        let empty = BTreeSet::new();
+        let resolver = AuthorityResolver::new(&roots, &empty, &empty, [&grant], 50);
+        let cas = resolver.ssh_user_cas();
+        assert_eq!(cas.len(), 1);
+        assert_eq!(cas[0].subject, id(&subject));
+        assert_eq!(cas[0].delegation_id, "delegate-1");
+        assert_eq!(cas[0].roles, BTreeSet::from(["network-admin".into()]));
+        assert!(resolver.ssh_user_ca(&id(&subject)).authorized);
+    }
+
+    #[test]
+    fn unconstrained_ssh_user_ca_is_refused() {
+        let root = key(1);
+        let subject = key(8);
+        let grant = delegation(
+            &root,
+            &subject,
+            AuthorityCapability::SshUserCa {
+                roles: BTreeSet::new(),
+                unix_users: BTreeSet::new(),
+            },
+        );
+        let roots = BTreeSet::from([id(&root)]);
+        let empty = BTreeSet::new();
+        let resolver = AuthorityResolver::new(&roots, &empty, &empty, [&grant], 50);
+        assert!(resolver.ssh_user_cas().is_empty());
+        let capability = AuthorityCapability::SshUserCa {
+            roles: BTreeSet::new(),
+            unix_users: BTreeSet::new(),
+        };
+        assert!(!capability.permits_ssh_user_ca(Some("network-admin"), Some("ajmwagar")));
+    }
+
+    #[test]
+    fn revoked_or_expired_ssh_ca_delegation_is_excluded() {
+        let root = key(1);
+        let subject = key(9);
+        let capability = AuthorityCapability::SshUserCa {
+            roles: BTreeSet::new(),
+            unix_users: BTreeSet::from(["ajmwagar".into()]),
+        };
+        let grant = delegation(&root, &subject, capability);
+        let roots = BTreeSet::from([id(&root)]);
+        let empty = BTreeSet::new();
+        // Expired window.
+        let resolver = AuthorityResolver::new(&roots, &empty, &empty, [&grant], 100);
+        assert!(resolver.ssh_user_cas().is_empty());
+        // Revoked before the decision time.
+        let revoke = AuthorityRecord::sign(
+            &root,
+            AuthorityStatement::Revoke {
+                revocation_id: "revoke-ssh".into(),
+                delegation_id: "delegate-1".into(),
+                revoked_at: 40,
+                reason: "compromise".into(),
+            },
+        )
+        .unwrap();
+        let resolver = AuthorityResolver::new(&roots, &empty, &empty, [&grant, &revoke], 50);
+        assert!(resolver.ssh_user_cas().is_empty());
+        assert!(!resolver.ssh_user_ca(&id(&subject)).authorized);
+    }
+
+    #[test]
+    fn ssh_user_ca_capability_does_not_confer_other_authority() {
+        let root = key(1);
+        let subject = key(10);
+        let grant = delegation(
+            &root,
+            &subject,
+            AuthorityCapability::SshUserCa {
+                roles: BTreeSet::from(["network-admin".into()]),
+                unix_users: BTreeSet::new(),
+            },
+        );
+        let roots = BTreeSet::from([id(&root)]);
+        let empty = BTreeSet::new();
+        let resolver = AuthorityResolver::new(&roots, &empty, &empty, [&grant], 50);
+        assert!(!resolver.access(&id(&subject)).authorized);
+        assert!(!resolver.release(&id(&subject)).authorized);
     }
 }

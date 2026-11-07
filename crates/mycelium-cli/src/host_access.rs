@@ -26,6 +26,53 @@ struct Policy {
     /// PAM account checks only; authentication stacks/passwords remain intact.
     #[serde(default)]
     pam_services: BTreeSet<String>,
+    /// How the set of trusted SSH user CAs is derived. `legacy` (default) uses
+    /// `ca_public` verbatim; `delegated` materializes the active root-authorized
+    /// `ssh_user_ca` delegates into a derived file.
+    #[serde(default)]
+    ssh_ca: SshCaPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SshCaPolicy {
+    #[serde(default)]
+    mode: SshCaMode,
+    /// During migration keep the CA already installed at `ca_public` trusted
+    /// alongside the delegates, so enabling delegated mode cannot lock out
+    /// existing sessions. Turn off once the old CA is retired.
+    #[serde(default = "default_true")]
+    keep_installed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SshCaMode {
+    #[default]
+    Legacy,
+    Delegated,
+}
+
+impl SshCaMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            SshCaMode::Legacy => "legacy",
+            SshCaMode::Delegated => "delegated",
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SshCaPolicy {
+    fn default() -> Self {
+        Self {
+            mode: SshCaMode::Legacy,
+            keep_installed: true,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -35,6 +82,19 @@ struct Plan {
     managed_users: BTreeSet<String>,
     sudoers: String,
     pam_access: String,
+    ssh_ca_mode: String,
+    ssh_ca_source: String,
+    ssh_user_cas: Vec<SshCaSummary>,
+}
+
+/// Read-only projection of an active `ssh_user_ca` delegation for `plan`.
+#[derive(Debug, Serialize)]
+struct SshCaSummary {
+    subject: String,
+    delegation_id: String,
+    roles: BTreeSet<String>,
+    unix_users: BTreeSet<String>,
+    not_after: u64,
 }
 
 fn atom(s: &str) -> Result<(), String> {
@@ -106,6 +166,27 @@ fn derive(
         &authority_records,
         now,
     );
+    // Delegated SSH CA trust is derived from the same verified authority graph.
+    // An unconstrained or absent delegation fails closed rather than silently
+    // trusting the legacy CA forever.
+    let ssh_user_cas = if policy.ssh_ca.mode == SshCaMode::Delegated {
+        resolver.ssh_user_cas()
+    } else {
+        Vec::new()
+    };
+    if policy.ssh_ca.mode == SshCaMode::Delegated
+        && ssh_user_cas.is_empty()
+        && !policy.ssh_ca.keep_installed
+    {
+        return Err(
+            "delegated SSH CA mode has no active ssh_user_ca delegation and keep_installed is false; refusing to leave SSH with no trusted CA"
+                .into(),
+        );
+    }
+    let ssh_ca_source = match policy.ssh_ca.mode {
+        SshCaMode::Legacy => policy.ca_public.clone(),
+        SshCaMode::Delegated => "/var/lib/mycelium/access/ssh-user-ca.pub".to_string(),
+    };
     let mut records = Vec::new();
     let mut retained_grants = Vec::new();
     let mut retained_revocations = Vec::new();
@@ -219,6 +300,18 @@ fn derive(
             managed_users,
             sudoers,
             pam_access,
+            ssh_ca_mode: policy.ssh_ca.mode.as_str().to_string(),
+            ssh_ca_source,
+            ssh_user_cas: ssh_user_cas
+                .into_iter()
+                .map(|ca| SshCaSummary {
+                    subject: ca.subject,
+                    delegation_id: ca.delegation_id,
+                    roles: ca.roles,
+                    unix_users: ca.unix_users,
+                    not_after: ca.not_after,
+                })
+                .collect(),
         },
         sanitized,
     ))
@@ -513,6 +606,30 @@ pub fn run(args: &[String], access: &Value, authority: &Value) -> Result<Vec<Str
     for (path, content) in pam {
         install(Path::new(&path), content.as_bytes(), 0o644)?;
     }
+    // Materialize the delegated SSH CA trust set into a root-owned derived file.
+    // The legacy CA stays trusted during migration via `keep_installed`.
+    if plan.ssh_ca_mode == "delegated" {
+        let mut lines = Vec::new();
+        if policy.ssh_ca.keep_installed {
+            lines.extend(read_public_key_lines(Path::new(&policy.ca_public))?);
+        }
+        for ca in &plan.ssh_user_cas {
+            lines.push(ssh_ed25519_line(&ca.subject)?);
+        }
+        let mut seen = BTreeSet::new();
+        lines.retain(|line| seen.insert(line.clone()));
+        if lines.is_empty() {
+            return Err(
+                "delegated SSH CA mode produced no trusted keys; refusing to install an empty TrustedUserCAKeys"
+                    .into(),
+            );
+        }
+        install(
+            Path::new(&plan.ssh_ca_source),
+            (lines.join("\n") + "\n").as_bytes(),
+            0o644,
+        )?;
+    }
     let bundle = base.join(format!("ssh-bundle-{}-{now}", std::process::id()));
     let krl = base.join("revoked.krl");
     let krl_args = vec![
@@ -527,7 +644,7 @@ pub fn run(args: &[String], access: &Value, authority: &Value) -> Result<Vec<Str
     let mut bundle_args = vec![
         "host-bundle".into(),
         "--ca-public".into(),
-        policy.ca_public,
+        plan.ssh_ca_source.clone(),
         "--krl".into(),
         krl.display().to_string(),
         "--path".into(),
@@ -605,6 +722,41 @@ fn install_timer(args: &[String], policy: &Path) -> Result<Vec<String>, String> 
     Ok(vec!["installed root-owned two-minute host access reconciliation; cached signed grants expire even when gossip is unavailable".into()])
 }
 
+/// Non-empty, non-comment lines from a trusted-CA file. A missing legacy file is
+/// not fatal: a fully delegated host may not have one.
+fn read_public_key_lines(path: &Path) -> Result<Vec<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("read {}: {error}", path.display())),
+    }
+}
+
+/// Render a hex Ed25519 public key as an OpenSSH `ssh-ed25519` trust line.
+fn ssh_ed25519_line(hex_key: &str) -> Result<String, String> {
+    let key = mycelium_peer_protocol::decode_hex(hex_key)
+        .map_err(|error| format!("invalid delegated SSH CA key: {error}"))?;
+    if key.len() != 32 {
+        return Err("delegated SSH CA key must be a 32-byte Ed25519 public key".into());
+    }
+    const ALGORITHM: &[u8] = b"ssh-ed25519";
+    let mut blob = Vec::with_capacity(4 + ALGORITHM.len() + 4 + key.len());
+    blob.extend_from_slice(&(ALGORITHM.len() as u32).to_be_bytes());
+    blob.extend_from_slice(ALGORITHM);
+    blob.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    blob.extend_from_slice(&key);
+    use base64::Engine as _;
+    Ok(format!(
+        "ssh-ed25519 {}",
+        base64::engine::general_purpose::STANDARD.encode(blob)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +769,7 @@ mod tests {
             sudo_roles: BTreeSet::new(),
             ca_public: "/etc/ssh/ca.pub".into(),
             pam_services: BTreeSet::new(),
+            ssh_ca: SshCaPolicy::default(),
         }
     }
     #[test]
@@ -841,5 +994,86 @@ mod tests {
         .unwrap();
         assert!(offline.sudo_users.is_empty());
         assert!(offline.pam_access.contains("- : mames : ALL"));
+    }
+
+    fn ssh_ca_authority(
+        root: &ed25519_dalek::SigningKey,
+        subject: &ed25519_dalek::SigningKey,
+        not_before: u64,
+        not_after: u64,
+    ) -> Value {
+        use mycelium_peer_protocol::{AuthorityCapability, AuthorityStatement};
+        let record = AuthorityRecord::sign(
+            root,
+            AuthorityStatement::Delegate {
+                delegation_id: "ssh-ca-1".into(),
+                subject: mycelium_peer_protocol::encode_hex(
+                    subject.verifying_key().as_bytes(),
+                ),
+                capabilities: vec![AuthorityCapability::SshUserCa {
+                    roles: BTreeSet::from(["operator".into()]),
+                    unix_users: BTreeSet::new(),
+                }],
+                not_before,
+                not_after,
+            },
+        )
+        .unwrap();
+        serde_json::json!([record])
+    }
+
+    #[test]
+    fn delegated_ssh_ca_selects_active_delegation() {
+        let root = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let delegate = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let (mut p, grant) = signed_fixture();
+        p.authority_roots =
+            BTreeSet::from([mycelium_peer_protocol::encode_hex(root.verifying_key().as_bytes())]);
+        p.ssh_ca = SshCaPolicy {
+            mode: SshCaMode::Delegated,
+            keep_installed: false,
+        };
+        let authority = ssh_ca_authority(&root, &delegate, 10, 20);
+        let (plan, _) = derive(
+            &p,
+            &snapshot(&grant, true, vec![]),
+            &authority,
+            BTreeSet::new(),
+            15,
+        )
+        .unwrap();
+        assert_eq!(plan.ssh_ca_mode, "delegated");
+        assert_eq!(plan.ssh_ca_source, "/var/lib/mycelium/access/ssh-user-ca.pub");
+        assert_eq!(plan.ssh_user_cas.len(), 1);
+        assert_eq!(
+            plan.ssh_user_cas[0].subject,
+            mycelium_peer_protocol::encode_hex(delegate.verifying_key().as_bytes())
+        );
+        let line = ssh_ed25519_line(&plan.ssh_user_cas[0].subject).unwrap();
+        assert!(line.starts_with("ssh-ed25519 "));
+        use base64::Engine as _;
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(line.trim_start_matches("ssh-ed25519 "))
+            .unwrap();
+        assert_eq!(&blob[4..15], b"ssh-ed25519");
+        assert_eq!(blob.len(), 4 + 11 + 4 + 32);
+    }
+
+    #[test]
+    fn delegated_ssh_ca_refuses_to_lock_out_without_delegation() {
+        let (mut p, grant) = signed_fixture();
+        p.authority_roots = BTreeSet::from(["a".repeat(64)]);
+        p.ssh_ca = SshCaPolicy {
+            mode: SshCaMode::Delegated,
+            keep_installed: false,
+        };
+        let result = derive(
+            &p,
+            &snapshot(&grant, true, vec![]),
+            &serde_json::json!([]),
+            BTreeSet::new(),
+            15,
+        );
+        assert!(result.is_err());
     }
 }
