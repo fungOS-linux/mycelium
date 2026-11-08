@@ -84,7 +84,45 @@ cargo run -p mycelium-gateway -- --listen 127.0.0.1:8080 \
 
 ### HTTPS ingress
 
-Terminate TLS in the gateway for the stable capability names:
+The CLI owns the normal local setup:
+
+```sh
+mycelium gateway install --write --trust-cert
+mycelium gateway status
+mycelium doctor
+```
+
+`gateway install` writes a local CA and leaf certificate (or retains an
+existing certificate pair), installs the default capability routes, copies the
+gateway/forwarder binaries under `$MYCELIUM_HOME/bin`, and bootstraps the two
+macOS LaunchAgents. `--trust-cert` adds the issuing CA to the login keychain so
+Brave/Safari accept `ai.myc`; it is deliberately explicit because it changes
+the user's trust settings. `mycelium setup --local-gateway --trust-cert` runs
+the same installation after enrollment. `mycelium doctor --fix --trust-cert`
+repairs an existing installation, and plain `mycelium doctor` exits non-zero
+when a check fails so it can gate scripts.
+
+`gateway install` refuses to start when `:443` or `:8443` is already held by a
+different process, so a leftover system LaunchDaemon is reported instead of
+being silently duplicated. `gateway uninstall` removes only the two user
+LaunchAgents; it never touches `/Library/LaunchDaemons`.
+
+For a custom certificate or route table, use the installer flags directly:
+
+```sh
+mycelium gateway install --write \
+  --routes /path/to/routes.json \
+  --cert /path/to/server.pem \
+  --key /path/to/server-key.pem \
+  --trust-cert
+```
+
+The certificate must cover every `Host` the gateway serves (`ai.myc`,
+`home.myc`, a wildcard such as `*.myc`, or an explicit SAN list). The browser
+trust decision is separate from gateway authorization; trust the issuing CA in
+the browser keychain if the certificate is not publicly trusted.
+
+For development, run the gateway directly on a nonprivileged port:
 
 ```sh
 mycelium-gateway --listen 127.0.0.1:8443 \
@@ -92,11 +130,6 @@ mycelium-gateway --listen 127.0.0.1:8443 \
   --tls-cert "$HOME/.mycelium/gateway/server.pem" \
   --tls-key "$HOME/.mycelium/gateway/server-key.pem"
 ```
-
-The certificate must cover every `Host` the gateway serves (`ai.myc`,
-`home.myc`, a wildcard such as `*.myc`, or an explicit SAN list). The browser
-trust decision is separate from gateway authorization; trust the issuing CA in
-the browser keychain if the certificate is not publicly trusted.
 
 On macOS, launchd can own `:443` for an unprivileged LaunchAgent. The agent is
 started on the first connection and runs the forwarder as the logged-in user:

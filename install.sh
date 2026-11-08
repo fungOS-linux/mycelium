@@ -19,7 +19,7 @@ export PATH
 
 echo "Building Mycelium from the public repository..."
 cargo install --git https://github.com/ajmwagar/mycelium.git \
-  mycelium-cli --locked --force
+  mycelium-cli mycelium-gateway --locked --force
 
 echo "Starting secure browser enrollment..."
 exec mycelium setup --gateway "$gateway" "$@"

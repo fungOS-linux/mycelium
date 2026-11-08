@@ -8,16 +8,26 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         return Err("--packaged requires the installed owner-built Mycelium Debian package".into());
     }
     let system_service = packaged || args.iter().any(|argument| argument == "--system-service");
+    let local_gateway = args.iter().any(|argument| argument == "--local-gateway");
+    let trust_gateway = args.iter().any(|argument| argument == "--trust-cert");
+    if trust_gateway && !local_gateway {
+        return Err("--trust-cert requires --local-gateway".into());
+    }
+    if local_gateway && (packaged || system_service || !cfg!(target_os = "macos")) {
+        return Err("--local-gateway is supported only for a user-level macOS setup".into());
+    }
     let home = value(args, "--path").map(expand_home).unwrap_or_else(|| {
         if packaged { PathBuf::from(crate::packaged::HOME) } else { myceliumd::home_dir() }
     });
     if packaged { crate::packaged::validate(&home, system_service)?; }
     if args.iter().any(|argument| argument == "--repair") {
-        return crate::enroll::repair_peer_service(
+        let mut lines = crate::enroll::repair_peer_service(
             &home,
             value(args, "--site"),
             system_service,
-        );
+        )?;
+        lines.extend(install_local_gateway(local_gateway, &home, trust_gateway).await?);
+        return Ok(lines);
     }
     let claim_path = value(args, "--claim-file").map(expand_home);
     if value(args, "--claim").is_some() && claim_path.is_some() {
@@ -47,12 +57,14 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     {
         let result = setup_peer(
             embedded.as_ref().expect("checked above"),
-            Some(home),
+            Some(home.clone()),
             system_service,
         )
         .await;
         remove_consumed_claim(&result, claim_path.as_deref())?;
-        return result;
+        let mut lines = result?;
+        lines.extend(install_local_gateway(local_gateway, &home, trust_gateway).await?);
+        return Ok(lines);
     }
     let ssh_dir = user_home()?.join(".ssh");
     let private_key = value(args, "--key")
@@ -119,7 +131,19 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         certificate.display()
     ));
     remove_consumed_claim(&Ok(()), claim_path.as_deref())?;
+    lines.extend(install_local_gateway(local_gateway, &home, trust_gateway).await?);
     Ok(lines)
+}
+
+async fn install_local_gateway(
+    local_gateway: bool,
+    home: &Path,
+    trust: bool,
+) -> Result<Vec<String>, String> {
+    if !local_gateway {
+        return Ok(Vec::new());
+    }
+    crate::gateway::install_default(home, trust).await
 }
 
 fn read_claim_file(path: &Path) -> Result<String, String> {

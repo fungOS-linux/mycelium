@@ -61,6 +61,23 @@ curl --proto '=https' --tlsv1.2 -fsS \
 After installation, enrollment can be repeated explicitly with
 `mycelium setup --gateway https://sso.fpl.dev`.
 
+On a workstation that should expose local capability names such as `ai.myc`
+and `mcp.myc`, install the loopback HTTPS gateway after enrollment. The
+`--trust-cert` flag adds the generated local CA to the login keychain so the
+browser accepts the names:
+
+```sh
+mycelium setup --claim "$CLAIM" --local-gateway --trust-cert
+# or, on an already-enrolled workstation:
+mycelium gateway install --write --trust-cert
+mycelium doctor
+```
+
+`mycelium doctor` checks the daemon, `.myc` resolution, both LaunchAgents, the
+gateway listeners, certificate trust, and HTTPS health. It exits non-zero when
+a check fails, so it can gate automation. `--json` is available for scripts;
+`--fix --trust-cert` repairs the local gateway installation.
+
 ### Shell completion
 
 Completion definitions are generated from the CLI's usage contract, so newly
@@ -145,7 +162,7 @@ For a pinned checkout, build `mycelium-cli` as shown below and place
 ```sh
 git clone https://github.com/ajmwagar/mycelium.git
 cd mycelium
-cargo build --release -p mycelium-cli
+cargo build --release -p mycelium-cli -p mycelium-gateway
 
 # The CLI starts its local daemon on demand.
 ./target/release/mycelium drivers
