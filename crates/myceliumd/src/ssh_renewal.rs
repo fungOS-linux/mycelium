@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use mycelium_peer_protocol::{SshRenewalRequest, SshRenewalResponse};
+use crate::authority::AuthorizedSshCa;
+use mycelium_peer_protocol::{encode_hex, SshRenewalRequest, SshRenewalResponse};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -64,25 +65,104 @@ pub fn authorize(binding: RenewalBinding) -> Result<(), String> {
     )
 }
 
-pub fn issue(request: &SshRenewalRequest, now: u64) -> Option<SshRenewalResponse> {
+pub fn issue(
+    request: &SshRenewalRequest,
+    now: u64,
+    authorized_cas: &[AuthorizedSshCa],
+) -> Option<SshRenewalResponse> {
     let ca = crate::home_dir().join("ssh/user_ca");
     if !ca.is_file() {
         return None;
     }
-    Some(
-        issue_inner(request, now, &ca).unwrap_or_else(|error| SshRenewalResponse {
+    Some(issue_inner(request, now, &ca, authorized_cas).unwrap_or_else(
+        |error| SshRenewalResponse {
             request_id: request.request_id.clone(),
             certificate: None,
             expires_at: None,
             error: Some(error),
-        }),
-    )
+        },
+    ))
+}
+
+/// Delegated mode requires the signing CA to be a live `ssh_user_ca` delegate
+/// and the requested principals to stay inside its constraints. Default legacy
+/// mode preserves today's behavior until the CA is migrated.
+fn delegated_mode() -> bool {
+    std::env::var("MYCELIUM_SSH_CA_MODE")
+        .map(|value| value.eq_ignore_ascii_case("delegated"))
+        .unwrap_or(false)
+}
+
+fn renewal_identity(delegation_id: Option<&str>, node_id: &str) -> String {
+    match delegation_id {
+        Some(id) => format!("mycelium:renew:{id}:{node_id}"),
+        None => format!("mycelium:renew:{node_id}"),
+    }
+}
+
+fn delegated_ca<'a>(
+    authorized_cas: &'a [AuthorizedSshCa],
+    ca_public_hex: &str,
+    binding: &RenewalBinding,
+) -> Result<&'a AuthorizedSshCa, String> {
+    let ca = authorized_cas
+        .iter()
+        .find(|ca| ca.subject.eq_ignore_ascii_case(ca_public_hex))
+        .ok_or("signing CA is not an active delegated ssh_user_ca")?;
+    if !ca.roles.is_empty() && !binding.roles.iter().all(|role| ca.roles.contains(role)) {
+        return Err("requested roles exceed the CA delegation".into());
+    }
+    if !ca.unix_users.is_empty()
+        && !binding
+            .unix_users
+            .iter()
+            .all(|user| ca.unix_users.contains(user))
+    {
+        return Err("requested Unix users exceed the CA delegation".into());
+    }
+    Ok(ca)
+}
+
+/// Hex Ed25519 public key from an OpenSSH `ssh-ed25519` public-key file.
+fn ssh_public_key_hex(path: &Path) -> Result<String, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("read CA public key {}: {error}", path.display()))?;
+    let mut fields = text.split_whitespace();
+    if fields.next() != Some("ssh-ed25519") {
+        return Err("CA public key is not an ssh-ed25519 key".into());
+    }
+    let encoded = fields.next().ok_or("CA public key has no key material")?;
+    use base64::Engine as _;
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("decode CA public key: {error}"))?;
+    // string "ssh-ed25519" + string key
+    let algorithm_len = u32::from_be_bytes(blob.get(0..4).ok_or("truncated CA key")?.try_into().unwrap()) as usize;
+    let algorithm_end = 4 + algorithm_len;
+    if blob.get(4..algorithm_end) != Some(b"ssh-ed25519") {
+        return Err("CA public key algorithm mismatch".into());
+    }
+    let key_len = u32::from_be_bytes(
+        blob.get(algorithm_end..algorithm_end + 4)
+            .ok_or("truncated CA key length")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let key_start = algorithm_end + 4;
+    let key = blob
+        .get(key_start..key_start + key_len)
+        .ok_or("truncated CA key material")?;
+    if key.len() != 32 {
+        return Err("CA key is not a 32-byte Ed25519 public key".into());
+    }
+    Ok(encode_hex(key))
 }
 
 fn issue_inner(
     request: &SshRenewalRequest,
     now: u64,
     ca: &Path,
+    authorized_cas: &[AuthorizedSshCa],
 ) -> Result<SshRenewalResponse, String> {
     request
         .verify()
@@ -99,7 +179,14 @@ fn issue_inner(
         .iter()
         .find(|entry| entry.node_id == request.node_id && !entry.revoked)
         .ok_or("peer has no active SSH renewal authorization")?;
-    let certificate = sign_certificate(request, binding, ca)?;
+    let delegation_id = if delegated_mode() {
+        let ca_hex = ssh_public_key_hex(&ca.with_extension("pub"))?;
+        let delegate = delegated_ca(authorized_cas, &ca_hex, binding)?;
+        Some(delegate.delegation_id.clone())
+    } else {
+        None
+    };
+    let certificate = sign_certificate(request, binding, ca, delegation_id.as_deref())?;
     Ok(SshRenewalResponse {
         request_id: request.request_id.clone(),
         certificate: Some(certificate),
@@ -112,6 +199,7 @@ fn sign_certificate(
     request: &SshRenewalRequest,
     binding: &RenewalBinding,
     ca: &Path,
+    delegation_id: Option<&str>,
 ) -> Result<String, String> {
     let root = crate::home_dir().join("ssh/renewal-staging");
     fs::create_dir_all(&root).map_err(|error| format!("create renewal staging: {error}"))?;
@@ -127,7 +215,7 @@ fn sign_certificate(
         .collect::<Vec<_>>()
         .join(",");
     let validity = format!("+0s:+{}s", binding.credential_ttl);
-    let identity = format!("mycelium:renew:{}", request.node_id);
+    let identity = renewal_identity(delegation_id, &request.node_id);
     let serial = crate::peer::now().wrapping_mul(1_000_003);
     let output = Command::new("ssh-keygen")
         .args(["-q", "-s"])
@@ -339,6 +427,27 @@ fn safe_atom(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn delegate(subject: String, roles: &[&str], users: &[&str]) -> AuthorizedSshCa {
+        AuthorizedSshCa {
+            subject,
+            delegation_id: "ssh-ca-1".into(),
+            roles: roles.iter().map(|value| (*value).into()).collect(),
+            unix_users: users.iter().map(|value| (*value).into()).collect(),
+            not_before: 0,
+            not_after: 100,
+        }
+    }
+
+    fn binding() -> RenewalBinding {
+        RenewalBinding {
+            node_id: "node".into(),
+            unix_users: vec!["ajmwagar".into()],
+            roles: vec!["network-admin".into()],
+            credential_ttl: 60,
+            revoked: false,
+        }
+    }
+
     #[test]
     fn renewal_request_proof_detects_tampering() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
@@ -348,5 +457,52 @@ mod tests {
         assert!(request.verify().is_ok());
         request.requested_at += 1;
         assert!(request.verify().is_err());
+    }
+
+    #[test]
+    fn delegated_ca_enforces_constraints_and_binds_identity() {
+        let subject = "aa".repeat(32);
+        let ca = delegate(subject.clone(), &["network-admin"], &[]);
+        assert!(delegated_ca(&[ca.clone()], &subject, &binding()).is_ok());
+
+        let mut wrong_role = binding();
+        wrong_role.roles = vec!["operator".into()];
+        assert!(delegated_ca(&[ca.clone()], &subject, &wrong_role).is_err());
+
+        let mut wrong_user = binding();
+        wrong_user.unix_users = vec!["root".into()];
+        let restricted = delegate(subject.clone(), &[], &["ajmwagar"]);
+        assert!(delegated_ca(&[restricted], &subject, &wrong_user).is_err());
+
+        assert!(delegated_ca(&[ca], &"bb".repeat(32), &binding()).is_err());
+        assert_eq!(
+            renewal_identity(Some("ssh-ca-1"), "node"),
+            "mycelium:renew:ssh-ca-1:node"
+        );
+        assert_eq!(renewal_identity(None, "node"), "mycelium:renew:node");
+    }
+
+    #[test]
+    fn ca_public_key_hex_round_trips_an_ed25519_key() {
+        let key = [7u8; 32];
+        const ALGORITHM: &[u8] = b"ssh-ed25519";
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(ALGORITHM.len() as u32).to_be_bytes());
+        blob.extend_from_slice(ALGORITHM);
+        blob.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&key);
+        use base64::Engine as _;
+        let line = format!(
+            "ssh-ed25519 {} test\n",
+            base64::engine::general_purpose::STANDARD.encode(&blob)
+        );
+        let path = std::env::temp_dir().join(format!(
+            "mycelium-ca-pub-{}-{}.pub",
+            std::process::id(),
+            crate::peer::now()
+        ));
+        fs::write(&path, line).unwrap();
+        assert_eq!(ssh_public_key_hex(&path).unwrap(), encode_hex(&key));
+        let _ = fs::remove_file(path);
     }
 }

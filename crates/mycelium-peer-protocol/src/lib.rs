@@ -887,6 +887,21 @@ pub enum AuthorityCapability {
         #[serde(default)]
         targets: BTreeSet<String>,
     },
+    /// Authorize an Ed25519 key as an OpenSSH user-certificate authority.
+    ///
+    /// The subject key signs user certificates; hosts trust it only while this
+    /// delegation is active and unrevoked. Constraints narrow what a delegate
+    /// may certify. Unlike package constraints, an empty set here does *not*
+    /// mean "all": the resolver requires at least one non-empty constraint so a
+    /// misconfigured delegation cannot silently become a fleet-wide CA.
+    SshUserCa {
+        /// Roles the delegate's certificates may carry.
+        #[serde(default)]
+        roles: BTreeSet<String>,
+        /// Unix users the delegate may certify.
+        #[serde(default)]
+        unix_users: BTreeSet<String>,
+    },
 }
 
 impl AuthorityCapability {
@@ -912,6 +927,27 @@ impl AuthorityCapability {
             }
             _ => false,
         }
+    }
+
+    /// Whether this capability may certify the given role/user pair. At least
+    /// one constraint must be present; an unconstrained SSH CA delegation is
+    /// rejected rather than treated as a wildcard.
+    pub fn permits_ssh_user_ca(&self, role: Option<&str>, unix_user: Option<&str>) -> bool {
+        let Self::SshUserCa { roles, unix_users } = self else {
+            return false;
+        };
+        if roles.is_empty() && unix_users.is_empty() {
+            return false;
+        }
+        let role_ok = match role {
+            Some(role) => roles.is_empty() || roles.contains(role),
+            None => roles.is_empty(),
+        };
+        let user_ok = match unix_user {
+            Some(user) => unix_users.is_empty() || unix_users.contains(user),
+            None => unix_users.is_empty(),
+        };
+        role_ok && user_ok
     }
 }
 
@@ -1568,6 +1604,29 @@ mod tests {
     }
 
     #[test]
+    fn ssh_user_ca_capability_round_trips_and_scopes_principals() {
+        let capability = AuthorityCapability::SshUserCa {
+            roles: BTreeSet::from(["network-admin".into()]),
+            unix_users: BTreeSet::from(["ajmwagar".into()]),
+        };
+        let encoded = serde_json::to_string(&capability).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AuthorityCapability>(&encoded).unwrap(),
+            capability
+        );
+        assert!(encoded.contains("\"ssh_user_ca\""));
+        assert!(capability.permits_ssh_user_ca(Some("network-admin"), Some("ajmwagar")));
+        assert!(!capability.permits_ssh_user_ca(Some("other-role"), Some("ajmwagar")));
+        assert!(!capability.permits_ssh_user_ca(Some("network-admin"), Some("other")));
+        // Unconstrained is refused, not a wildcard.
+        let open = AuthorityCapability::SshUserCa {
+            roles: BTreeSet::new(),
+            unix_users: BTreeSet::new(),
+        };
+        assert!(!open.permits_ssh_user_ca(Some("network-admin"), Some("ajmwagar")));
+    }
+
+    #[test]
     fn authority_signature_covers_capability_constraints() {
         let key = SigningKey::from_bytes(&[17; 32]);
         let mut record = AuthorityRecord::sign(
@@ -1606,9 +1665,20 @@ mod tests {
             "../../../docs/examples/authority-revocation.json"
         ))
         .unwrap();
+        let ssh_ca: AuthorityStatement = serde_json::from_str(include_str!(
+            "../../../docs/examples/authority-ssh-user-ca-delegation.json"
+        ))
+        .unwrap();
         assert!(matches!(access, AuthorityStatement::Delegate { .. }));
         assert!(matches!(package, AuthorityStatement::Delegate { .. }));
         assert!(matches!(revocation, AuthorityStatement::Revoke { .. }));
+        let AuthorityStatement::Delegate { capabilities, .. } = &ssh_ca else {
+            panic!("ssh CA example is not a delegation")
+        };
+        assert!(matches!(
+            capabilities.as_slice(),
+            [AuthorityCapability::SshUserCa { .. }]
+        ));
     }
 
     #[test]

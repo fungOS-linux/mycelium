@@ -1459,7 +1459,18 @@ impl Mesh {
                             if binding_required && !transport_authenticated {
                                 continue;
                             }
-                            if let Some(response) = crate::ssh_renewal::issue(&request, now()) {
+                            let authority_records = self.authority_records().await;
+                            let resolver = crate::authority::AuthorityResolver::new(
+                                &self.authority_roots,
+                                &self.trusted_access_keys,
+                                &self.trusted_release_keys,
+                                authority_records.iter(),
+                                now(),
+                            );
+                            let authorized_cas = resolver.ssh_user_cas();
+                            if let Some(response) =
+                                crate::ssh_renewal::issue(&request, now(), &authorized_cas)
+                            {
                                 send(&mut writer, &PeerMessage::SshRenewalResponse(response)).await?;
                             }
                         }

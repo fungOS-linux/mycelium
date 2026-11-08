@@ -170,6 +170,7 @@ usage:
   mycelium authority explain access.publish|release.publish SIGNER [--json]
   mycelium authority explain package.promote SIGNER --name PACKAGE [--channel CHANNEL] [--target TRIPLE] [--json]
   mycelium access ssh ca-init --path PRIVATE-KEY --write [--json]
+  mycelium access ssh ca-delegation --ca-public PATH --delegation-id ID (--role ROLE | --unix-user USER)... [--not-before TS] [--not-after TS] [--path FILE --write] [--json]
   mycelium access ssh issue --grant ID --public-key PATH --ca PRIVATE-KEY --path CERT --ttl 8h --write [--json]
   mycelium access ssh krl --ca-public PATH --path KRL --write [--json]
   mycelium access ssh host-bundle --ca-public PATH --krl PATH (--allow USER=ROLE... | --from-access --role ROLE...) --path DIR --write [--json]
