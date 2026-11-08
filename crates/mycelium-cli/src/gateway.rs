@@ -441,6 +441,7 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     let material = prepare_certificate(&paths, &options, &routes, &mut actions)?;
 
     if options.dry_run {
+        actions.push(format!("would use gateway listen {listen}"));
         actions.push(format!(
             "would install {} from {}",
             paths.gateway_bin.display(),
@@ -554,10 +555,15 @@ fn ensure_port_available(service: Service, address: SocketAddr) -> Result<(), St
         state["state"].as_str(),
         Some("running") | Some("waiting") | Some("active")
     );
-    if service.installed() && state["loaded"].as_bool() == Some(true) && healthy {
+    let owners = listener_pids(address);
+    // The service must own the listener, not merely be active. Without this a
+    // second gateway on the same port could pass preflight against the first
+    // one's socket and only fail later.
+    let owned = owners.is_empty()
+        || service_pid(service).is_none_or(|pid| owners.iter().all(|owner| *owner == pid));
+    if service.installed() && state["loaded"].as_bool() == Some(true) && healthy && owned {
         return Ok(());
     }
-    let owners = listener_pids(address);
     Err(format!(
         "cannot install {}: {address} is already in use by {}; stop that listener and retry",
         service.path()?.display(),
@@ -574,6 +580,32 @@ fn ensure_port_available(service: Service, address: SocketAddr) -> Result<(), St
             )
         }
     ))
+}
+
+fn service_pid(service: Service) -> Option<u32> {
+    match platform().ok()? {
+        Platform::Macos => launchd_print(service.macos_label())
+            .ok()
+            .flatten()
+            .and_then(|text| {
+                text.lines().find_map(|line| {
+                    line.trim()
+                        .strip_prefix("pid = ")
+                        .and_then(|value| value.trim().parse().ok())
+                })
+            }),
+        Platform::Linux => {
+            let output = Command::new("systemctl")
+                .args(["show", "-p", "MainPID", "--value", service.linux_unit()])
+                .output()
+                .ok()?;
+            let pid = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse()
+                .ok()?;
+            (pid != 0).then_some(pid)
+        }
+    }
 }
 
 fn parse_install(args: &[String]) -> Result<InstallOptions, String> {
