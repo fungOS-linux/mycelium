@@ -437,8 +437,8 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
         &paths.forwarder_bin,
     )?;
     let mut actions = Vec::new();
-    let material = prepare_certificate(&paths, &options, &mut actions)?;
     let routes = prepare_routes(&paths, &options, &mut actions)?;
+    let material = prepare_certificate(&paths, &options, &routes, &mut actions)?;
 
     if options.dry_run {
         actions.push(format!(
@@ -632,6 +632,7 @@ fn parse_install(args: &[String]) -> Result<InstallOptions, String> {
 fn prepare_certificate(
     paths: &Paths,
     options: &InstallOptions,
+    routes: &Path,
     actions: &mut Vec<String>,
 ) -> Result<CertificateMaterial, String> {
     if let (Some(cert), Some(key)) = (&options.cert, &options.key) {
@@ -677,7 +678,7 @@ fn prepare_certificate(
             generated: true,
         });
     }
-    let material = generate_certificate(&paths.dir)?;
+    let material = generate_certificate(&paths.dir, &route_hosts(routes))?;
     actions.push(format!(
         "generated local certificate {}",
         material.cert.display()
@@ -748,7 +749,7 @@ impl CertificateMaterial {
     }
 }
 
-fn generate_certificate(dir: &Path) -> Result<CertificateMaterial, String> {
+fn generate_certificate(dir: &Path, route_hosts: &[String]) -> Result<CertificateMaterial, String> {
     create_private_dir(dir)?;
     let ca_key = KeyPair::generate().map_err(|error| format!("generate CA key: {error}"))?;
     let mut ca_params = CertificateParams::new(Vec::new())
@@ -769,7 +770,7 @@ fn generate_certificate(dir: &Path) -> Result<CertificateMaterial, String> {
         .map_err(|error| format!("sign CA: {error}"))?;
 
     let leaf_key = KeyPair::generate().map_err(|error| format!("generate leaf key: {error}"))?;
-    let mut leaf_params = CertificateParams::new(capability_names())
+    let mut leaf_params = CertificateParams::new(certificate_names(route_hosts))
         .map_err(|error| format!("create leaf parameters: {error}"))?;
     leaf_params.distinguished_name = DistinguishedName::new();
     leaf_params
@@ -801,11 +802,12 @@ fn generate_certificate(dir: &Path) -> Result<CertificateMaterial, String> {
     })
 }
 
-fn capability_names() -> Vec<String> {
+fn certificate_names(route_hosts: &[String]) -> Vec<String> {
     // `*.myc` alone is not accepted by OpenSSL/most browsers because the
-    // wildcard sits in a single-label domain. List the bootstrap names too so
-    // the generated certificate matches them on every TLS implementation.
-    [
+    // wildcard sits in a single-label domain. List the bootstrap names and
+    // every host in the installed route table so the generated certificate
+    // covers what the gateway actually serves.
+    let mut names = [
         "ai.myc",
         "api.myc",
         "mcp.myc",
@@ -817,7 +819,25 @@ fn capability_names() -> Vec<String> {
     ]
     .iter()
     .map(|name| (*name).to_owned())
-    .collect()
+    .collect::<Vec<_>>();
+    names.extend(route_hosts.iter().cloned());
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn route_hosts(path: &Path) -> Vec<String> {
+    let Ok(routes) = read_routes(path) else {
+        return Vec::new();
+    };
+    routes["routes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|route| route["hosts"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 fn find_binary(name: &str, explicit: Option<&Path>, installed: &Path) -> Result<PathBuf, String> {
@@ -1668,7 +1688,7 @@ mod tests {
     #[test]
     fn certificate_generation_writes_a_chain_and_private_key() {
         let dir = temporary_dir("cert");
-        let material = generate_certificate(&dir).unwrap();
+        let material = generate_certificate(&dir, &[]).unwrap();
         assert!(material.generated);
         assert!(material.cert.is_file());
         assert!(material.key.is_file());
@@ -1690,8 +1710,8 @@ mod tests {
 
     #[test]
     fn certificate_names_cover_capability_hosts() {
-        let names = capability_names();
-        for expected in ["ai.myc", "mcp.myc", "home.myc", "webhook.myc"] {
+        let names = certificate_names(&["tools.myc".to_owned()]);
+        for expected in ["ai.myc", "mcp.myc", "home.myc", "webhook.myc", "tools.myc"] {
             assert!(names.contains(&expected.to_owned()));
         }
     }

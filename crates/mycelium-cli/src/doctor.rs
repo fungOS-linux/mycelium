@@ -227,9 +227,9 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
                 .to_owned(),
         );
     }
-    for (name, key, port) in [
-        ("gateway listener", "gateway_listening", 8443),
-        ("https listener", "https_listening", 443),
+    for (name, key, address_key) in [
+        ("gateway listener", "gateway_listening", "listen"),
+        ("https listener", "https_listening", "https_listen"),
     ] {
         let listening = snapshot[key].as_bool().unwrap_or(false);
         add(
@@ -237,7 +237,8 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
             name,
             if listening { "ok" } else { "fail" },
             format!(
-                "127.0.0.1:{port} {}",
+                "{} {}",
+                snapshot[address_key].as_str().unwrap_or("unknown"),
                 if listening { "listening" } else { "down" }
             ),
         );
