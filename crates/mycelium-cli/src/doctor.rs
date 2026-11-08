@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::path::Path;
+use std::time::Duration;
 
 pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     let mut home = myceliumd::home_dir();
@@ -44,7 +45,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         }
     }
     let mut client = match Client::try_connect().await {
-        Ok(mut client) => match client.call(&Request::Hello).await {
+        Ok(mut client) => match daemon_call(&mut client, &Request::Hello).await {
             Ok(hello) => {
                 add(
                     &mut checks,
@@ -81,7 +82,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     };
 
     if let Some(client) = client.as_mut() {
-        match client.call(&Request::Services).await {
+        match daemon_call(client, &Request::Services).await {
             Ok(services) => {
                 let (fresh, total) = service_count(&services);
                 let status = if fresh == 0 { "warn" } else { "ok" };
@@ -313,6 +314,16 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
 
 fn add(checks: &mut Vec<Value>, name: &str, status: &'static str, detail: String) {
     checks.push(json!({"name": name, "status": status, "detail": detail}));
+}
+
+/// Doctor must report a wedged daemon, not hang behind it.
+async fn daemon_call(
+    client: &mut Client,
+    request: &Request,
+) -> Result<Value, myceliumd::client::ClientError> {
+    tokio::time::timeout(Duration::from_secs(5), client.call(request))
+        .await
+        .map_err(|_| myceliumd::client::ClientError::Protocol("daemon call timed out".into()))?
 }
 
 fn service_count(value: &Value) -> (usize, usize) {
