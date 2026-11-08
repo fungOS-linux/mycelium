@@ -834,10 +834,16 @@ signed release for their target:
 ```sh
 mycelium update status --fleet
 mycelium update status --fleet --json
+mycelium update report
+mycelium update report --json
+mycelium update report --fail-on-updates
 ```
 
 Rows include `latest_version` and `needs_update`; unrecorded/local builds are
-reported separately rather than assumed current. `mycelium doctor` makes the
+reported separately rather than assumed current. `update report` adds local
+binary state, summary counts, and an explicit `need update` / `unknown` section;
+`--fail-on-updates` gates automation. The JSON shape also carries a `spores`
+section, currently `supported: false` until the Spore Store lands. `mycelium doctor` makes the
 same comparison locally and adds `codesign`/`spctl` checks on macOS. Release
 selection is semantic-version based and the latest manifest's signature is
 verified before it is offered. See [docs/releases.md](docs/releases.md) for the

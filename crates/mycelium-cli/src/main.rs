@@ -203,6 +203,7 @@ usage:
   mycelium access oidc join --gateway HTTPS-URL --public-key PATH --certificate PATH [--grant ID] [--ttl 8h] --write
     [--provider NAME] [--providers PATH]
   mycelium update status [--channel CHANNEL] [--fleet] [--json]
+  mycelium update report [--channel CHANNEL] [--json] [--fail-on-updates]
   mycelium update apply [--channel CHANNEL] [--path INSTALLED-BINARY] --write
   mycelium update policy status [--json]
   mycelium update policy enable [--channel CHANNEL] [--minimum-age 15m] [--rollout-window 30m] [--retry-backoff 1h] --write
@@ -2104,6 +2105,7 @@ async fn update(args: &[String]) -> Result<Vec<String>, ClientError> {
     }
     let flags = parse_flags(args);
     let action = flags.rest.first().map(String::as_str).unwrap_or("status");
+    let fail_on_updates = args.iter().any(|arg| arg == "--fail-on-updates");
     if action == "apply" {
         let executable = std::env::current_exe().map_err(ClientError::Io)?;
         myceliumd::software_apt::require_native_executable(&executable).map_err(|error| err_usage(&error.to_string()))?;
@@ -2114,6 +2116,19 @@ async fn update(args: &[String]) -> Result<Vec<String>, ClientError> {
     let channel = flags.channel.unwrap_or_else(myceliumd::updates::channel);
     let targets = mycelium_peer_protocol::local_compatible_targets();
     let mut client = connect().await?;
+    if action == "report" {
+        let peers = client.call(&Request::PeerList).await?;
+        let releases = client.call(&Request::ReleaseList).await?;
+        let report = build_update_report(&peers, &releases, &channel, &targets, flags.json);
+        if fail_on_updates && report.update_available > 0 {
+            for line in &report.lines {
+                println!("{line}");
+            }
+            let _ = std::io::stdout().flush();
+            std::process::exit(1);
+        }
+        return Ok(report.lines);
+    }
     if action == "status" && flags.fleet {
         let peers = client.call(&Request::PeerList).await?;
         let releases = client.call(&Request::ReleaseList).await?;
@@ -2577,15 +2592,18 @@ fn xml_update(value: &str) -> String {
 }
 
 
-fn render_fleet_update_status(
+struct UpdateReport {
+    lines: Vec<String>,
+    update_available: usize,
+}
+
+fn fleet_update_rows(
     peers: &serde_json::Value,
-    releases: &serde_json::Value,
+    releases: &[mycelium_peer_protocol::ReleaseManifest],
     channel: &str,
-    json: bool,
-) -> Result<Vec<String>, ClientError> {
-    let releases = myceliumd::updates::parse_releases(releases);
+) -> Vec<serde_json::Value> {
     let local_targets = mycelium_peer_protocol::local_compatible_targets();
-    let rows: Vec<_> = peers
+    peers
         .as_array()
         .into_iter()
         .flatten()
@@ -2597,18 +2615,20 @@ fn render_fleet_update_status(
             let targets = target
                 .map(|target| vec![target.to_owned()])
                 .unwrap_or_else(|| local_targets.clone());
-            let latest = myceliumd::updates::select_release(&releases, channel, &targets);
+            let latest = myceliumd::updates::select_release(releases, channel, &targets);
             let installed = metrics["mycelium_update.release_version"]
                 .as_str()
                 .filter(|value| !value.is_empty());
             let verdict = latest.map(|release| {
                 myceliumd::updates::version_verdict(installed, &release.version)
             });
-            let needs_update = match verdict {
-                Some(myceliumd::updates::VersionVerdict::UpdateAvailable) => Some(true),
-                Some(myceliumd::updates::VersionVerdict::Current)
-                | Some(myceliumd::updates::VersionVerdict::Ahead) => Some(false),
-                _ => None,
+            let (verdict, needs_update) = match verdict {
+                Some(myceliumd::updates::VersionVerdict::Current) => ("current", Some(false)),
+                Some(myceliumd::updates::VersionVerdict::UpdateAvailable) => {
+                    ("update-available", Some(true))
+                }
+                Some(myceliumd::updates::VersionVerdict::Ahead) => ("ahead", Some(false)),
+                Some(myceliumd::updates::VersionVerdict::Unknown) | None => ("unknown", None),
             };
             serde_json::json!({
                 "node_id": peer["hello"]["node_id"],
@@ -2622,21 +2642,34 @@ fn render_fleet_update_status(
                 "release_version": metrics["mycelium_update.release_version"],
                 "release_target": metrics["mycelium_update.release_target"],
                 "latest_version": latest.map(|release| release.version.clone()),
+                "latest_target": latest.map(|release| release.target.clone()),
+                "verdict": verdict,
                 "needs_update": needs_update,
                 "activation_state": metrics["mycelium_update.activation_state"],
                 "last_error": metrics["mycelium_update.last_error"],
             })
         })
-        .collect();
+        .collect()
+}
+
+fn render_fleet_update_status(
+    peers: &serde_json::Value,
+    releases: &serde_json::Value,
+    channel: &str,
+    json: bool,
+) -> Result<Vec<String>, ClientError> {
+    let releases = myceliumd::updates::parse_releases(releases);
+    let rows = fleet_update_rows(peers, &releases, channel);
     if json {
         return Ok(vec![serde_json::Value::Array(rows).to_string()]);
     }
     let mut lines = vec![format!("fleet update status (channel={channel}):")];
     for row in rows {
-        let update = match row["needs_update"].as_bool() {
-            Some(true) => "available",
-            Some(false) => "current",
-            None => "unknown",
+        let update = match row["verdict"].as_str() {
+            Some("update-available") => "available",
+            Some("current") => "current",
+            Some("ahead") => "ahead",
+            _ => "unknown",
         };
         lines.push(format!(
             "  {} daemon={} installed={} latest={} update={} state={} staged={} staged_state={} digest={} error={}",
@@ -2653,6 +2686,124 @@ fn render_fleet_update_status(
         ));
     }
     Ok(lines)
+}
+
+fn build_update_report(
+    peers: &serde_json::Value,
+    releases_value: &serde_json::Value,
+    channel: &str,
+    targets: &[String],
+    json: bool,
+) -> UpdateReport {
+    let releases = myceliumd::updates::parse_releases(releases_value);
+    let rows = fleet_update_rows(peers, &releases, channel);
+    let count = |verdict: &str| {
+        rows.iter()
+            .filter(|row| row["verdict"] == verdict)
+            .count()
+    };
+    let current = count("current");
+    let update_available = count("update-available");
+    let ahead = count("ahead");
+    let unknown = count("unknown");
+    let total = rows.len();
+
+    let running = myceliumd::updates::running_release(&releases);
+    let latest = myceliumd::updates::select_release(&releases, channel, targets);
+    let local_verdict = match latest {
+        Some(latest) if running.digest_matches => {
+            match myceliumd::updates::version_verdict(
+                running.version.as_deref(),
+                &latest.version,
+            ) {
+                myceliumd::updates::VersionVerdict::Current => "current",
+                myceliumd::updates::VersionVerdict::UpdateAvailable => "update-available",
+                myceliumd::updates::VersionVerdict::Ahead => "ahead",
+                myceliumd::updates::VersionVerdict::Unknown => "unknown",
+            }
+        }
+        Some(_) => "unverified",
+        None => "unknown",
+    };
+    let local_needs_update = local_verdict == "update-available";
+    let local = serde_json::json!({
+        "version": running.version,
+        "source": running.source,
+        "digest": running.digest,
+        "digest_matches": running.digest_matches,
+        "latest_version": latest.map(|release| release.version.clone()),
+        "latest_target": latest.map(|release| release.target.clone()),
+        "verdict": local_verdict,
+    });
+    let spores = serde_json::json!({
+        "supported": false,
+        "reason": "Spore Store is not implemented; see mycelium-6sm2"
+    });
+    if json {
+        return UpdateReport {
+            lines: vec![serde_json::json!({
+                "channel": channel,
+                "local": local,
+                "summary": {
+                    "total": total,
+                    "current": current,
+                    "update_available": update_available,
+                    "ahead": ahead,
+                    "unknown": unknown,
+                },
+                "hosts": rows,
+                "spores": spores,
+            })
+            .to_string()],
+            update_available: update_available + usize::from(local_needs_update),
+        };
+    }
+
+    let local_version = local["version"].as_str().unwrap_or("unrecorded");
+    let local_source = local["source"].as_str().unwrap_or("unrecorded");
+    let local_latest = local["latest_version"].as_str().unwrap_or("unknown");
+    let local_target = local["latest_target"].as_str().unwrap_or("unknown");
+    let mut lines = vec![format!("update report (channel={channel}):")];
+    lines.push(format!(
+        "  local: {local_version} ({local_source}), latest={local_latest} target={local_target} verdict={local_verdict}"
+    ));
+    lines.push(format!(
+        "  hosts: {total} total, {current} current, {update_available} need update, {ahead} ahead, {unknown} unknown"
+    ));
+    let needed = rows
+        .iter()
+        .filter(|row| row["verdict"] == "update-available")
+        .collect::<Vec<_>>();
+    if needed.is_empty() {
+        lines.push("  need update: none".into());
+    } else {
+        lines.push("  need update:".into());
+        for row in needed {
+            lines.push(format!(
+                "    {} {} -> {}",
+                row["hostname"].as_str().unwrap_or("?"),
+                row["release_version"].as_str().unwrap_or("unrecorded"),
+                row["latest_version"].as_str().unwrap_or("unknown"),
+            ));
+        }
+    }
+    if unknown > 0 {
+        lines.push("  unknown:".into());
+        for row in rows.iter().filter(|row| row["verdict"] == "unknown") {
+            lines.push(format!(
+                "    {} (release unrecorded)",
+                row["hostname"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    lines.push(format!(
+        "  spores: no catalog ({})",
+        spores["reason"].as_str().unwrap_or("unavailable")
+    ));
+    UpdateReport {
+        lines,
+        update_available: update_available + usize::from(local_needs_update),
+    }
 }
 
 async fn activate_update(
@@ -5308,5 +5459,41 @@ mod ssh_command_tests {
             argv.last().map(String::as_str),
             Some("fpladmin@192.168.1.48:/tmp/agent")
         );
+    }
+
+    #[test]
+    fn fleet_rows_flag_outdated_and_unrecorded_hosts() {
+        let releases = serde_json::json!([{
+            "version": "0.2.4",
+            "channel": "canary",
+            "target": "x86_64-unknown-linux-gnu",
+            "protocol_version": 1,
+            "artifact_digest": "00".repeat(32),
+            "artifact_size": 1,
+            "signer": "11".repeat(32),
+            "signature": "22".repeat(64)
+        }]);
+        let parsed = myceliumd::updates::parse_releases(&releases);
+        let peers = serde_json::json!([
+            {
+                "hello": {"hostname": "edge", "node_id": "a", "daemon_version": "0.1.0"},
+                "health": {"platform_metrics": {
+                    "mycelium_update.release_version": "0.2.0",
+                    "mycelium_update.release_target": "x86_64-unknown-linux-gnu"
+                }}
+            },
+            {
+                "hello": {"hostname": "fresh", "node_id": "b", "daemon_version": "0.1.0"},
+                "health": {"platform_metrics": {
+                    "mycelium_update.release_version": "",
+                    "mycelium_update.release_target": "x86_64-unknown-linux-gnu"
+                }}
+            }
+        ]);
+        let rows = fleet_update_rows(&peers, &parsed, "canary");
+        assert_eq!(rows[0]["verdict"], "update-available");
+        assert_eq!(rows[0]["needs_update"], true);
+        assert_eq!(rows[1]["verdict"], "unknown");
+        assert_eq!(rows[1]["needs_update"], serde_json::Value::Null);
     }
 }

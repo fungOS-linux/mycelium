@@ -69,6 +69,60 @@ pub fn version_verdict(installed: Option<&str>, latest: &str) -> VersionVerdict 
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RunningRelease {
+    pub version: Option<String>,
+    pub source: &'static str,
+    pub digest: Option<String>,
+    pub digest_matches: bool,
+}
+
+/// Identify the running binary against admitted releases and the recorded
+/// update state. A version is only trusted when its digest matches the bytes
+/// actually executing.
+pub fn running_release(releases: &[ReleaseManifest]) -> RunningRelease {
+    let Ok(executable) = std::env::current_exe() else {
+        return RunningRelease {
+            version: None,
+            source: "unrecorded",
+            digest: None,
+            digest_matches: false,
+        };
+    };
+    let Ok(bytes) = std::fs::read(&executable) else {
+        return RunningRelease {
+            version: None,
+            source: "unrecorded",
+            digest: None,
+            digest_matches: false,
+        };
+    };
+    let digest = mycelium_peer_protocol::sha256_hex(&bytes);
+    if let Some(release) = releases
+        .iter()
+        .find(|release| release.artifact_digest == digest)
+    {
+        return RunningRelease {
+            version: Some(release.version.clone()),
+            source: "binary digest",
+            digest: Some(digest),
+            digest_matches: true,
+        };
+    }
+    let state = crate::read_update_state();
+    let (version, source, matches) = match (state.release_version, state.release_digest) {
+        (Some(version), Some(recorded)) if recorded == digest => (Some(version), "update state", true),
+        (Some(version), _) => (Some(version), "update state", false),
+        _ => (None, "unrecorded", false),
+    };
+    RunningRelease {
+        version,
+        source,
+        digest: Some(digest),
+        digest_matches: matches,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

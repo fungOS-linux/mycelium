@@ -3,7 +3,6 @@
 //! Doctor deliberately reports local facts rather than starting the daemon or
 //! changing the host. `--fix` is the only mutating mode and delegates to the
 //! gateway lifecycle module.
-use mycelium_peer_protocol::ReleaseManifest;
 use myceliumd::{client::Client, protocol::Request};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -367,7 +366,9 @@ async fn update_check(checks: &mut Vec<Value>, client: &mut Client) {
         return;
     }
 
-    let (installed, source, digest_matches) = installed_release(&releases);
+    let running = myceliumd::updates::running_release(&releases);
+    let (installed, source, digest_matches) =
+        (running.version, running.source, running.digest_matches);
     let (status, detail) = if !digest_matches {
         match installed.as_deref() {
             Some(version) => (
@@ -421,31 +422,6 @@ async fn update_check(checks: &mut Vec<Value>, client: &mut Client) {
         }
     };
     add(checks, "mycelium version", status, detail);
-}
-
-fn installed_release(releases: &[ReleaseManifest]) -> (Option<String>, &'static str, bool) {
-    let Ok(executable) = std::env::current_exe() else {
-        return (None, "unrecorded", false);
-    };
-    let Ok(bytes) = std::fs::read(&executable) else {
-        return (None, "unrecorded", false);
-    };
-    let digest = mycelium_peer_protocol::sha256_hex(&bytes);
-    if let Some(release) = releases
-        .iter()
-        .find(|release| release.artifact_digest == digest)
-    {
-        return (Some(release.version.clone()), "binary digest", true);
-    }
-    let state = myceliumd::read_update_state();
-    match (state.release_version, state.release_digest) {
-        (Some(version), Some(recorded)) if recorded == digest => {
-            (Some(version), "update state", true)
-        }
-        (Some(version), Some(_)) => (Some(version), "update state", false),
-        (Some(version), None) => (Some(version), "update state", false),
-        _ => (None, "unrecorded", false),
-    }
 }
 
 fn signature_checks(checks: &mut Vec<Value>) {
