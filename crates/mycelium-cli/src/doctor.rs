@@ -368,46 +368,57 @@ async fn update_check(checks: &mut Vec<Value>, client: &mut Client) {
     }
 
     let (installed, source, digest_matches) = installed_release(&releases);
-    let verdict = myceliumd::updates::version_verdict(installed.as_deref(), &latest.version);
-    let (status, detail) = match verdict {
-        myceliumd::updates::VersionVerdict::Current if digest_matches => (
-            "ok",
-            format!(
-                "installed {} is the latest {channel} release for {}",
-                latest.version, latest.target
+    let (status, detail) = if !digest_matches {
+        match installed.as_deref() {
+            Some(version) => (
+                "warn",
+                format!(
+                    "update state records {version} ({source}), but the running binary does not match its digest; latest {channel} is {}",
+                    latest.version
+                ),
             ),
-        ),
-        myceliumd::updates::VersionVerdict::Current => (
-            "warn",
-            format!(
-                "update state records {}, but the running binary does not match its digest; latest {channel} is {}",
-                installed.as_deref().unwrap_or("unknown"),
-                latest.version
+            None => (
+                "warn",
+                format!(
+                    "installed release is unrecorded (local build?); latest {channel} is {} for {} (run `mycelium update apply --write` to adopt it)",
+                    latest.version, latest.target
+                ),
             ),
-        ),
-        myceliumd::updates::VersionVerdict::UpdateAvailable => (
-            "warn",
-            format!(
-                "update available: installed {} is older than {} on {channel}; run `mycelium update apply --write`",
-                installed.as_deref().unwrap_or("unrecorded"),
-                latest.version
+        }
+    } else {
+        match myceliumd::updates::version_verdict(installed.as_deref(), &latest.version) {
+            myceliumd::updates::VersionVerdict::Current => (
+                "ok",
+                format!(
+                    "installed {} is the latest {channel} release for {}",
+                    latest.version, latest.target
+                ),
             ),
-        ),
-        myceliumd::updates::VersionVerdict::Ahead => (
-            "ok",
-            format!(
-                "installed {} is ahead of the latest {channel} release {}",
-                installed.as_deref().unwrap_or("unknown"),
-                latest.version
+            myceliumd::updates::VersionVerdict::UpdateAvailable => (
+                "warn",
+                format!(
+                    "update available: installed {} is older than {} on {channel}; run `mycelium update apply --write`",
+                    installed.as_deref().unwrap_or("unrecorded"),
+                    latest.version
+                ),
             ),
-        ),
-        myceliumd::updates::VersionVerdict::Unknown => (
-            "warn",
-            format!(
-                "installed release {source}; latest {channel} is {} for {} (run `mycelium update apply --write` to adopt it)",
-                latest.version, latest.target
+            myceliumd::updates::VersionVerdict::Ahead => (
+                "ok",
+                format!(
+                    "installed {} is ahead of the latest {channel} release {}",
+                    installed.as_deref().unwrap_or("unknown"),
+                    latest.version
+                ),
             ),
-        ),
+            myceliumd::updates::VersionVerdict::Unknown => (
+                "warn",
+                format!(
+                    "recorded release {} could not be compared with latest {channel} {}",
+                    installed.as_deref().unwrap_or("unknown"),
+                    latest.version
+                ),
+            ),
+        }
     };
     add(checks, "mycelium version", status, detail);
 }
