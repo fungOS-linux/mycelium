@@ -191,13 +191,12 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
 }
 
 fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
-    if !cfg!(target_os = "macos") {
+    if crate::gateway::supported_platform().is_err() {
         add(
             checks,
             "local gateway",
             "warn",
-            "gateway lifecycle is macOS-only for now; run mycelium-gateway manually on this platform"
-                .into(),
+            "gateway lifecycle supports macOS and Linux only".into(),
         );
         return;
     }

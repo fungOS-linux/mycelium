@@ -73,10 +73,12 @@ mycelium gateway install --write --trust-cert
 mycelium doctor
 ```
 
-`mycelium doctor` checks the daemon, `.myc` resolution, both LaunchAgents, the
-gateway listeners, certificate trust, and HTTPS health. It exits non-zero when
-a check fails, so it can gate automation. `--json` is available for scripts;
-`--fix --trust-cert` repairs the local gateway installation.
+`mycelium doctor` checks the daemon, `.myc` resolution, the gateway services,
+the gateway listeners, certificate trust, and HTTPS health. It exits non-zero
+when a check fails, so it can gate automation. `--json` is available for
+scripts; `--fix --trust-cert` repairs the local gateway installation. The
+lifecycle supports macOS LaunchAgents and Linux systemd units; on Linux the
+installer needs passwordless sudo.
 
 ### Shell completion
 

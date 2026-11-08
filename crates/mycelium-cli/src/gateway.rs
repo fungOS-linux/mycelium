@@ -17,15 +17,17 @@ use std::{
     time::Duration,
 };
 
+const DEFAULT_GATEWAY_LISTEN: &str = "127.0.0.1:8443";
+const HTTPS_ADDR: &str = "127.0.0.1:443";
+const HTTPS_PORT: u16 = 443;
 const GATEWAY_LABEL: &str = "dev.fpl.mycelium-gateway";
 const HTTPS_LABEL: &str = "dev.fpl.mycelium-https";
-const GATEWAY_PORT: u16 = 8443;
-const HTTPS_PORT: u16 = 443;
-const GATEWAY_ADDR: &str = "127.0.0.1:8443";
-const HTTPS_ADDR: &str = "127.0.0.1:443";
+const GATEWAY_UNIT: &str = "mycelium-gateway.service";
+const HTTPS_SOCKET_UNIT: &str = "mycelium-https.socket";
+const HTTPS_SERVICE_UNIT: &str = "mycelium-https.service";
 
 const USAGE: &str = "mycelium gateway status [--json] [--path MYCELIUM-HOME]\n\
-mycelium gateway install [--write|--dry-run] [--trust-cert] [--routes PATH] [--cert PATH --key PATH] [--gateway-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]\n\
+mycelium gateway install [--write|--dry-run] [--trust-cert] [--listen ADDR] [--routes PATH] [--cert PATH --key PATH] [--gateway-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]\n\
 mycelium gateway uninstall [--write|--dry-run] [--path MYCELIUM-HOME]";
 
 #[derive(Clone, Debug)]
@@ -38,6 +40,7 @@ pub struct Paths {
     pub ca: PathBuf,
     pub gateway_bin: PathBuf,
     pub forwarder_bin: PathBuf,
+    pub listen: SocketAddr,
 }
 
 impl Paths {
@@ -63,8 +66,128 @@ impl Paths {
             ca: home.join("gateway/ca.pem"),
             gateway_bin: home.join("bin/mycelium-gateway"),
             forwarder_bin: home.join("bin/mycelium-https-forwarder"),
+            listen: installed_listen().unwrap_or_else(default_listen),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    Macos,
+    Linux,
+}
+
+fn platform() -> Result<Platform, String> {
+    if cfg!(target_os = "macos") {
+        Ok(Platform::Macos)
+    } else if cfg!(target_os = "linux") {
+        Ok(Platform::Linux)
+    } else {
+        Err("the local gateway supports macOS launchd and Linux systemd only".into())
+    }
+}
+
+pub fn supported_platform() -> Result<(), String> {
+    platform().map(|_| ())
+}
+
+fn default_listen() -> SocketAddr {
+    DEFAULT_GATEWAY_LISTEN
+        .parse()
+        .expect("default gateway listen address is valid")
+}
+
+fn https_listen() -> SocketAddr {
+    HTTPS_ADDR.parse().expect("https listen address is valid")
+}
+
+fn listen_addr(value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| format!("listen address must be IP:PORT, got `{value}`"))?;
+    if !address.ip().is_loopback() {
+        return Err(format!("gateway must listen on loopback, got {address}"));
+    }
+    if address.port() == 0 || address.port() == HTTPS_PORT {
+        return Err(format!(
+            "gateway must not bind port {HTTPS_PORT}; the privileged socket belongs to the forwarder"
+        ));
+    }
+    Ok(address)
+}
+
+/// The installed service definition is the single source of truth for the
+/// gateway address, so reinstall/status keep using a custom `--listen`.
+fn installed_listen() -> Option<SocketAddr> {
+    let path = match platform() {
+        Ok(Platform::Macos) => launch_agent_path(GATEWAY_LABEL).ok()?,
+        Ok(Platform::Linux) => systemd_unit_path(GATEWAY_UNIT),
+        Err(_) => return None,
+    };
+    parse_listen(&fs::read_to_string(path).ok()?)
+}
+
+fn parse_listen(text: &str) -> Option<SocketAddr> {
+    let raw = if cfg!(target_os = "macos") {
+        let marker = "<string>--listen</string><string>";
+        text.split_once(marker)?.1.split_once("</string>")?.0
+    } else {
+        let mut value = None;
+        for line in text.lines() {
+            let Some(rest) = line.trim().strip_prefix("ExecStart=") else {
+                continue;
+            };
+            let mut parts = rest.split_whitespace();
+            while let Some(part) = parts.next() {
+                if part == "--listen" {
+                    value = parts.next();
+                    break;
+                }
+            }
+            if value.is_some() {
+                break;
+            }
+        }
+        value?
+    };
+    listen_addr(raw).ok()
+}
+
+#[derive(Clone, Copy)]
+enum Service {
+    Gateway,
+    HttpsSocket,
+}
+
+impl Service {
+    fn macos_label(self) -> &'static str {
+        match self {
+            Self::Gateway => GATEWAY_LABEL,
+            Self::HttpsSocket => HTTPS_LABEL,
+        }
+    }
+
+    fn linux_unit(self) -> &'static str {
+        match self {
+            Self::Gateway => GATEWAY_UNIT,
+            Self::HttpsSocket => HTTPS_SOCKET_UNIT,
+        }
+    }
+
+    fn path(self) -> Result<PathBuf, String> {
+        match platform()? {
+            Platform::Macos => launch_agent_path(self.macos_label()),
+            Platform::Linux => Ok(systemd_unit_path(self.linux_unit())),
+        }
+    }
+
+    fn installed(self) -> bool {
+        self.path().is_ok_and(|path| path.is_file())
+    }
+}
+
+fn systemd_unit_path(name: &str) -> PathBuf {
+    Path::new("/etc/systemd/system").join(name)
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +198,7 @@ struct InstallOptions {
     key: Option<PathBuf>,
     gateway_bin: Option<PathBuf>,
     forwarder_bin: Option<PathBuf>,
+    listen: Option<SocketAddr>,
     trust: bool,
     write: bool,
     dry_run: bool,
@@ -89,6 +213,7 @@ impl InstallOptions {
             key: None,
             gateway_bin: None,
             forwarder_bin: None,
+            listen: None,
             trust: false,
             write: false,
             dry_run: false,
@@ -175,7 +300,7 @@ fn render_status(value: &Value) -> Vec<String> {
     lines.push(format!(
         "  gateway listener: {}",
         if value["gateway_listening"].as_bool().unwrap_or(false) {
-            GATEWAY_ADDR
+            value["listen"].as_str().unwrap_or("unknown")
         } else {
             "down"
         }
@@ -183,7 +308,7 @@ fn render_status(value: &Value) -> Vec<String> {
     lines.push(format!(
         "  https listener: {}",
         if value["https_listening"].as_bool().unwrap_or(false) {
-            HTTPS_ADDR
+            value["https_listen"].as_str().unwrap_or(HTTPS_ADDR)
         } else {
             "down"
         }
@@ -231,20 +356,17 @@ fn render_status(value: &Value) -> Vec<String> {
 
 pub async fn snapshot(home: &Path) -> Value {
     let paths = Paths::discover(home);
-    let gateway_plist = launch_agent_path(GATEWAY_LABEL);
-    let https_plist = launch_agent_path(HTTPS_LABEL);
-    let installed = gateway_plist.as_ref().is_ok_and(|path| path.is_file())
-        && https_plist.as_ref().is_ok_and(|path| path.is_file());
-    let gateway_listening = tcp_probe(GATEWAY_PORT);
-    let https_listening = tcp_probe(HTTPS_PORT);
+    let installed = Service::Gateway.installed() && Service::HttpsSocket.installed();
+    let gateway_listening = tcp_probe(paths.listen);
+    let https_listening = tcp_probe(https_listen());
     let certificate_trusted = paths.cert.is_file() && certificate_trusted(&paths.cert);
     let health = if gateway_listening {
-        probe(GATEWAY_PORT).await.ok()
+        probe(paths.listen).await.ok()
     } else {
         None
     };
     let tls = if gateway_listening {
-        Some(tls_chain_verified(&paths, GATEWAY_PORT))
+        Some(tls_chain_verified(&paths, paths.listen))
     } else {
         None
     };
@@ -255,10 +377,12 @@ pub async fn snapshot(home: &Path) -> Value {
     };
     json!({
         "installed": installed,
-        "gateway_agent": launchd_state(GATEWAY_LABEL),
-        "https_agent": launchd_state(HTTPS_LABEL),
+        "gateway_agent": service_state(Service::Gateway),
+        "https_agent": service_state(Service::HttpsSocket),
         "gateway_listening": gateway_listening,
         "https_listening": https_listening,
+        "listen": paths.listen.to_string(),
+        "https_listen": HTTPS_ADDR,
         "certificate": paths.cert.display().to_string(),
         "certificate_trusted": certificate_trusted,
         "routes": paths.routes.display().to_string(),
@@ -293,15 +417,14 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     if !options.write && !options.dry_run {
         return Err("gateway install requires --write or --dry-run".into());
     }
-    if !cfg!(target_os = "macos") && !options.dry_run {
-        return Err("local HTTPS gateway installation currently supports macOS LaunchAgents; Linux socket units are a follow-up".into());
-    }
     if options.cert.is_some() != options.key.is_some() {
         return Err("--cert and --key must be provided together".into());
     }
 
+    platform()?;
     let paths = Paths::discover(&options.home);
-    preflight()?;
+    let listen = options.listen.unwrap_or(paths.listen);
+    preflight(listen)?;
     let gateway_source = find_binary(
         "mycelium-gateway",
         options.gateway_bin.as_deref(),
@@ -328,19 +451,21 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
             forwarder_source.display()
         ));
         actions.push(format!(
-            "would write {}/{}.plist",
-            launch_agent_dir().display(),
-            GATEWAY_LABEL
-        ));
-        actions.push(format!(
-            "would write {}/{}.plist",
-            launch_agent_dir().display(),
-            HTTPS_LABEL
+            "would write {}",
+            service_paths()?
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         if options.trust {
             actions.push(format!(
-                "would trust {} for the login keychain",
-                material.trust_anchor().display()
+                "would trust {} in the {} trust store",
+                material.trust_anchor().display(),
+                match platform()? {
+                    Platform::Macos => "login keychain",
+                    Platform::Linux => "system CA",
+                }
             ));
         }
         return Ok(actions);
@@ -349,11 +474,8 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     create_private_dir(&paths.dir)?;
     let gateway_bin = install_binary(&gateway_source, &paths.gateway_bin)?;
     let forwarder_bin = install_binary(&forwarder_source, &paths.forwarder_bin)?;
-    let gateway_plist = write_named_plist(
-        GATEWAY_LABEL,
-        &render_gateway_plist(&paths, &gateway_bin, &routes, &material),
-    )?;
-    let https_plist = write_named_plist(HTTPS_LABEL, &render_https_plist(&paths, &forwarder_bin))?;
+    install_gateway_service(&paths, listen, &gateway_bin, &routes, &material)?;
+    install_https_services(&paths, listen, &forwarder_bin)?;
     if options.trust {
         trust_certificate(material.trust_anchor())?;
         if !certificate_trusted(&material.cert) {
@@ -364,9 +486,8 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
         }
     }
 
-    bootstrap(GATEWAY_LABEL, &gateway_plist)?;
-    bootstrap(HTTPS_LABEL, &https_plist)?;
-    wait_for_listener(GATEWAY_PORT)?;
+    start_services()?;
+    wait_for_listener(listen)?;
     let health = wait_for_https(HTTPS_PORT).await?;
     if health["status"].as_u64() != Some(200) {
         return Err(format!(
@@ -374,7 +495,7 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
             health["status"]
         ));
     }
-    tls_chain_verified(&paths, HTTPS_PORT).map_err(|error| {
+    tls_chain_verified(&paths, https_listen()).map_err(|error| {
         format!("installed the gateway, but the :{HTTPS_PORT} TLS check failed: {error}")
     })?;
 
@@ -384,6 +505,7 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     )];
     lines.push(format!("  gateway: {}", gateway_bin.display()));
     lines.push(format!("  forwarder: {}", forwarder_bin.display()));
+    lines.push(format!("  listen: {listen}"));
     lines.push(format!("  routes: {}", routes.display()));
     lines.push(format!("  certificate: {}", material.cert.display()));
     if material.generated {
@@ -407,7 +529,7 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     Ok(lines)
 }
 
-fn preflight() -> Result<(), String> {
+fn preflight(listen: SocketAddr) -> Result<(), String> {
     if let Some(path) = system_daemon_path() {
         return Err(format!(
             "{} also claims 127.0.0.1:{HTTPS_PORT} for the system launchd domain; remove it before installing the user agent: sudo launchctl bootout system/{HTTPS_LABEL} && sudo rm {}",
@@ -415,26 +537,29 @@ fn preflight() -> Result<(), String> {
             path.display()
         ));
     }
-    ensure_port_available(GATEWAY_LABEL, GATEWAY_PORT)?;
-    ensure_port_available(HTTPS_LABEL, HTTPS_PORT)
+    ensure_port_available(Service::Gateway, listen)?;
+    ensure_port_available(Service::HttpsSocket, https_listen())
 }
 
-/// Refuse to start when a listener already owns the port and is not the
-/// Mycelium job we are about to replace. A socket-activated job counts as ours
-/// while launchd reports it as `waiting` or `running` and its plist is present.
-fn ensure_port_available(label: &str, port: u16) -> Result<(), String> {
-    if !tcp_probe(port) {
+/// Refuse to start when a listener is not the service we are about to replace.
+/// A socket-activated service counts as ours while its manager reports it
+/// healthy and its unit/plist is present.
+fn ensure_port_available(service: Service, address: SocketAddr) -> Result<(), String> {
+    if !tcp_probe(address) {
         return Ok(());
     }
-    let plist_present = launch_agent_path(label).is_ok_and(|path| path.is_file());
-    let state = launchd_state(label);
-    let healthy = matches!(state["state"].as_str(), Some("running") | Some("waiting"));
-    if plist_present && state["loaded"].as_bool() == Some(true) && healthy {
+    let state = service_state(service);
+    let healthy = matches!(
+        state["state"].as_str(),
+        Some("running") | Some("waiting") | Some("active")
+    );
+    if service.installed() && state["loaded"].as_bool() == Some(true) && healthy {
         return Ok(());
     }
-    let owners = listener_pids(port);
+    let owners = listener_pids(address);
     Err(format!(
-        "cannot install {label}: 127.0.0.1:{port} is already in use by {}; stop that listener and retry",
+        "cannot install {}: {address} is already in use by {}; stop that listener and retry",
+        service.path()?.display(),
         if owners.is_empty() {
             "another process".to_owned()
         } else {
@@ -450,21 +575,6 @@ fn ensure_port_available(label: &str, port: u16) -> Result<(), String> {
     ))
 }
 
-fn listener_pids(port: u16) -> Vec<u32> {
-    let Ok(output) = Command::new("lsof")
-        .arg("-nP")
-        .arg(format!("-iTCP:{port}"))
-        .args(["-sTCP:LISTEN", "-t"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect()
-}
-
 fn parse_install(args: &[String]) -> Result<InstallOptions, String> {
     let mut options = InstallOptions::new();
     let mut index = 0;
@@ -473,6 +583,12 @@ fn parse_install(args: &[String]) -> Result<InstallOptions, String> {
             "--write" => options.write = true,
             "--dry-run" => options.dry_run = true,
             "--trust-cert" => options.trust = true,
+            "--listen" => {
+                index += 1;
+                options.listen = Some(listen_addr(
+                    args.get(index).ok_or("--listen requires IP:PORT")?,
+                )?);
+            }
             "--path" => {
                 index += 1;
                 options.home = expand_home(args.get(index).ok_or("--path requires a directory")?);
@@ -755,12 +871,13 @@ fn render_gateway_plist(
     gateway_bin: &Path,
     routes: &Path,
     material: &CertificateMaterial,
+    listen: SocketAddr,
 ) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{gateway}</string><string>--listen</string><string>{listen}</string><string>--routes</string><string>{routes}</string><string>--reload-secs</string><string>1</string><string>--tls-cert</string><string>{cert}</string><string>--tls-key</string><string>{key}</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n",
         label = xml(GATEWAY_LABEL),
         gateway = xml(&gateway_bin.display().to_string()),
-        listen = GATEWAY_ADDR,
+        listen = listen,
         routes = xml(&routes.display().to_string()),
         cert = xml(&material.cert.display().to_string()),
         key = xml(&material.key.display().to_string()),
@@ -768,15 +885,155 @@ fn render_gateway_plist(
     )
 }
 
-fn render_https_plist(paths: &Paths, forwarder_bin: &Path) -> String {
+fn render_https_plist(paths: &Paths, forwarder_bin: &Path, listen: SocketAddr) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{forwarder}</string><string>--target</string><string>{listen}</string></array>\n<key>RunAtLoad</key><true/><key>ThrottleInterval</key><integer>5</integer>\n<key>StandardErrorPath</key><string>{log}</string>\n<key>Sockets</key><dict><key>HTTPS</key><dict><key>SockNodeName</key><string>127.0.0.1</string><key>SockServiceName</key><integer>{port}</integer><key>SockFamily</key><string>IPv4</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict></dict>\n</dict></plist>\n",
         label = xml(HTTPS_LABEL),
         forwarder = xml(&forwarder_bin.display().to_string()),
-        listen = GATEWAY_ADDR,
+        listen = listen,
         log = xml(&paths.dir.join("https-forwarder.log").display().to_string()),
         port = HTTPS_PORT,
     )
+}
+
+fn render_gateway_unit(
+    listen: SocketAddr,
+    gateway_bin: &Path,
+    routes: &Path,
+    material: &CertificateMaterial,
+) -> Result<String, String> {
+    let user = current_user()?;
+    let group = current_group()?;
+    Ok(format!(
+        "[Unit]\nDescription=Mycelium local .myc HTTPS gateway\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={user}\nGroup={group}\nEnvironment={home}\nExecStart={gateway} --listen {listen} --routes {routes} --reload-secs 1 --tls-cert {cert} --tls-key {key}\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n",
+        home = systemd_quote(&format!(
+            "HOME={}",
+            user_home()?.display()
+        )),
+        gateway = systemd_quote(&gateway_bin.display().to_string()),
+        routes = systemd_quote(&routes.display().to_string()),
+        cert = systemd_quote(&material.cert.display().to_string()),
+        key = systemd_quote(&material.key.display().to_string()),
+    ))
+}
+
+fn render_https_socket_unit() -> String {
+    format!(
+        "[Unit]\nDescription=Mycelium .myc HTTPS socket\n\n[Socket]\nListenStream={HTTPS_ADDR}\nAccept=no\nService={HTTPS_SERVICE_UNIT}\n\n[Install]\nWantedBy=sockets.target\n"
+    )
+}
+
+fn render_https_service_unit(listen: SocketAddr, forwarder_bin: &Path) -> Result<String, String> {
+    let user = current_user()?;
+    let group = current_group()?;
+    Ok(format!(
+        "[Unit]\nDescription=Mycelium .myc HTTPS forwarder\nRequires={HTTPS_SOCKET_UNIT}\nAfter={GATEWAY_UNIT}\n\n[Service]\nUser={user}\nGroup={group}\nExecStart={forwarder} --target {listen}\nNoNewPrivileges=true\nPrivateTmp=true\n",
+        forwarder = systemd_quote(&forwarder_bin.display().to_string()),
+    ))
+}
+
+fn systemd_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn current_user() -> Result<String, String> {
+    id_field("-un")
+}
+
+fn current_group() -> Result<String, String> {
+    id_field("-gn")
+}
+
+fn id_field(flag: &str) -> Result<String, String> {
+    let output = Command::new("id")
+        .arg(flag)
+        .output()
+        .map_err(|error| format!("run id {flag}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("id {flag} failed"));
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(format!("id {flag} returned an unusable name"));
+    }
+    Ok(value)
+}
+
+fn service_paths() -> Result<Vec<PathBuf>, String> {
+    Ok(match platform()? {
+        Platform::Macos => vec![
+            launch_agent_path(GATEWAY_LABEL)?,
+            launch_agent_path(HTTPS_LABEL)?,
+        ],
+        Platform::Linux => vec![
+            systemd_unit_path(GATEWAY_UNIT),
+            systemd_unit_path(HTTPS_SOCKET_UNIT),
+            systemd_unit_path(HTTPS_SERVICE_UNIT),
+        ],
+    })
+}
+
+fn install_gateway_service(
+    paths: &Paths,
+    listen: SocketAddr,
+    gateway_bin: &Path,
+    routes: &Path,
+    material: &CertificateMaterial,
+) -> Result<(), String> {
+    match platform()? {
+        Platform::Macos => {
+            write_named_plist(
+                GATEWAY_LABEL,
+                &render_gateway_plist(paths, gateway_bin, routes, material, listen),
+            )?;
+        }
+        Platform::Linux => {
+            let unit = render_gateway_unit(listen, gateway_bin, routes, material)?;
+            install_system_unit(&paths.dir, GATEWAY_UNIT, &unit)?;
+        }
+    }
+    Ok(())
+}
+
+fn install_https_services(
+    paths: &Paths,
+    listen: SocketAddr,
+    forwarder_bin: &Path,
+) -> Result<(), String> {
+    match platform()? {
+        Platform::Macos => {
+            write_named_plist(
+                HTTPS_LABEL,
+                &render_https_plist(paths, forwarder_bin, listen),
+            )?;
+        }
+        Platform::Linux => {
+            install_system_unit(&paths.dir, HTTPS_SOCKET_UNIT, &render_https_socket_unit())?;
+            install_system_unit(
+                &paths.dir,
+                HTTPS_SERVICE_UNIT,
+                &render_https_service_unit(listen, forwarder_bin)?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn install_system_unit(dir: &Path, name: &str, contents: &str) -> Result<(), String> {
+    let destination = systemd_unit_path(name);
+    let staged = dir.join(format!(".{name}.staged"));
+    write_file(&staged, contents.as_bytes(), 0o644)?;
+    let result = run_privileged(
+        "install",
+        &[
+            "-m".to_owned(),
+            "0644".to_owned(),
+            staged.display().to_string(),
+            destination.display().to_string(),
+        ],
+    );
+    let _ = fs::remove_file(&staged);
+    result
 }
 
 fn write_named_plist(label: &str, contents: &str) -> Result<PathBuf, String> {
@@ -792,6 +1049,64 @@ fn xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('\"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn is_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+}
+
+fn run_privileged(program: &str, args: &[String]) -> Result<(), String> {
+    let mut command = if is_root() {
+        Command::new(program)
+    } else {
+        let mut command = Command::new("sudo");
+        command.arg("-n").arg(program);
+        command
+    };
+    let output = command
+        .args(args)
+        .output()
+        .map_err(|error| format!("run {program}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{program} failed: {} (system installation needs passwordless sudo; run `sudo -v` and retry)",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn start_services() -> Result<(), String> {
+    match platform()? {
+        Platform::Macos => {
+            bootstrap(GATEWAY_LABEL, &launch_agent_path(GATEWAY_LABEL)?)?;
+            bootstrap(HTTPS_LABEL, &launch_agent_path(HTTPS_LABEL)?)?;
+        }
+        Platform::Linux => {
+            run_privileged("systemctl", &["daemon-reload".to_owned()])?;
+            run_privileged(
+                "systemctl",
+                &[
+                    "enable".to_owned(),
+                    GATEWAY_UNIT.to_owned(),
+                    HTTPS_SOCKET_UNIT.to_owned(),
+                ],
+            )?;
+            run_privileged(
+                "systemctl",
+                &["restart".to_owned(), GATEWAY_UNIT.to_owned()],
+            )?;
+            run_privileged(
+                "systemctl",
+                &["restart".to_owned(), HTTPS_SOCKET_UNIT.to_owned()],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn bootstrap(label: &str, plist: &Path) -> Result<(), String> {
@@ -815,8 +1130,7 @@ fn bootstrap(label: &str, plist: &Path) -> Result<(), String> {
     Err(format!("launchctl bootstrap {label} failed: {last_error}"))
 }
 
-fn wait_for_listener(port: u16) -> Result<(), String> {
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
+fn wait_for_listener(address: SocketAddr) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok() {
@@ -831,23 +1145,34 @@ fn wait_for_listener(port: u16) -> Result<(), String> {
     }
 }
 
-fn tcp_probe(port: u16) -> bool {
+fn tcp_probe(address: SocketAddr) -> bool {
     // Prefer lsof: a bare TCP connect to the socket-activated :443 would wake
     // the forwarder and log a failed TLS handshake on every status check.
-    if !listener_pids(port).is_empty() {
+    if !listener_pids(address).is_empty() {
         return true;
     }
-    TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(300),
-    )
-    .is_ok()
+    TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
+}
+
+fn listener_pids(address: SocketAddr) -> Vec<u32> {
+    let Ok(output) = Command::new("lsof")
+        .arg("-nP")
+        .arg(format!("-iTCP@{}:{}", address.ip(), address.port()))
+        .args(["-sTCP:LISTEN", "-t"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
 }
 
 async fn wait_for_https(port: u16) -> Result<Value, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match probe(port).await {
+        match probe(https_listen()).await {
             Ok(health) => return Ok(health),
             Err(error) => {
                 if std::time::Instant::now() >= deadline {
@@ -862,23 +1187,34 @@ async fn wait_for_https(port: u16) -> Result<Value, String> {
 }
 
 fn launch_domain() -> Result<String, String> {
-    let output = Command::new("id")
-        .arg("-u")
-        .output()
-        .map_err(|error| format!("determine user id: {error}"))?;
-    if !output.status.success() {
-        return Err("id -u failed".into());
+    Ok(format!("gui/{}", id_field("-u")?))
+}
+
+fn service_state(service: Service) -> Value {
+    match platform() {
+        Ok(Platform::Macos) => launchd_state(service.macos_label()),
+        Ok(Platform::Linux) => systemctl_state(service.linux_unit()),
+        Err(error) => json!({"supported": false, "loaded": false, "state": error}),
     }
-    Ok(format!(
-        "gui/{}",
-        String::from_utf8_lossy(&output.stdout).trim()
-    ))
+}
+
+fn systemctl_state(unit: &str) -> Value {
+    let output = Command::new("systemctl").args(["is-active", unit]).output();
+    match output {
+        Ok(output) => {
+            let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let state = if state.is_empty() {
+                "inactive".to_owned()
+            } else {
+                state
+            };
+            json!({"supported": true, "loaded": state == "active", "state": state})
+        }
+        Err(error) => json!({"supported": false, "loaded": false, "state": error.to_string()}),
+    }
 }
 
 fn launchd_state(label: &str) -> Value {
-    if !cfg!(target_os = "macos") {
-        return json!({"supported": false, "loaded": false, "state": "unsupported"});
-    }
     match launchd_print(label) {
         Ok(Some(text)) => {
             let state = text
@@ -905,14 +1241,8 @@ fn launchd_print(label: &str) -> Result<Option<String>, String> {
     }
 }
 
-fn launch_agent_dir() -> PathBuf {
-    user_home()
-        .map(|home| home.join("Library/LaunchAgents"))
-        .unwrap_or_else(|_| PathBuf::from("Library/LaunchAgents"))
-}
-
 fn launch_agent_path(label: &str) -> Result<PathBuf, String> {
-    if !cfg!(target_os = "macos") {
+    if platform()? != Platform::Macos {
         return Err("launchd is only available on macOS".into());
     }
     Ok(user_home()?
@@ -1030,10 +1360,11 @@ fn read_routes(path: &Path) -> Result<Value, String> {
 /// Probe the gateway over TLS without judging the certificate. Used for health
 /// and forwarding checks; certificate validation is a separate handshake below
 /// so a broken cert does not hide an otherwise reachable gateway.
-async fn probe(port: u16) -> Result<Value, String> {
+async fn probe(address: SocketAddr) -> Result<Value, String> {
+    let port = address.port();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
-        .resolve("ai.myc", SocketAddr::from(([127, 0, 0, 1], port)))
+        .resolve("ai.myc", address)
         .danger_accept_invalid_certs(true)
         .build()
         .map_err(|error| format!("build gateway client: {error}"))?;
@@ -1055,7 +1386,7 @@ async fn probe(port: u16) -> Result<Value, String> {
 /// backend rejects CA-as-leaf certificates (the legacy `server.crt` shape),
 /// while macOS browsers and OpenSSL accept them, so `openssl s_client` is the
 /// honest check for both generated and legacy material.
-fn tls_chain_verified(paths: &Paths, port: u16) -> Result<(), String> {
+fn tls_chain_verified(paths: &Paths, address: SocketAddr) -> Result<(), String> {
     let anchor = if paths.ca.is_file() {
         &paths.ca
     } else {
@@ -1064,16 +1395,21 @@ fn tls_chain_verified(paths: &Paths, port: u16) -> Result<(), String> {
     if !anchor.is_file() {
         return Err(format!("trust anchor missing: {}", anchor.display()));
     }
-    let output = Command::new("openssl")
-        .args([
-            "s_client",
-            "-connect",
-            &format!("127.0.0.1:{port}"),
-            "-servername",
-            "ai.myc",
-            "-CAfile",
-        ])
-        .arg(anchor)
+    tls_verified(address, Some(anchor))
+}
+
+fn tls_verified(address: SocketAddr, anchor: Option<&Path>) -> Result<(), String> {
+    let mut command = Command::new("openssl");
+    command
+        .args(["s_client", "-connect"])
+        .arg(address.ip().to_string())
+        .args(["-port"])
+        .arg(address.port().to_string())
+        .args(["-servername", "ai.myc"]);
+    if let Some(anchor) = anchor {
+        command.arg("-CAfile").arg(anchor);
+    }
+    let output = command
         .args(["-verify_return_error", "-verify_hostname", "ai.myc"])
         .stdin(std::process::Stdio::null())
         .output()
@@ -1087,9 +1423,7 @@ fn tls_chain_verified(paths: &Paths, port: u16) -> Result<(), String> {
         .find(|line| line.contains("verify error") || line.contains("connect:"))
         .unwrap_or("TLS handshake failed")
         .trim();
-    Err(format!(
-        "127.0.0.1:{port} certificate check failed: {detail}"
-    ))
+    Err(format!("{address} certificate check failed: {detail}"))
 }
 
 fn system_daemon_path() -> Option<PathBuf> {
@@ -1098,39 +1432,60 @@ fn system_daemon_path() -> Option<PathBuf> {
 }
 
 fn certificate_trusted(cert: &Path) -> bool {
-    if !cfg!(target_os = "macos") || !cert.is_file() {
+    if !cert.is_file() {
         return false;
     }
-    Command::new("security")
-        .args(["verify-cert", "-c"])
-        .arg(cert)
-        .args(["-p", "ssl", "-s", "ai.myc"])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    match platform() {
+        Ok(Platform::Macos) => Command::new("security")
+            .args(["verify-cert", "-c"])
+            .arg(cert)
+            .args(["-p", "ssl", "-s", "ai.myc"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false),
+        Ok(Platform::Linux) => {
+            let address = installed_listen().unwrap_or_else(default_listen);
+            tls_verified(address, None).is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
 fn trust_certificate(cert: &Path) -> Result<(), String> {
-    if !cfg!(target_os = "macos") {
-        return Err("--trust-cert is supported only on macOS".into());
+    match platform()? {
+        Platform::Macos => {
+            let keychain = user_home()?.join("Library/Keychains/login.keychain-db");
+            if !keychain.is_file() {
+                return Err(format!("login keychain not found: {}", keychain.display()));
+            }
+            let output = Command::new("security")
+                .args(["add-trusted-cert", "-r", "trustRoot", "-k"])
+                .arg(&keychain)
+                .arg(cert)
+                .output()
+                .map_err(|error| format!("run security add-trusted-cert: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "security add-trusted-cert failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok(())
+        }
+        Platform::Linux => {
+            let destination = "/usr/local/share/ca-certificates/mycelium-gateway.crt";
+            run_privileged(
+                "install",
+                &[
+                    "-m".to_owned(),
+                    "0644".to_owned(),
+                    cert.display().to_string(),
+                    destination.to_owned(),
+                ],
+            )?;
+            run_privileged("update-ca-certificates", &[])
+        }
     }
-    let keychain = user_home()?.join("Library/Keychains/login.keychain-db");
-    if !keychain.is_file() {
-        return Err(format!("login keychain not found: {}", keychain.display()));
-    }
-    let output = Command::new("security")
-        .args(["add-trusted-cert", "-r", "trustRoot", "-k"])
-        .arg(&keychain)
-        .arg(cert)
-        .output()
-        .map_err(|error| format!("run security add-trusted-cert: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "security add-trusted-cert failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
 }
 
 fn uninstall(args: &[String]) -> Result<Vec<String>, String> {
@@ -1153,30 +1508,54 @@ fn uninstall(args: &[String]) -> Result<Vec<String>, String> {
     if write == dry_run {
         return Err("gateway uninstall requires exactly one of --write or --dry-run".into());
     }
-    let paths = [
-        launch_agent_path(GATEWAY_LABEL)?,
-        launch_agent_path(HTTPS_LABEL)?,
-    ];
+    let paths = service_paths()?;
     if dry_run {
         return Ok(paths
             .iter()
             .map(|path| format!("would remove {}", path.display()))
             .collect());
     }
-    let domain = launch_domain()?;
-    for label in [GATEWAY_LABEL, HTTPS_LABEL] {
-        let _ = Command::new("launchctl")
-            .args(["bootout", &format!("{domain}/{label}")])
-            .output();
-    }
-    for path in paths {
-        if path.exists() {
-            fs::remove_file(&path)
-                .map_err(|error| format!("remove {}: {error}", path.display()))?;
+    match platform()? {
+        Platform::Macos => {
+            let domain = launch_domain()?;
+            for label in [GATEWAY_LABEL, HTTPS_LABEL] {
+                let _ = Command::new("launchctl")
+                    .args(["bootout", &format!("{domain}/{label}")])
+                    .output();
+            }
+            for path in &paths {
+                if path.exists() {
+                    fs::remove_file(path)
+                        .map_err(|error| format!("remove {}: {error}", path.display()))?;
+                }
+            }
+        }
+        Platform::Linux => {
+            let _ = run_privileged(
+                "systemctl",
+                &[
+                    "disable".to_owned(),
+                    "--now".to_owned(),
+                    HTTPS_SOCKET_UNIT.to_owned(),
+                    HTTPS_SERVICE_UNIT.to_owned(),
+                    GATEWAY_UNIT.to_owned(),
+                ],
+            );
+            for path in &paths {
+                run_privileged("rm", &["-f".to_owned(), path.display().to_string()])?;
+            }
+            run_privileged("systemctl", &["daemon-reload".to_owned()])?;
         }
     }
     let mut lines = vec![
-        format!("removed user launch agents for {}", home.display()),
+        format!(
+            "removed {} for {}",
+            match platform()? {
+                Platform::Macos => "user launch agents",
+                Platform::Linux => "systemd units",
+            },
+            home.display()
+        ),
         "routes and certificates were retained".into(),
     ];
     if let Some(path) = system_daemon_path() {
@@ -1281,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn plists_use_loopback_and_socket_activation() {
+    fn services_use_the_configured_loopback_and_socket_activation() {
         let home = temporary_dir("plist");
         let dir = home.join("gateway");
         fs::create_dir_all(&dir).unwrap();
@@ -1292,18 +1671,64 @@ mod tests {
             ca: None,
             generated: false,
         };
+        let listen: SocketAddr = "127.0.0.1:9443".parse().unwrap();
         let gateway = render_gateway_plist(
             &paths,
             Path::new("/tmp/mycelium-gateway"),
             &paths.routes,
             &material,
+            listen,
         );
-        let https = render_https_plist(&paths, Path::new("/tmp/mycelium-https-forwarder"));
-        assert!(gateway.contains("127.0.0.1:8443"));
+        let https = render_https_plist(&paths, Path::new("/tmp/mycelium-https-forwarder"), listen);
+        assert!(gateway.contains("127.0.0.1:9443"));
         assert!(gateway.contains("--tls-cert"));
         assert!(https.contains("SockServiceName"));
         assert!(https.contains("<integer>443</integer>"));
-        assert!(https.contains("127.0.0.1:8443"));
+        assert!(https.contains("127.0.0.1:9443"));
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn systemd_units_use_the_configured_listen() {
+        let listen: SocketAddr = "127.0.0.1:10443".parse().unwrap();
+        let material = CertificateMaterial {
+            cert: PathBuf::from("/home/a/.mycelium/gateway/server.pem"),
+            key: PathBuf::from("/home/a/.mycelium/gateway/server-key.pem"),
+            ca: None,
+            generated: false,
+        };
+        let gateway = render_gateway_unit(
+            listen,
+            Path::new("/home/a/.mycelium/bin/mycelium-gateway"),
+            Path::new("/home/a/.mycelium/gateway/routes.json"),
+            &material,
+        )
+        .unwrap();
+        assert!(gateway.contains("--listen 127.0.0.1:10443"));
+        assert!(gateway.contains("Restart=on-failure"));
+        assert!(gateway.contains("mycelium-gateway"));
+        let socket = render_https_socket_unit();
+        assert!(socket.contains("ListenStream=127.0.0.1:443"));
+        assert!(socket.contains("Service=mycelium-https.service"));
+        let forwarder = render_https_service_unit(
+            listen,
+            Path::new("/home/a/.mycelium/bin/mycelium-https-forwarder"),
+        )
+        .unwrap();
+        assert!(forwarder.contains("--target 127.0.0.1:10443"));
+    }
+
+    #[test]
+    fn listen_parsing_rejects_unsafe_addresses() {
+        let expected: SocketAddr = "127.0.0.1:10443".parse().unwrap();
+        let text = if cfg!(target_os = "macos") {
+            "<string>--listen</string><string>127.0.0.1:10443</string>"
+        } else {
+            "ExecStart=/x --listen 127.0.0.1:10443 --routes /r"
+        };
+        assert_eq!(parse_listen(text), Some(expected));
+        assert!(listen_addr("0.0.0.0:8443").is_err());
+        assert!(listen_addr("127.0.0.1:443").is_err());
+        assert!(listen_addr("127.0.0.1:0").is_err());
     }
 }

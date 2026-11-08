@@ -94,18 +94,27 @@ mycelium doctor
 
 `gateway install` writes a local CA and leaf certificate (or retains an
 existing certificate pair), installs the default capability routes, copies the
-gateway/forwarder binaries under `$MYCELIUM_HOME/bin`, and bootstraps the two
-macOS LaunchAgents. `--trust-cert` adds the issuing CA to the login keychain so
-Brave/Safari accept `ai.myc`; it is deliberately explicit because it changes
-the user's trust settings. `mycelium setup --local-gateway --trust-cert` runs
-the same installation after enrollment. `mycelium doctor --fix --trust-cert`
-repairs an existing installation, and plain `mycelium doctor` exits non-zero
-when a check fails so it can gate scripts.
+gateway/forwarder binaries under `$MYCELIUM_HOME/bin`, and installs the host
+services: two LaunchAgents on macOS, a gateway service plus a socket-activated
+forwarder on Linux. `--trust-cert` adds the issuing CA to the login keychain on
+macOS or the system CA store on Linux; it is deliberately explicit because it
+changes the host's trust settings. `mycelium setup --local-gateway
+--trust-cert` runs the same installation after enrollment. `mycelium doctor
+--fix --trust-cert` repairs an existing installation, and plain `mycelium
+doctor` exits non-zero when a check fails so it can gate scripts.
 
-`gateway install` refuses to start when `:443` or `:8443` is already held by a
-different process, so a leftover system LaunchDaemon is reported instead of
-being silently duplicated. `gateway uninstall` removes only the two user
-LaunchAgents; it never touches `/Library/LaunchDaemons`.
+Linux units live in `/etc/systemd/system`: `mycelium-gateway.service`,
+`mycelium-https.socket`, and `mycelium-https.service`. Installing them needs
+passwordless sudo (the CLI uses `sudo -n` and fails loudly otherwise). Use
+`--listen 127.0.0.1:PORT` when another service already owns the default
+gateway port; the installed unit is the source of truth, so later reinstalls
+keep that address.
+
+`gateway install` refuses to start when the configured gateway address or
+`:443` is already held by a different process, so a leftover system LaunchDaemon
+or another service is reported instead of being silently duplicated. `gateway
+uninstall` removes only the Mycelium user agents/systemd units; it never
+touches `/Library/LaunchDaemons` or unrelated units.
 
 For a custom certificate or route table, use the installer flags directly:
 
@@ -120,7 +129,10 @@ mycelium gateway install --write \
 The certificate must cover every `Host` the gateway serves (`ai.myc`,
 `home.myc`, a wildcard such as `*.myc`, or an explicit SAN list). The browser
 trust decision is separate from gateway authorization; trust the issuing CA in
-the browser keychain if the certificate is not publicly trusted.
+the browser keychain if the certificate is not publicly trusted. On Linux,
+`--trust-cert` installs `/usr/local/share/ca-certificates/mycelium-gateway.crt`
+and runs `update-ca-certificates`; browsers that use their own NSS store may
+still need the CA imported separately.
 
 For development, run the gateway directly on a nonprivileged port:
 

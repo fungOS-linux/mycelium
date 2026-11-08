@@ -13,8 +13,8 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     if trust_gateway && !local_gateway {
         return Err("--trust-cert requires --local-gateway".into());
     }
-    if local_gateway && (packaged || system_service || !cfg!(target_os = "macos")) {
-        return Err("--local-gateway is supported only for a user-level macOS setup".into());
+    if local_gateway && packaged {
+        return Err("--local-gateway is not available in the packaged system installation".into());
     }
     let home = value(args, "--path").map(expand_home).unwrap_or_else(|| {
         if packaged { PathBuf::from(crate::packaged::HOME) } else { myceliumd::home_dir() }

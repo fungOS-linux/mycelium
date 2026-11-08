@@ -15,8 +15,8 @@ fn target(value: &str) -> Result<SocketAddr, String> {
     let address: SocketAddr = value
         .parse()
         .map_err(|_| "target must be a literal socket address")?;
-    if address.ip().is_unspecified() || address.ip().is_multicast() || address.port() != 8443 {
-        return Err("target must be an explicit local address on port 8443".into());
+    if address.ip().is_unspecified() || address.ip().is_multicast() || address.port() == 443 {
+        return Err("target must be an explicit local address on a non-443 port".into());
     }
     Ok(address)
 }
@@ -170,6 +170,7 @@ mod tests {
         for invalid in ["0.0.0.0:8443", "127.0.0.1:443", "localhost:8443"] {
             assert!(target(invalid).is_err());
         }
+        assert!(target("127.0.0.1:9443").is_ok());
     }
     #[test]
     fn transparent_bytes_round_trip() {
