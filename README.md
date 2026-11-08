@@ -74,11 +74,13 @@ mycelium doctor
 ```
 
 `mycelium doctor` checks the daemon, `.myc` resolution, the gateway services,
-the gateway listeners, certificate trust, and HTTPS health. It exits non-zero
-when a check fails, so it can gate automation. `--json` is available for
-scripts; `--fix --trust-cert` repairs the local gateway installation. The
-lifecycle supports macOS LaunchAgents and Linux systemd units; on Linux the
-installer needs passwordless sudo.
+the gateway listeners, certificate trust, HTTPS health, whether the installed
+release is the latest signed release for the channel, and the macOS
+signature/notarization status. It exits non-zero when a check fails, so it can
+gate automation. `--json` is available for scripts; `--fix --trust-cert`
+repairs the local gateway installation. The lifecycle supports macOS
+LaunchAgents and Linux systemd units; on Linux the installer needs
+passwordless sudo. See [docs/releases.md](docs/releases.md).
 
 ### Shell completion
 
@@ -825,6 +827,21 @@ check or the previous executable is restored. A node needs one successful
 manual signed activation before unattended updates begin, and automatic policy
 refuses same-version replacements and downgrades. `update policy disable
 --write` stops activation without disabling signed artifact distribution.
+
+The fleet projection flags hosts whose recorded release is behind the latest
+signed release for their target:
+
+```sh
+mycelium update status --fleet
+mycelium update status --fleet --json
+```
+
+Rows include `latest_version` and `needs_update`; unrecorded/local builds are
+reported separately rather than assumed current. `mycelium doctor` makes the
+same comparison locally and adds `codesign`/`spctl` checks on macOS. Release
+selection is semantic-version based and the latest manifest's signature is
+verified before it is offered. See [docs/releases.md](docs/releases.md) for the
+signing boundary and current notarization gap.
 
 ## SSH observation points
 

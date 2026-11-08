@@ -3,11 +3,13 @@
 //! Doctor deliberately reports local facts rather than starting the daemon or
 //! changing the host. `--fix` is the only mutating mode and delegates to the
 //! gateway lifecycle module.
+use mycelium_peer_protocol::ReleaseManifest;
 use myceliumd::{client::Client, protocol::Request};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
@@ -102,6 +104,10 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         }
     }
 
+    if let Some(client) = client.as_mut() {
+        update_check(&mut checks, client).await;
+    }
+
     for host in ["ai.myc", "mcp.myc"] {
         match (host, 443u16).to_socket_addrs() {
             Ok(addresses) => {
@@ -140,6 +146,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
 
     let snapshot = crate::gateway::snapshot(&home).await;
     gateway_checks(&mut checks, &snapshot, &home);
+    signature_checks(&mut checks);
 
     let failed = checks
         .iter()
@@ -315,6 +322,160 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
 
 fn add(checks: &mut Vec<Value>, name: &str, status: &'static str, detail: String) {
     checks.push(json!({"name": name, "status": status, "detail": detail}));
+}
+
+/// Compare the running binary and recorded update state with the newest signed
+/// release the daemon knows for this channel and target.
+async fn update_check(checks: &mut Vec<Value>, client: &mut Client) {
+    let channel = myceliumd::updates::channel();
+    let targets = mycelium_peer_protocol::local_compatible_targets();
+    let value = match daemon_call(client, &Request::ReleaseList).await {
+        Ok(value) => value,
+        Err(error) => {
+            add(
+                checks,
+                "mycelium version",
+                "warn",
+                format!("release catalog unavailable: {error}"),
+            );
+            return;
+        }
+    };
+    let releases = myceliumd::updates::parse_releases(&value);
+    let Some(latest) = myceliumd::updates::select_release(&releases, &channel, &targets) else {
+        add(
+            checks,
+            "mycelium version",
+            "warn",
+            format!(
+                "no {channel} release for compatible targets {}",
+                targets.join(", ")
+            ),
+        );
+        return;
+    };
+    if let Err(error) = latest.verify() {
+        add(
+            checks,
+            "mycelium version",
+            "fail",
+            format!(
+                "latest {channel} release {} has an invalid signature: {error}",
+                latest.version
+            ),
+        );
+        return;
+    }
+
+    let (installed, source, digest_matches) = installed_release(&releases);
+    let verdict = myceliumd::updates::version_verdict(installed.as_deref(), &latest.version);
+    let (status, detail) = match verdict {
+        myceliumd::updates::VersionVerdict::Current if digest_matches => (
+            "ok",
+            format!(
+                "installed {} is the latest {channel} release for {}",
+                latest.version, latest.target
+            ),
+        ),
+        myceliumd::updates::VersionVerdict::Current => (
+            "warn",
+            format!(
+                "update state records {}, but the running binary does not match its digest; latest {channel} is {}",
+                installed.as_deref().unwrap_or("unknown"),
+                latest.version
+            ),
+        ),
+        myceliumd::updates::VersionVerdict::UpdateAvailable => (
+            "warn",
+            format!(
+                "update available: installed {} is older than {} on {channel}; run `mycelium update apply --write`",
+                installed.as_deref().unwrap_or("unrecorded"),
+                latest.version
+            ),
+        ),
+        myceliumd::updates::VersionVerdict::Ahead => (
+            "ok",
+            format!(
+                "installed {} is ahead of the latest {channel} release {}",
+                installed.as_deref().unwrap_or("unknown"),
+                latest.version
+            ),
+        ),
+        myceliumd::updates::VersionVerdict::Unknown => (
+            "warn",
+            format!(
+                "installed release {source}; latest {channel} is {} for {} (run `mycelium update apply --write` to adopt it)",
+                latest.version, latest.target
+            ),
+        ),
+    };
+    add(checks, "mycelium version", status, detail);
+}
+
+fn installed_release(releases: &[ReleaseManifest]) -> (Option<String>, &'static str, bool) {
+    let Ok(executable) = std::env::current_exe() else {
+        return (None, "unrecorded", false);
+    };
+    let Ok(bytes) = std::fs::read(&executable) else {
+        return (None, "unrecorded", false);
+    };
+    let digest = mycelium_peer_protocol::sha256_hex(&bytes);
+    if let Some(release) = releases
+        .iter()
+        .find(|release| release.artifact_digest == digest)
+    {
+        return (Some(release.version.clone()), "binary digest", true);
+    }
+    let state = myceliumd::read_update_state();
+    match (state.release_version, state.release_digest) {
+        (Some(version), Some(recorded)) if recorded == digest => {
+            (Some(version), "update state", true)
+        }
+        (Some(version), Some(_)) => (Some(version), "update state", false),
+        (Some(version), None) => (Some(version), "update state", false),
+        _ => (None, "unrecorded", false),
+    }
+}
+
+fn signature_checks(checks: &mut Vec<Value>) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let signed = Command::new("codesign")
+        .args(["--verify", "--strict", "--verbose=2"])
+        .arg(&executable)
+        .output();
+    let signed = signed.as_ref().is_ok_and(|output| output.status.success());
+    add(
+        checks,
+        "binary signature",
+        if signed { "ok" } else { "warn" },
+        if signed {
+            "codesign verified".into()
+        } else {
+            "codesign verification failed; local builds are expected to be unsigned".into()
+        },
+    );
+    let notarized = Command::new("spctl")
+        .args(["--assess", "--type", "execute", "--verbose"])
+        .arg(&executable)
+        .output();
+    let notarized = notarized
+        .as_ref()
+        .is_ok_and(|output| output.status.success());
+    add(
+        checks,
+        "binary notarization",
+        if notarized { "ok" } else { "warn" },
+        if notarized {
+            "Gatekeeper accepted the binary".into()
+        } else {
+            "Gatekeeper rejected the binary; release builds should be signed and notarized".into()
+        },
+    );
 }
 
 /// Doctor must report a wedged daemon, not hang behind it.

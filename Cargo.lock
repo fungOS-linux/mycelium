@@ -2798,6 +2798,7 @@ dependencies = [
  "rumqttc",
  "rustls",
  "rustls-pemfile",
+ "semver",
  "serde",
  "serde_json",
  "ssh-key",

@@ -42,6 +42,7 @@ pub mod ssh_renewal;
 pub mod state_change;
 pub mod topology_feed;
 pub mod update_policy;
+pub mod updates;
 
 use std::path::PathBuf;
 
