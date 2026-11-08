@@ -126,7 +126,64 @@ Add a `ssh_ca` block to the root-owned `/etc/mycelium/access.json`:
    delegation that authorized it. Host reconciliation now builds the revocation
    KRL by adding a section per trusted CA (delegates, plus legacy while
    `keep_installed`) into one staged KRL.
-4. Migrate the existing CA: keep it trusted, add the first delegate, let hosts
-   reconcile, then retire the old key.
+4. **Implemented (tooling + runbook):** migrate the existing CA. Add a
+   delegation for the current CA key first, enable delegated mode on hosts while
+   `keep_installed` is true, then add/rotate delegates and revoke the old one.
+   Actual publication needs the offline root key (below).
 5. Backup/restore and root-rotation runbook with a scratch-host rehearsal.
+
+## Migrating the existing CA
+
+1. On the host that holds the current CA, emit a delegation statement for it:
+
+   ```sh
+   mycelium access ssh ca-delegation \
+     --ca-public "$HOME/.mycelium/ssh/user_ca.pub" \
+     --delegation-id ssh-user-ca-2026-11 \
+     --role network-admin \
+     --not-after 1825536000 \
+     --path /secure/ssh-user-ca-delegation.json --write
+   ```
+
+   This derives the hex Ed25519 subject from the OpenSSH public key and writes
+   an `ssh_user_ca` delegation. The example is in
+   `docs/examples/authority-ssh-user-ca-delegation.json`.
+
+2. With the **offline root key**, sign and publish it:
+
+   ```sh
+   mycelium authority delegate \
+     --statement /secure/ssh-user-ca-delegation.json \
+     --signing-key /secure/authority.key --write
+   mycelium authority explain ssh.user-ca "$CA_PUBLIC_KEY_HEX"
+   ```
+
+3. On each Linux host, turn on delegated trust but keep the legacy CA during
+   migration:
+
+   ```json
+   "ssh_ca": { "mode": "delegated", "keep_installed": true }
+   ```
+
+   ```sh
+   sudo env MYCELIUM_HOME=/home/OPERATOR/.mycelium MYCELIUM_NO_AUTOSTART=1 \
+     /usr/local/libexec/mycelium-access/mycelium access host plan \
+     --policy /etc/mycelium/access.json
+   # verify plan.ssh_user_cas and plan.ssh_ca_source, then apply --write
+   ```
+
+   Confirm a new SSH login and that `/etc/ssh/mycelium/user_ca.pub` contains the
+   delegated key. Leave the legacy CA in place until every host has reconciled.
+
+4. Only then set `MYCELIUM_SSH_CA_MODE=delegated` on the issuing daemon, so
+   signing is gated by the same delegation.
+
+5. To rotate: generate a new CA, emit/publish a delegation for it, let hosts
+   reconcile, verify logins, then publish a root-signed revocation of the old
+   delegation. Set `keep_installed` to `false` and re-apply once no host relies
+   on the legacy key. Already-issued certificates remain valid until they
+   expire; revocation is prospective.
+
+Rollback: set `mode` back to `legacy` (or `keep_installed: true`) and re-apply.
+The legacy `ca_public` was never removed.
 

@@ -1,0 +1,14 @@
+{
+  "kind": "delegate",
+  "delegation_id": "ssh-user-ca-2026-11",
+  "subject": "REPLACE_WITH_64_CHARACTER_ED25519_PUBLIC_KEY_HEX",
+  "capabilities": [
+    {
+      "action": "ssh_user_ca",
+      "roles": ["network-admin"],
+      "unix_users": []
+    }
+  ],
+  "not_before": 1794000000,
+  "not_after": 1825536000
+}

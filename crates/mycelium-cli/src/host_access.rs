@@ -773,22 +773,7 @@ fn read_public_key_lines(path: &Path) -> Result<Vec<String>, String> {
 
 /// Render a hex Ed25519 public key as an OpenSSH `ssh-ed25519` trust line.
 fn ssh_ed25519_line(hex_key: &str) -> Result<String, String> {
-    let key = mycelium_peer_protocol::decode_hex(hex_key)
-        .map_err(|error| format!("invalid delegated SSH CA key: {error}"))?;
-    if key.len() != 32 {
-        return Err("delegated SSH CA key must be a 32-byte Ed25519 public key".into());
-    }
-    const ALGORITHM: &[u8] = b"ssh-ed25519";
-    let mut blob = Vec::with_capacity(4 + ALGORITHM.len() + 4 + key.len());
-    blob.extend_from_slice(&(ALGORITHM.len() as u32).to_be_bytes());
-    blob.extend_from_slice(ALGORITHM);
-    blob.extend_from_slice(&(key.len() as u32).to_be_bytes());
-    blob.extend_from_slice(&key);
-    use base64::Engine as _;
-    Ok(format!(
-        "ssh-ed25519 {}",
-        base64::engine::general_purpose::STANDARD.encode(blob)
-    ))
+    crate::ssh_access::ssh_ed25519_line_from_hex(hex_key)
 }
 
 #[cfg(test)]

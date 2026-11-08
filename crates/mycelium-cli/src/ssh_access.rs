@@ -51,12 +51,13 @@ pub fn run(args: &[String], state: &Value) -> Result<Vec<String>, String> {
         Some("host-apply") => host_apply(args),
         Some("host-rollout") => host_rollout(args),
         Some("renewal-authorize") => renewal_authorize(args),
+        Some("ca-delegation") => ca_delegation(args),
         Some("client-config") => client_config(args),
         Some("profile") => profile(args),
         Some("host-policy") => host_policy(args, state),
         Some(action) => Err(format!("unknown access ssh action `{action}`")),
         None => Err(
-            "access ssh needs ca-init, issue, krl, host-bundle, host-apply, host-rollout, or client-config"
+            "access ssh needs ca-init, issue, krl, host-bundle, host-apply, host-rollout, client-config, or ca-delegation"
                 .into(),
         ),
     }
@@ -1394,6 +1395,124 @@ fn krl(args: &[String], state: &Value) -> Result<Vec<String>, String> {
     )])
 }
 
+fn ca_delegation(args: &[String]) -> Result<Vec<String>, String> {
+    let ca_public = required(args, "--ca-public")?;
+    let subject = ssh_key_hex_from_public(Path::new(ca_public))?;
+    let delegation_id = required(args, "--delegation-id")?;
+    let roles = repeated(args, "--role")
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let unix_users = repeated(args, "--unix-user")
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if roles.is_empty() && unix_users.is_empty() {
+        return Err("ca-delegation needs at least one --role or --unix-user".into());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    let not_before = parse_timestamp(args, "--not-before")?.unwrap_or(now);
+    let not_after = parse_timestamp(args, "--not-after")?.unwrap_or(now + 90 * 24 * 3600);
+    if not_after <= not_before {
+        return Err("--not-after must be after --not-before".into());
+    }
+    let statement = serde_json::json!({
+        "kind": "delegate",
+        "delegation_id": delegation_id,
+        "subject": subject,
+        "capabilities": [{
+            "action": "ssh_user_ca",
+            "roles": roles,
+            "unix_users": unix_users,
+        }],
+        "not_before": not_before,
+        "not_after": not_after,
+    });
+    let text = serde_json::to_string_pretty(&statement).map_err(|error| error.to_string())?;
+    if let Some(path) = value(args, "--path") {
+        if !args.iter().any(|argument| argument == "--write") {
+            return Err("ca-delegation --path requires --write".into());
+        }
+        fs::write(path, format!("{text}\n")).map_err(|error| format!("write {path}: {error}"))?;
+        return Ok(vec![format!(
+            "wrote SSH user-CA delegation statement to {path}"
+        )]);
+    }
+    Ok(vec![text])
+}
+
+fn parse_timestamp(args: &[String], flag: &str) -> Result<Option<u64>, String> {
+    value(args, flag)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("{flag} must be a Unix timestamp"))
+        })
+        .transpose()
+}
+
+/// Hex Ed25519 public key from an OpenSSH `ssh-ed25519` public-key file.
+pub(crate) fn ssh_key_hex_from_public(path: &Path) -> Result<String, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let mut fields = text.split_whitespace();
+    if fields.next() != Some("ssh-ed25519") {
+        return Err("key is not an ssh-ed25519 public key".into());
+    }
+    let encoded = fields.next().ok_or("key has no key material")?;
+    use base64::Engine as _;
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("decode public key: {error}"))?;
+    let algorithm_len = u32::from_be_bytes(
+        blob.get(0..4)
+            .ok_or("truncated public key")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let algorithm_end = 4 + algorithm_len;
+    if blob.get(4..algorithm_end) != Some(b"ssh-ed25519") {
+        return Err("public key algorithm mismatch".into());
+    }
+    let key_len = u32::from_be_bytes(
+        blob.get(algorithm_end..algorithm_end + 4)
+            .ok_or("truncated public key length")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let key_start = algorithm_end + 4;
+    let key = blob
+        .get(key_start..key_start + key_len)
+        .ok_or("truncated public key material")?;
+    if key.len() != 32 {
+        return Err("key is not a 32-byte Ed25519 public key".into());
+    }
+    Ok(mycelium_peer_protocol::encode_hex(key))
+}
+
+/// Render a hex Ed25519 public key as an OpenSSH `ssh-ed25519` trust line.
+pub(crate) fn ssh_ed25519_line_from_hex(hex_key: &str) -> Result<String, String> {
+    let key = mycelium_peer_protocol::decode_hex(hex_key)
+        .map_err(|error| format!("invalid Ed25519 public key: {error}"))?;
+    if key.len() != 32 {
+        return Err("Ed25519 public key must be 32 bytes".into());
+    }
+    const ALGORITHM: &[u8] = b"ssh-ed25519";
+    let mut blob = Vec::with_capacity(4 + ALGORITHM.len() + 4 + key.len());
+    blob.extend_from_slice(&(ALGORITHM.len() as u32).to_be_bytes());
+    blob.extend_from_slice(ALGORITHM);
+    blob.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    blob.extend_from_slice(&key);
+    use base64::Engine as _;
+    Ok(format!(
+        "ssh-ed25519 {}",
+        base64::engine::general_purpose::STANDARD.encode(blob)
+    ))
+}
+
 fn value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter()
         .position(|arg| arg == flag)
@@ -2144,5 +2263,76 @@ mod tests {
             "certificate serial 42 should be revoked"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ca_delegation_round_trips_an_openssh_ca_key() {
+        let hex_key = "07".repeat(32);
+        let line = ssh_ed25519_line_from_hex(&hex_key).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "mycelium-ca-delegation-{}.pub",
+            std::process::id()
+        ));
+        fs::write(&path, format!("{line}\n")).unwrap();
+        assert_eq!(
+            ssh_key_hex_from_public(&path).unwrap(),
+            hex_key
+        );
+        let args = vec![
+            "ca-delegation".to_string(),
+            "--ca-public".to_string(),
+            path.display().to_string(),
+            "--delegation-id".to_string(),
+            "ssh-user-ca-test".to_string(),
+            "--role".to_string(),
+            "network-admin".to_string(),
+            "--not-before".to_string(),
+            "100".to_string(),
+            "--not-after".to_string(),
+            "200".to_string(),
+        ];
+        let output = ca_delegation(&args).unwrap();
+        let statement: mycelium_peer_protocol::AuthorityStatement =
+            serde_json::from_str(&output[0]).unwrap();
+        let mycelium_peer_protocol::AuthorityStatement::Delegate {
+            delegation_id,
+            subject,
+            capabilities,
+            not_before,
+            not_after,
+        } = statement
+        else {
+            panic!("expected a delegation")
+        };
+        assert_eq!(delegation_id, "ssh-user-ca-test");
+        assert_eq!(subject, hex_key);
+        assert_eq!(not_before, 100);
+        assert_eq!(not_after, 200);
+        assert!(matches!(
+            capabilities.as_slice(),
+            [mycelium_peer_protocol::AuthorityCapability::SshUserCa { roles, .. }]
+                if roles.contains("network-admin")
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ca_delegation_requires_a_constraint() {
+        let hex_key = "08".repeat(32);
+        let line = ssh_ed25519_line_from_hex(&hex_key).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "mycelium-ca-delegation-empty-{}.pub",
+            std::process::id()
+        ));
+        fs::write(&path, format!("{line}\n")).unwrap();
+        let args = vec![
+            "ca-delegation".to_string(),
+            "--ca-public".to_string(),
+            path.display().to_string(),
+            "--delegation-id".to_string(),
+            "ssh-user-ca-test".to_string(),
+        ];
+        assert!(ca_delegation(&args).is_err());
+        let _ = fs::remove_file(path);
     }
 }

@@ -1665,9 +1665,20 @@ mod tests {
             "../../../docs/examples/authority-revocation.json"
         ))
         .unwrap();
+        let ssh_ca: AuthorityStatement = serde_json::from_str(include_str!(
+            "../../../docs/examples/authority-ssh-user-ca-delegation.json"
+        ))
+        .unwrap();
         assert!(matches!(access, AuthorityStatement::Delegate { .. }));
         assert!(matches!(package, AuthorityStatement::Delegate { .. }));
         assert!(matches!(revocation, AuthorityStatement::Revoke { .. }));
+        let AuthorityStatement::Delegate { capabilities, .. } = &ssh_ca else {
+            panic!("ssh CA example is not a delegation")
+        };
+        assert!(matches!(
+            capabilities.as_slice(),
+            [AuthorityCapability::SshUserCa { .. }]
+        ));
     }
 
     #[test]
