@@ -25,6 +25,7 @@ const HTTPS_LABEL: &str = "dev.fpl.mycelium-https";
 const GATEWAY_UNIT: &str = "mycelium-gateway.service";
 const HTTPS_SOCKET_UNIT: &str = "mycelium-https.socket";
 const HTTPS_SERVICE_UNIT: &str = "mycelium-https.service";
+const SYSTEM_CA_PATH: &str = "/usr/local/share/ca-certificates/mycelium-gateway.crt";
 
 const USAGE: &str = "mycelium gateway status [--json] [--path MYCELIUM-HOME]\n\
 mycelium gateway install [--write|--dry-run] [--trust-cert] [--listen ADDR] [--routes PATH] [--cert PATH --key PATH] [--gateway-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]\n\
@@ -478,12 +479,6 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     install_https_services(&paths, listen, &forwarder_bin)?;
     if options.trust {
         trust_certificate(material.trust_anchor())?;
-        if !certificate_trusted(&material.cert) {
-            return Err(format!(
-                "certificate {} does not verify for ai.myc after trust installation",
-                material.cert.display()
-            ));
-        }
     }
 
     start_services()?;
@@ -498,6 +493,12 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     tls_chain_verified(&paths, https_listen()).map_err(|error| {
         format!("installed the gateway, but the :{HTTPS_PORT} TLS check failed: {error}")
     })?;
+    if options.trust && !certificate_trusted(&material.cert) {
+        return Err(format!(
+            "certificate {} does not verify for ai.myc after trust installation",
+            material.cert.display()
+        ));
+    }
 
     let mut lines = vec![format!(
         "installed local HTTPS gateway for {}",
@@ -1473,14 +1474,13 @@ fn trust_certificate(cert: &Path) -> Result<(), String> {
             Ok(())
         }
         Platform::Linux => {
-            let destination = "/usr/local/share/ca-certificates/mycelium-gateway.crt";
             run_privileged(
                 "install",
                 &[
                     "-m".to_owned(),
                     "0644".to_owned(),
                     cert.display().to_string(),
-                    destination.to_owned(),
+                    SYSTEM_CA_PATH.to_owned(),
                 ],
             )?;
             run_privileged("update-ca-certificates", &[])
@@ -1510,10 +1510,14 @@ fn uninstall(args: &[String]) -> Result<Vec<String>, String> {
     }
     let paths = service_paths()?;
     if dry_run {
-        return Ok(paths
+        let mut lines = paths
             .iter()
             .map(|path| format!("would remove {}", path.display()))
-            .collect());
+            .collect::<Vec<_>>();
+        if platform()? == Platform::Linux && Path::new(SYSTEM_CA_PATH).is_file() {
+            lines.push(format!("would remove {SYSTEM_CA_PATH}"));
+        }
+        return Ok(lines);
     }
     match platform()? {
         Platform::Macos => {
@@ -1558,6 +1562,13 @@ fn uninstall(args: &[String]) -> Result<Vec<String>, String> {
         ),
         "routes and certificates were retained".into(),
     ];
+    if platform()? == Platform::Linux && Path::new(SYSTEM_CA_PATH).is_file() {
+        run_privileged("rm", &["-f".to_owned(), SYSTEM_CA_PATH.to_owned()])?;
+        run_privileged("update-ca-certificates", &[])?;
+        lines.push(format!(
+            "removed the system CA trust entry {SYSTEM_CA_PATH}"
+        ));
+    }
     if let Some(path) = system_daemon_path() {
         lines.push(format!(
             "system LaunchDaemon {} was not modified; remove it separately if it is no longer wanted",
