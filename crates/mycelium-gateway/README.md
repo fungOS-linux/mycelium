@@ -113,8 +113,13 @@ keep that address.
 `gateway install` refuses to start when the configured gateway address or
 `:443` is already held by a different process, so a leftover system LaunchDaemon
 or another service is reported instead of being silently duplicated. `gateway
-uninstall` removes only the Mycelium user agents/systemd units; it never
-touches `/Library/LaunchDaemons` or unrelated units.
+uninstall` removes only the Mycelium user agents/systemd units and the Linux CA
+entry; it never touches `/Library/LaunchDaemons` or unrelated units.
+
+The gateway does not manage DNS. Hosts that do not already resolve `.myc`
+wildcards locally need bootstrap entries (for example
+`127.0.0.1 ai.myc api.myc mcp.myc home.myc webhook.myc` in `/etc/hosts`) until
+the Mycelium DNS resolver owns the zone.
 
 For a custom certificate or route table, use the installer flags directly:
 
