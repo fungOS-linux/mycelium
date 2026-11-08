@@ -769,9 +769,8 @@ fn generate_certificate(dir: &Path) -> Result<CertificateMaterial, String> {
         .map_err(|error| format!("sign CA: {error}"))?;
 
     let leaf_key = KeyPair::generate().map_err(|error| format!("generate leaf key: {error}"))?;
-    let mut leaf_params =
-        CertificateParams::new(vec!["*.myc".into(), "localhost".into(), "127.0.0.1".into()])
-            .map_err(|error| format!("create leaf parameters: {error}"))?;
+    let mut leaf_params = CertificateParams::new(capability_names())
+        .map_err(|error| format!("create leaf parameters: {error}"))?;
     leaf_params.distinguished_name = DistinguishedName::new();
     leaf_params
         .distinguished_name
@@ -800,6 +799,25 @@ fn generate_certificate(dir: &Path) -> Result<CertificateMaterial, String> {
         ca: Some(ca_path),
         generated: true,
     })
+}
+
+fn capability_names() -> Vec<String> {
+    // `*.myc` alone is not accepted by OpenSSL/most browsers because the
+    // wildcard sits in a single-label domain. List the bootstrap names too so
+    // the generated certificate matches them on every TLS implementation.
+    [
+        "ai.myc",
+        "api.myc",
+        "mcp.myc",
+        "home.myc",
+        "webhook.myc",
+        "*.myc",
+        "localhost",
+        "127.0.0.1",
+    ]
+    .iter()
+    .map(|name| (*name).to_owned())
+    .collect()
 }
 
 fn find_binary(name: &str, explicit: Option<&Path>, installed: &Path) -> Result<PathBuf, String> {
@@ -1668,6 +1686,14 @@ mod tests {
             );
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn certificate_names_cover_capability_hosts() {
+        let names = capability_names();
+        for expected in ["ai.myc", "mcp.myc", "home.myc", "webhook.myc"] {
+            assert!(names.contains(&expected.to_owned()));
+        }
     }
 
     #[test]
