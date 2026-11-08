@@ -1,22 +1,25 @@
 {
+  "mycelium_bin": "mycelium",
   "default_route": "bifrost",
   "routes": [
     {
       "name": "bifrost",
-      "hosts": ["*"],
+      "hosts": ["ai.myc", "api.myc"],
       "upstream": "http://127.0.0.1:4000",
-      "priority": 0
+      "service_kind": "ai",
+      "priority": 10
     },
     {
       "name": "mcp",
       "hosts": ["mcp.myc", "*.mcp"],
       "upstream": "http://127.0.0.1:8000",
+      "service_kind": "mcp",
       "priority": 10
     },
     {
       "name": "home",
       "hosts": ["home.myc", "*.home"],
-      "upstream": "http://127.0.0.1:8080",
+      "service_kind": "home",
       "priority": 10
     },
     {

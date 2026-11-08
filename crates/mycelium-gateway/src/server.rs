@@ -7,14 +7,18 @@ use axum::http::{Request, Response, StatusCode, Uri};
 use axum::routing::get;
 use axum::Router;
 use futures_util::StreamExt;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::service::TowerToHyperService;
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::io::{Error, ErrorKind};
+use std::fs::File;
+use std::io::{BufReader, Error, ErrorKind};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
@@ -24,6 +28,7 @@ struct GatewayState {
     table: Arc<std::sync::RwLock<RouteTable>>,
     services: Arc<std::sync::RwLock<ServiceIndex>>,
     auth_token: Option<Arc<str>>,
+    forwarded_proto: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +42,16 @@ pub async fn run(
     config_path: Option<PathBuf>,
     token_file: Option<PathBuf>,
     reload_secs: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_with_tls(listen, config_path, token_file, reload_secs, None).await
+}
+
+pub async fn run_with_tls(
+    listen: SocketAddr,
+    config_path: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+    reload_secs: u64,
+    tls: Option<(PathBuf, PathBuf)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read every operator input before opening the listener. A gateway that
     // started without its token or route table would be quietly wrong.
@@ -86,6 +101,7 @@ pub async fn run(
         spawn_service_refresh(bin, refresh_secs, services.clone());
     }
 
+    let forwarded_proto = if tls.is_some() { "https" } else { "http" };
     let state = GatewayState {
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
@@ -94,6 +110,7 @@ pub async fn run(
         table: table.clone(),
         services,
         auth_token: auth_token.map(Arc::from),
+        forwarded_proto,
     };
 
     if let (Some(path), true) = (config_path, reload_secs > 0) {
@@ -101,10 +118,78 @@ pub async fn run(
     }
 
     let listener = TcpListener::bind(listen).await?;
-    eprintln!("mycelium-gateway: listening on {listen}; routing by Host");
-    axum::serve(listener, routes(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let app = routes(state);
+    if let Some((cert, key)) = tls {
+        let config = tls_config(&cert, &key)?;
+        eprintln!("mycelium-gateway: listening on https://{listen}; routing by Host");
+        serve_tls(listener, app, config).await?;
+    } else {
+        eprintln!("mycelium-gateway: listening on http://{listen}; routing by Host");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
+    Ok(())
+}
+
+fn tls_config(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    let certificates = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
+        .collect::<Result<Vec<_>, _>>()?;
+    if certificates.is_empty() {
+        return Err(format!("{} contains no certificates", cert_path.display()).into());
+    }
+    let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path)?))?
+        .ok_or_else(|| format!("{} contains no private key", key_path.display()))?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+async fn serve_tls(
+    listener: TcpListener,
+    app: Router,
+    config: Arc<rustls::ServerConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let acceptor = TlsAcceptor::from(config);
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let acceptor = acceptor.clone();
+                let service = TowerToHyperService::new(app.clone());
+                tokio::spawn(async move {
+                    let tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+                        Ok(Ok(tls)) => tls,
+                        Ok(Err(error)) => {
+                            eprintln!("mycelium-gateway: TLS handshake from {peer} failed: {error}");
+                            return;
+                        }
+                        Err(_) => {
+                            eprintln!("mycelium-gateway: TLS handshake from {peer} timed out");
+                            return;
+                        }
+                    };
+                    let io = TokioIo::new(tls);
+                    if let Err(error) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await
+                    {
+                        eprintln!("mycelium-gateway: HTTPS connection from {peer} failed: {error}");
+                    }
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -185,7 +270,8 @@ async fn healthz(State(state): State<GatewayState>) -> impl axum::response::Into
         "routes": table.routes().len(),
         "service_endpoints": services.len(),
         "local_node": services.local_node(),
-        "auth_required": state.auth_token.is_some()
+        "auth_required": state.auth_token.is_some(),
+        "tls": state.forwarded_proto == "https"
     }))
 }
 
@@ -194,12 +280,7 @@ async fn proxy(State(state): State<GatewayState>, request: Request<Body>) -> Res
         return text(StatusCode::UNAUTHORIZED, "unauthorized");
     }
 
-    let host = request
-        .headers()
-        .get("host")
-        .and_then(|value| value.to_str().ok())
-        .map(crate::route::normalize_host)
-        .unwrap_or_default();
+    let host = request_host(&request);
     let Some(route) = state.table.read().unwrap().select(&host) else {
         return text(StatusCode::NOT_FOUND, "no route");
     };
@@ -229,11 +310,9 @@ async fn proxy(State(state): State<GatewayState>, request: Request<Body>) -> Res
             }
             forwarded = forwarded.header(name, value);
         }
-        if let Some(host) = headers.get("host").and_then(|value| value.to_str().ok()) {
-            forwarded = forwarded
-                .header("x-forwarded-host", host)
-                .header("x-forwarded-proto", "http");
-        }
+        forwarded = forwarded
+            .header("x-forwarded-host", &host)
+            .header("x-forwarded-proto", state.forwarded_proto);
         if target.remote {
             match remote_authorization(&route) {
                 Ok(Some(token)) => {
@@ -273,6 +352,21 @@ async fn proxy(State(state): State<GatewayState>, request: Request<Body>) -> Res
     } else {
         text(StatusCode::SERVICE_UNAVAILABLE, "no backend for route")
     }
+}
+
+fn request_host(request: &Request<Body>) -> String {
+    request
+        .headers()
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })
+        .map(crate::route::normalize_host)
+        .unwrap_or_default()
 }
 
 fn targets_for(route: &Route, services: &ServiceIndex) -> Vec<Target> {
@@ -443,6 +537,21 @@ mod tests {
             upstream_url(&base, &uri("/v1/models")).unwrap().as_str(),
             "http://127.0.0.1:4000/api/v1/models"
         );
+    }
+
+    #[test]
+    fn host_falls_back_to_http2_authority() {
+        let request = Request::builder()
+            .uri("https://ai.myc/hello")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(request_host(&request), "ai.myc");
+        let request = Request::builder()
+            .uri("/hello")
+            .header("host", "mcp.myc:443")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(request_host(&request), "mcp.myc");
     }
 
     #[test]

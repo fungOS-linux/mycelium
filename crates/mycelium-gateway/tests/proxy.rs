@@ -51,6 +51,30 @@ async fn start_gateway(
     Ok((address, handle))
 }
 
+async fn start_gateway_tls(
+    route_path: std::path::PathBuf,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    let handle = tokio::spawn(async move {
+        if let Err(error) = server::run_with_tls(
+            address,
+            Some(route_path),
+            None,
+            0,
+            Some((cert_path, key_path)),
+        )
+        .await
+        {
+            panic!("gateway exited: {error}");
+        }
+    });
+    Ok((address, handle))
+}
+
 #[tokio::test]
 async fn routes_by_host_and_requires_auth() -> Result<(), Box<dyn std::error::Error>> {
     let upstream = TcpListener::bind("127.0.0.1:0").await?;
@@ -170,6 +194,7 @@ async fn health_reports_routes_and_auth() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(health["ok"], json!(true));
     assert_eq!(health["routes"], json!(1));
     assert_eq!(health["auth_required"], json!(false));
+    assert_eq!(health["tls"], json!(false));
 
     gateway.abort();
     let _ = fs::remove_file(route_path);
@@ -270,6 +295,86 @@ async fn streams_upstream_chunks_without_buffering() -> Result<(), Box<dyn std::
 
     gateway.abort();
     upstream_handle.abort();
+    let _ = fs::remove_file(route_path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn serves_https_and_reports_the_forwarded_proto() -> Result<(), Box<dyn std::error::Error>> {
+    use axum::http::HeaderMap;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream.local_addr()?;
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(
+            upstream,
+            Router::new().route(
+                "/proto",
+                get(|headers: HeaderMap| async move {
+                    Json(json!({
+                        "proto": headers.get("x-forwarded-proto")
+                            .and_then(|value| value.to_str().ok())
+                    }))
+                }),
+            ),
+        )
+        .await
+        .expect("upstream serve should succeed");
+    });
+
+    let mut ca_params = CertificateParams::new(vec!["gateway-test-ca".into()])?;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate()?;
+    let ca = ca_params.self_signed(&ca_key)?;
+    let leaf_key = KeyPair::generate()?;
+    let leaf =
+        CertificateParams::new(vec!["127.0.0.1".into()])?.signed_by(&leaf_key, &ca, &ca_key)?;
+
+    let cert_path = temp_path("tls-cert").with_extension("pem");
+    let key_path = temp_path("tls-key").with_extension("pem");
+    fs::write(&cert_path, leaf.pem())?;
+    fs::write(&key_path, leaf_key.serialize_pem())?;
+
+    let route_path = temp_path("tls-routes");
+    fs::write(
+        &route_path,
+        format!(
+            r#"{{"routes": [{{"name": "ai", "hosts": ["ai.myc"],
+                "upstream": "http://127.0.0.1:{}"}}]}}"#,
+            upstream_addr.port()
+        ),
+    )?;
+
+    let (addr, gateway) =
+        start_gateway_tls(route_path.clone(), cert_path.clone(), key_path.clone()).await?;
+    let client = Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes())?)
+        .build()?;
+    let base = format!("https://127.0.0.1:{}", addr.port());
+    let health = loop {
+        if let Ok(response) = client.get(format!("{base}/healthz")).send().await {
+            if response.status().is_success() {
+                break response.json::<serde_json::Value>().await?;
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(health["tls"], json!(true));
+
+    let response = client
+        .get(format!("{base}/proto"))
+        .header("host", "ai.myc")
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["proto"], json!("https"));
+
+    gateway.abort();
+    upstream_handle.abort();
+    let _ = fs::remove_file(cert_path);
+    let _ = fs::remove_file(key_path);
     let _ = fs::remove_file(route_path);
     Ok(())
 }

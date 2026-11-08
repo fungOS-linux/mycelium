@@ -9,10 +9,18 @@ cannot: binding a listener, authenticating local callers, and forwarding by
 
 ```text
 app / Soil Spore
-  -> http://ai.myc:8080
-  -> mycelium-gateway
+  -> https://ai.myc
+  -> host-owned :443 socket (launchd/systemd)
+  -> mycelium-https-forwarder
+  -> mycelium-gateway :8443 (TLS)
   -> configured route (local Bifrost, MCP bridge, Soil launcher, ...)
 ```
+
+The gateway terminates TLS when given `--tls-cert` and `--tls-key`. The privileged
+socket stays with the service manager: `mycelium-https-forwarder` accepts the
+`443` socket and forwards raw bytes to the gateway on loopback `8443`. It has no
+keys and cannot authorize requests, so certificate custody remains with the
+gateway process.
 
 Routes are a deliberately small table, loaded from JSON and hot-reloaded when
 the file changes:
@@ -74,6 +82,45 @@ cargo run -p mycelium-gateway -- --listen 127.0.0.1:8080 \
   --routes crates/mycelium-gateway/examples/routes.json
 ```
 
+### HTTPS ingress
+
+Terminate TLS in the gateway for the stable capability names:
+
+```sh
+mycelium-gateway --listen 127.0.0.1:8443 \
+  --routes "$HOME/.mycelium/gateway/routes.json" \
+  --tls-cert "$HOME/.mycelium/gateway/server.pem" \
+  --tls-key "$HOME/.mycelium/gateway/server-key.pem"
+```
+
+The certificate must cover every `Host` the gateway serves (`ai.myc`,
+`home.myc`, a wildcard such as `*.myc`, or an explicit SAN list). The browser
+trust decision is separate from gateway authorization; trust the issuing CA in
+the browser keychain if the certificate is not publicly trusted.
+
+On macOS, launchd can own `:443` for an unprivileged LaunchAgent. The agent is
+started on the first connection and runs the forwarder as the logged-in user:
+
+```xml
+<key>Sockets</key><dict><key>HTTPS</key><dict>
+  <key>SockNodeName</key><string>127.0.0.1</string>
+  <key>SockServiceName</key><integer>443</integer>
+  <key>SockFamily</key><string>IPv4</string>
+  <key>SockType</key><string>stream</string>
+  <key>SockProtocol</key><string>TCP</string>
+</dict></dict>
+```
+
+Point its `ProgramArguments` at `mycelium-https-forwarder --target
+127.0.0.1:8443`; keep the gateway itself in a separate agent or supervisor on
+`127.0.0.1:8443`. No root process is required, and the gateway does not run with
+privileged socket ownership. The same split works with a systemd socket unit on
+Linux.
+
+Binding `:443` directly in the gateway would require a privileged supervisor and
+is not the intended deployment. Use the socket-activated forwarder so the
+listener and the process holding TLS keys have different privileges.
+
 Use a bearer token for local callers:
 
 ```sh
@@ -95,17 +142,20 @@ layer that owns the upstream secret. Remote discovery candidates use
 
 Requests and responses are proxied, not replayed. Response bodies are streamed,
 so SSE chat completions arrive incrementally. Request bodies are bounded at
-32 MiB. HTTP Upgrade/WebSocket traffic is not proxied yet.
+32 MiB. HTTP Upgrade/WebSocket traffic is not proxied yet. `x-forwarded-proto`
+reports `https` on the TLS listener.
 
-The gateway binds one address and does not terminate TLS. Binding `:80` or
-`:443` requires a privileged supervisor; that belongs to the Spore/Confluence
-ingress layer, not to an application process. Ingress should terminate TLS and
-forward plain HTTP to this loopback listener.
+The gateway binds one address. Binding `:80` or `:443` belongs to the
+Spore/Confluence ingress layer: the service manager owns the privileged socket,
+`mycelium-https-forwarder` moves raw bytes, and the gateway terminates TLS on a
+loopback port. This keeps the privileged listener free of certificates and
+request authorization.
 
 ## Current scope
 
 This slice uses a static JSON route file. Mycelium service records are the
 intended source for that file: the route table is the narrow handoff point, and
 a service-discovery reconciler can regenerate it without granting Spores a
-listening socket. Service-record reconciliation, TLS termination, and
-Palisade-backed caller identity are follow-ups, not implemented here.
+listening socket. Service-record reconciliation and Palisade-backed caller
+identity are follow-ups. TLS termination and the host-owned HTTPS forwarder are
+implemented here.

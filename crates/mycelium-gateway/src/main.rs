@@ -1,4 +1,3 @@
-use mycelium_gateway::server::run;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -14,11 +13,12 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run(
+    runtime.block_on(mycelium_gateway::server::run_with_tls(
         config.listen,
         config.routes,
         config.token_file,
         config.reload_secs,
+        config.tls.map(|tls| (tls.cert, tls.key)),
     ))
 }
 
@@ -28,10 +28,17 @@ struct Config {
     routes: Option<PathBuf>,
     token_file: Option<PathBuf>,
     reload_secs: u64,
+    tls: Option<TlsFiles>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TlsFiles {
+    cert: PathBuf,
+    key: PathBuf,
 }
 
 mod args {
-    use super::Config;
+    use super::{Config, TlsFiles};
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
@@ -40,6 +47,8 @@ mod args {
         let mut routes = None;
         let mut token_file = None;
         let mut reload_secs = 1;
+        let mut tls_cert = None;
+        let mut tls_key = None;
         let mut index = 0;
 
         while index < argv.len() {
@@ -71,6 +80,18 @@ mod args {
                         .parse()
                         .map_err(|error| format!("invalid reload seconds: {error}"))?;
                 }
+                "--tls-cert" => {
+                    index += 1;
+                    tls_cert = Some(PathBuf::from(
+                        argv.get(index).ok_or("--tls-cert requires a path")?,
+                    ));
+                }
+                "--tls-key" => {
+                    index += 1;
+                    tls_key = Some(PathBuf::from(
+                        argv.get(index).ok_or("--tls-key requires a path")?,
+                    ));
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -85,13 +106,57 @@ mod args {
             routes,
             token_file,
             reload_secs,
+            tls: match (tls_cert, tls_key) {
+                (Some(cert), Some(key)) => Some(TlsFiles { cert, key }),
+                (None, None) => None,
+                _ => return Err("--tls-cert and --tls-key must be provided together".into()),
+            },
         })
     }
 
     fn print_usage() {
         println!(
             "mycelium-gateway --listen 127.0.0.1:8080 [--routes gateway.json] \
-             [--token-file TOKEN] [--reload-secs 1]"
+             [--token-file TOKEN] [--reload-secs 1] \
+             [--tls-cert CERT --tls-key KEY]"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(values: &[&str]) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+        args::parse(values.iter().map(|value| value.to_string()).collect())
+    }
+
+    #[test]
+    fn accepts_tls_only_as_a_pair() {
+        let config = parse(&[
+            "--listen",
+            "127.0.0.1:8443",
+            "--tls-cert",
+            "server.pem",
+            "--tls-key",
+            "server-key.pem",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.tls,
+            Some(TlsFiles {
+                cert: PathBuf::from("server.pem"),
+                key: PathBuf::from("server-key.pem")
+            })
+        );
+        assert!(parse(&["--listen", "127.0.0.1:8443", "--tls-cert", "server.pem"]).is_err());
+        assert!(parse(&["--listen", "127.0.0.1:8443", "--tls-key", "server-key.pem"]).is_err());
+    }
+
+    #[test]
+    fn defaults_to_loopback_http() {
+        let config = parse(&[]).unwrap();
+        assert_eq!(config.listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(config.tls, None);
     }
 }
