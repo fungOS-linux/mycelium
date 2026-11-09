@@ -283,7 +283,7 @@ pub(crate) async fn live_prefixes(site: &str) -> Result<Vec<String>, String> {
             "no signed routes or site addresses for `{site}`; pass --reachable to `mycelium dns resolver init`"
         ));
     }
-    if prefixes.len() > 32 {
+    if prefixes.len() > 64 {
         return Err(format!(
             "site `{site}` spans {} scopes; review them and pass --reachable",
             prefixes.len()
@@ -292,12 +292,30 @@ pub(crate) async fn live_prefixes(site: &str) -> Result<Vec<String>, String> {
     Ok(prefixes.into_iter().collect())
 }
 
+/// Container bridges and hypervisor NAT ranges are reported by every host that
+/// runs a workload, and no fleet name is ever published from them. A site that
+/// genuinely uses `172.16/12` passes `--reachable` explicitly instead.
+fn is_container_scope(address: std::net::Ipv4Addr) -> bool {
+    let octets = address.octets();
+    matches!(
+        octets,
+        [172, 16..=31, _, _]
+            | [10, 0, 2, _]
+            | [192, 0, 2, _]
+            | [198, 51, 100, _]
+            | [203, 0, 113, _]
+    )
+}
+
 /// The subnet a peer address sits on. Never wider than a `/24` or `/64`, so
 /// one reported address cannot claim an entire private range.
 fn covering_prefix(address: IpAddr) -> Option<String> {
     match address {
         IpAddr::V4(address)
-            if !address.is_loopback() && !address.is_link_local() && !address.is_unspecified() =>
+            if !address.is_loopback()
+                && !address.is_link_local()
+                && !address.is_unspecified()
+                && !is_container_scope(address) =>
         {
             let network = u32::from(address) & 0xffff_ff00;
             Some(format!("{}/24", std::net::Ipv4Addr::from(network)))

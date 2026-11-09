@@ -104,13 +104,13 @@ impl Settings {
             return Err("invalid refresh/expiry interval".into());
         }
         if self.reachable_prefixes.is_empty()
-            || self.reachable_prefixes.len() > 32
+            || self.reachable_prefixes.len() > 64
             || self
                 .reachable_prefixes
                 .iter()
                 .any(|s| mycelium_core::parse_cidr(s).is_none())
         {
-            return Err("provide 1..32 valid reachable prefixes".into());
+            return Err("provide 1..64 valid reachable prefixes".into());
         }
         Ok(())
     }
