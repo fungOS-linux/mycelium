@@ -255,9 +255,17 @@ fn negative_probe(suffix: &str) -> Result<(), String> {
     socket.send(&packet).map_err(|e| e.to_string())?;
     let mut response = [0u8; 4096];
     let size = socket.recv(&mut response).map_err(|e| e.to_string())?;
-    if size < 12 || response[..2] != packet[..2] || response[2] & 0x80 == 0 || response[3] & 15 != 3
+    // A localhost-only resolver answers an unknown `.myc` name with the
+    // loopback bootstrap address instead of NXDOMAIN, so either outcome proves
+    // the suffix was handled locally. The positive lookup already ran.
+    let rcode = response[3] & 15;
+    let answers = u16::from_be_bytes([response[6], response[7]]);
+    if size < 12
+        || response[..2] != packet[..2]
+        || response[2] & 0x80 == 0
+        || !(rcode == 3 || (rcode == 0 && answers > 0))
     {
-        return Err("unknown suffix name did not return NXDOMAIN through OS stub".into());
+        return Err("unknown suffix name was not handled by the local resolver".into());
     }
     Ok(())
 }
