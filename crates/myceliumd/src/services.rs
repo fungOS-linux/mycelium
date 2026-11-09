@@ -29,20 +29,41 @@ pub fn project(topology: &Topology) -> ServiceCatalog {
     }
     for (node_id, node) in &topology.nodes {
         for service in node.services.values() {
-            let Some((kind, confidence)) = recognize(service) else {
+            let Some(recognized) = recognize(service) else {
                 continue;
             };
+            let kind = recognized.kind;
             // A listener observation identifies software, not its routability.
-            // In particular Kubo RPC is administrative and loopback-only here.
-            let endpoints = node
-                .ips
-                .keys()
-                .filter(|_| kind != "ipfs")
-                .map(|ip| endpoint(&service.transport, ip.to_string(), service.port))
-                .collect();
+            // A loopback bind says the service is reachable from this host only,
+            // so publishing a node address would advertise a route peers cannot
+            // use. The loopback URL is truthful: this host's gateway accepts it,
+            // and every other gateway drops a remote loopback hint.
+            let endpoints = if kind == "ipfs" {
+                BTreeSet::new()
+            } else if service.host_local {
+                BTreeSet::from([endpoint("http", "127.0.0.1".into(), service.port)])
+            } else {
+                node.ips
+                    .keys()
+                    .map(|ip| {
+                        endpoint(
+                            if recognized.http {
+                                "http"
+                            } else {
+                                &service.transport
+                            },
+                            ip.to_string(),
+                            service.port,
+                        )
+                    })
+                    .collect()
+            };
             let mut protocols = BTreeSet::from([service.transport.to_lowercase()]);
             if kind == "mcp" {
                 protocols.insert("json-rpc".into());
+            }
+            if recognized.http {
+                protocols.insert("http".into());
             }
             let mut formats = BTreeSet::new();
             let evidence = evidence(service);
@@ -62,6 +83,9 @@ pub fn project(topology: &Topology) -> ServiceCatalog {
             attributes.insert("service_name".into(), service.name.clone());
             if let Some(product) = &service.product {
                 attributes.insert("product".into(), product.clone());
+            }
+            if service.host_local {
+                attributes.insert("endpoint_scope".into(), "host-local".into());
             }
             if kind == "ipfs" {
                 protocols.insert("ipfs".into());
@@ -106,9 +130,9 @@ pub fn project(topology: &Topology) -> ServiceCatalog {
                         service.transport, service.port, service.name
                     )),
                 },
-                confidence,
+                confidence: recognized.confidence,
                 value: Service {
-                    kind,
+                    kind: kind.to_owned(),
                     endpoints,
                     protocols,
                     formats,
@@ -142,12 +166,51 @@ fn evidence(service: &ServiceRecord) -> String {
     )
 }
 
-fn recognize(service: &ServiceRecord) -> Option<(String, Confidence)> {
+/// What a listener's evidence supports claiming about it.
+struct Recognized {
+    kind: &'static str,
+    confidence: Confidence,
+    /// The kind's contract is an OpenAI-compatible HTTP surface, so the
+    /// projected endpoint is an HTTP origin rather than a bare `tcp` port. Only
+    /// a kind may make that claim; a scan alone proves nothing about protocol.
+    http: bool,
+}
+
+impl Recognized {
+    fn strong(kind: &'static str, http: bool) -> Self {
+        Self {
+            kind,
+            confidence: Confidence::Strong,
+            http,
+        }
+    }
+}
+
+fn recognize(service: &ServiceRecord) -> Option<Recognized> {
     let evidence = evidence(service);
     let tokens = evidence
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect::<BTreeSet<_>>();
+    // Inference servers name themselves in the process or product string. The
+    // gateway routes `ai.myc` to whatever advertises this kind, so recognizing
+    // them here is what makes a UMIE or llama.cpp node reachable without an
+    // application-owner lease.
+    for (kind, http, aliases) in [(
+        "ai",
+        true,
+        &[
+            "umie", "llama", "llamacpp", "ollama", "vllm", "sglang", "tgi", "bifrost",
+        ][..],
+    )] {
+        if aliases.iter().any(|alias| tokens.contains(alias))
+            // "LM Studio" splits into two ordinary words, so the pair is the
+            // evidence rather than either word alone.
+            || (tokens.contains("lm") && tokens.contains("studio"))
+        {
+            return Some(Recognized::strong(kind, http));
+        }
+    }
     for (kind, aliases) in [
         ("isochrone", &["isochrone"][..]),
         ("unibus", &["unibus"][..]),
@@ -160,25 +223,32 @@ fn recognize(service: &ServiceRecord) -> Option<(String, Confidence)> {
         ("ipfs", &["ipfs", "kubo"][..]),
     ] {
         if aliases.iter().any(|alias| tokens.contains(alias)) {
-            return Some((kind.into(), Confidence::Strong));
+            return Some(Recognized::strong(kind, false));
         }
     }
     if !service.transport.eq_ignore_ascii_case("tcp") {
         return None;
     }
     if tokens.contains("adb") {
-        return Some(("adb".into(), Confidence::Strong));
+        return Some(Recognized::strong("adb", false));
     }
     // Standard ports are deliberately only derived confidence: another
     // service can use them, and explicit service evidence always wins above.
-    match service.port {
-        5555 => Some(("adb".into(), Confidence::Derived)),
-        5432 => Some(("postgresql".into(), Confidence::Derived)),
-        3306 => Some(("mysql".into(), Confidence::Derived)),
-        1433 => Some(("sql-server".into(), Confidence::Derived)),
-        6379 | 6380 => Some(("redis".into(), Confidence::Derived)),
-        _ => None,
-    }
+    let (kind, http) = match service.port {
+        5555 => ("adb", false),
+        5432 => ("postgresql", false),
+        3306 => ("mysql", false),
+        1433 => ("sql-server", false),
+        6379 | 6380 => ("redis", false),
+        // Ollama's default port is specific enough to be useful evidence.
+        11434 => ("ai", true),
+        _ => return None,
+    };
+    Some(Recognized {
+        kind,
+        confidence: Confidence::Derived,
+        http,
+    })
 }
 
 #[cfg(test)]
@@ -195,6 +265,7 @@ mod tests {
             product: product.map(str::to_owned),
             state: ServiceState::Up,
             observed_at: 100,
+            host_local: false,
             origin: Origin::new("neo", "fixture").at_site("home"),
         }
     }
@@ -214,7 +285,7 @@ mod tests {
             ("ipfs", None, 4001, "ipfs"),
         ] {
             assert_eq!(
-                recognize(&service(name, product, port)).unwrap().0,
+                recognize(&service(name, product, port)).unwrap().kind,
                 expected
             );
         }
@@ -222,16 +293,105 @@ mod tests {
 
     #[test]
     fn adb_port_is_derived_and_unrelated_ports_are_ignored() {
-        let (_, confidence) = recognize(&service("unknown", None, 5555)).unwrap();
-        assert_eq!(confidence, Confidence::Derived);
+        let recognized = recognize(&service("unknown", None, 5555)).unwrap();
+        assert_eq!(recognized.confidence, Confidence::Derived);
         assert_eq!(
-            recognize(&service("unknown", None, 6379)).unwrap(),
-            ("redis".into(), Confidence::Derived)
+            recognize(&service("unknown", None, 6379)).unwrap().kind,
+            "redis"
         );
         assert!(recognize(&service("ssh", Some("OpenSSH"), 22)).is_none());
         let mut udp_adb = service("adb", Some("adb"), 5353);
         udp_adb.transport = "udp".into();
         assert!(recognize(&udp_adb).is_none());
+    }
+
+    #[test]
+    fn inference_servers_are_recognized_as_ai_endpoints() {
+        for (name, product, port) in [
+            ("umie-serve", None, 8122),
+            ("llama-server", Some("llama.cpp"), 8094),
+            ("python", Some("vLLM engine"), 8000),
+            ("unknown", Some("LM Studio"), 1234),
+            ("bifrost", None, 4000),
+            ("unknown", Some("ollama"), 11500),
+        ] {
+            let recognized = recognize(&service(name, product, port)).unwrap();
+            assert_eq!(recognized.kind, "ai", "{name} {product:?}");
+            assert!(
+                recognized.http,
+                "{name} {product:?} must project an HTTP origin"
+            );
+            assert_eq!(recognized.confidence, Confidence::Strong);
+        }
+        // The default Ollama port is useful but weaker evidence.
+        let derived = recognize(&service("unknown", None, 11434)).unwrap();
+        assert_eq!(derived.kind, "ai");
+        assert_eq!(derived.confidence, Confidence::Derived);
+    }
+
+    #[test]
+    fn a_loopback_inference_server_is_published_for_this_host_only() {
+        let mut node = TopoNode {
+            id: "agora".into(),
+            ..TopoNode::default()
+        };
+        let addr = "192.0.2.10".parse::<IpAddr>().unwrap();
+        node.ips.insert(
+            addr,
+            IpRecord {
+                addr,
+                prefix: None,
+                vlan: None,
+                origins: BTreeSet::new(),
+            },
+        );
+        let mut umie = service("umie-serve", None, 8122);
+        umie.host_local = true;
+        node.services.insert("tcp:8122/umie-serve".into(), umie);
+        let mut topology = Topology::default();
+        topology.nodes.insert(node.id.clone(), node);
+
+        let catalog = project(&topology);
+        let value = &catalog.observations[0].value;
+        assert_eq!(value.kind, "ai");
+        assert_eq!(
+            value.endpoints,
+            BTreeSet::from(["http://127.0.0.1:8122".into()])
+        );
+        assert_eq!(value.attributes["endpoint_scope"], "host-local");
+        assert!(value.protocols.contains("http"));
+    }
+
+    #[test]
+    fn a_mesh_bound_inference_server_is_reachable_by_peers() {
+        let mut node = TopoNode {
+            id: "titan".into(),
+            ..TopoNode::default()
+        };
+        let addr = "192.0.2.20".parse::<IpAddr>().unwrap();
+        node.ips.insert(
+            addr,
+            IpRecord {
+                addr,
+                prefix: None,
+                vlan: None,
+                origins: BTreeSet::new(),
+            },
+        );
+        node.services.insert(
+            "tcp:8122/umie-serve".into(),
+            service("umie-serve", None, 8122),
+        );
+        let mut topology = Topology::default();
+        topology.nodes.insert(node.id.clone(), node);
+
+        let catalog = project(&topology);
+        let value = &catalog.observations[0].value;
+        assert_eq!(
+            value.endpoints,
+            BTreeSet::from(["http://192.0.2.20:8122".into()])
+        );
+        assert!(!value.attributes.contains_key("endpoint_scope"));
     }
 
     #[test]

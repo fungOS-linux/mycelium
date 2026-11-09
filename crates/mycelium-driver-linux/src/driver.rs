@@ -462,6 +462,7 @@ impl Device for LinuxDevice {
                         .or(listener.process),
                     state: ServiceState::Up,
                     observed_at,
+                    host_local: listener.host_local,
                     origin: origin(if kubo_version.is_some() {
                         "kubo-loopback-version"
                     } else {

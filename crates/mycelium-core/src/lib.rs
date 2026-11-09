@@ -67,9 +67,10 @@ pub use reconcile::{
 };
 pub use spec::{CapResult, CapSpec, MutationVerification, ParamSpec, ParamType};
 pub use topology::{
-    ipv4_in_cidr, Conflict, DiscoveredDevice, DiscoveredService, IpRecord, LeaseRecord, Link,
-    LinkDuplex, LinkMedium, LinkState, MacAddress, MeshControlPlane, MeshCoordinator, MeshProtocol,
-    NodeAnnotation, Observation, Origin, OverlayPeerRecord, PortRef, Segment, SegmentKind,
-    ServiceAdvertisement, ServiceRecord, ServiceState, TopoNode, Topology, TopologyReport, VlanId,
+    ipv4_in_cidr, is_host_local_listener, Conflict, DiscoveredDevice, DiscoveredService, IpRecord,
+    LeaseRecord, Link, LinkDuplex, LinkMedium, LinkState, MacAddress, MeshControlPlane,
+    MeshCoordinator, MeshProtocol, NodeAnnotation, Observation, Origin, OverlayPeerRecord, PortRef,
+    Segment, SegmentKind, ServiceAdvertisement, ServiceRecord, ServiceState, TopoNode, Topology,
+    TopologyReport, VlanId,
 };
 pub use value::{IntoValue, Params, Value};

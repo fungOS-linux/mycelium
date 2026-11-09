@@ -138,6 +138,18 @@ pub enum ServiceState {
     Unknown,
 }
 
+/// Whether a listen address serves this host only.
+///
+/// A wildcard (`*`, `0.0.0.0`, `::`) or a specific interface address is bound
+/// beyond loopback, so a peer may reach it. `127.0.0.0/8` and `::1` are not.
+pub fn is_host_local_listener(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(address) => address.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceRecord {
     pub name: String,
@@ -146,6 +158,12 @@ pub struct ServiceRecord {
     pub product: Option<String>,
     pub state: ServiceState,
     pub observed_at: u64,
+    /// The listener is bound to loopback, so the service exists for this host
+    /// only. Projection must not invent a mesh address for it; peers would
+    /// advertise a route they cannot reach. Defaults to `false` so records from
+    /// older peers keep their previous meaning.
+    #[serde(default)]
+    pub host_local: bool,
     pub origin: Origin,
 }
 
@@ -871,6 +889,7 @@ impl Topology {
                         product: None,
                         state: ServiceState::Up,
                         observed_at: device.observed_at,
+                        host_local: false,
                         origin: origin.clone(),
                     };
                     node.services.insert(
@@ -1496,6 +1515,40 @@ mod tests {
     }
 
     #[test]
+    fn host_local_listeners_are_told_apart_by_bind_address() {
+        for (host, expected) in [
+            ("127.0.0.1", true),
+            ("127.0.1.5", true),
+            ("[::1]", true),
+            ("::1", true),
+            ("0.0.0.0", false),
+            ("*", false),
+            ("[::]", false),
+            ("192.168.1.9", false),
+            ("fe80::1", false),
+        ] {
+            assert_eq!(is_host_local_listener(host), expected, "{host}");
+        }
+    }
+
+    #[test]
+    fn a_service_record_from_an_older_peer_is_not_host_local() {
+        // `host_local` was added after the first gossip schema; an older peer
+        // omits it, and its listeners must keep their previous meaning.
+        let record: ServiceRecord = serde_json::from_value(serde_json::json!({
+            "name": "frigate",
+            "transport": "tcp",
+            "port": 8971,
+            "product": "Frigate",
+            "state": "up",
+            "observed_at": 1,
+            "origin": {"device": "observer", "source": "probe"}
+        }))
+        .unwrap();
+        assert!(!record.host_local);
+    }
+
+    #[test]
     fn service_merges_into_node_by_ip() {
         let mut topo = Topology::empty();
         topo.observe_all([Observation::Neighbor {
@@ -1516,6 +1569,7 @@ mod tests {
                 product: Some("Frigate".into()),
                 state: ServiceState::Up,
                 observed_at: 1,
+                host_local: false,
                 origin: Origin::new("observer", "probe"),
             },
         }]);

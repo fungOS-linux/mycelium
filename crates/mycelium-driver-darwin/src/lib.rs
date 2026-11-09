@@ -230,6 +230,7 @@ impl Device for DarwinDevice {
                     product: listener.process,
                     state: ServiceState::Up,
                     observed_at,
+                    host_local: listener.host_local,
                     origin: origin("lsof-listen"),
                 },
             });

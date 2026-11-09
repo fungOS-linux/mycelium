@@ -25,6 +25,8 @@ pub struct Listener {
     pub transport: String,
     pub port: u16,
     pub process: Option<String>,
+    /// The listener is bound to loopback, so only this host can reach it.
+    pub host_local: bool,
 }
 
 pub fn parse_interfaces(text: &str) -> Vec<Interface> {
@@ -164,18 +166,17 @@ pub fn parse_listeners(text: &str) -> Vec<Listener> {
                 .iter()
                 .position(|word| *word == "TCP" || *word == "UDP")?;
             let transport = words[transport_index].to_ascii_lowercase();
-            let port = words
-                .last()?
-                .trim_end_matches("(LISTEN)")
-                .trim()
-                .rsplit(':')
-                .next()?
-                .parse()
-                .ok()?;
+            // lsof prints the bound socket address here; keep it so a
+            // loopback-only listener is not advertised as a mesh endpoint.
+            let (host, port) = words.iter().rev().find_map(|word| {
+                let (host, port) = word.trim_end_matches("(LISTEN)").rsplit_once(':')?;
+                Some((host.to_owned(), port.parse::<u16>().ok()?))
+            })?;
             Some(Listener {
                 transport,
                 port,
                 process: words.first().map(|value| (*value).to_owned()),
+                host_local: mycelium_core::is_host_local_listener(&host),
             })
         })
         .collect();

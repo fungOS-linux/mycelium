@@ -402,6 +402,7 @@ impl Device for RedfishDevice {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        host_local: false,
                         origin: Origin::new(self.meta.id.to_string(), "redfish"),
                     },
                 },

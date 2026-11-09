@@ -34,6 +34,8 @@ pub struct Listener {
     pub transport: String,
     pub port: u16,
     pub process: Option<String>,
+    /// The listener is bound to loopback, so only this host can reach it.
+    pub host_local: bool,
 }
 
 pub fn parse_interfaces(links: &str, addresses: &str) -> Vec<Interface> {
@@ -173,7 +175,12 @@ pub fn parse_listeners(text: &str) -> Vec<Listener> {
         .filter_map(|line| {
             let fields = line.split_whitespace().collect::<Vec<_>>();
             let transport = fields.first()?.trim_end_matches('6').to_owned();
-            let port = fields.get(4)?.rsplit(':').next()?.parse().ok()?;
+            // The local address decides whether a peer could reach the
+            // service; dropping it made loopback-only listeners look bound to
+            // the mesh.
+            let (host, port) = fields.get(4)?.rsplit_once(':')?;
+            let port = port.parse().ok()?;
+            let host_local = mycelium_core::is_host_local_listener(host);
             let process = line
                 .split("users:((\"")
                 .nth(1)
@@ -183,6 +190,7 @@ pub fn parse_listeners(text: &str) -> Vec<Listener> {
                 transport,
                 port,
                 process,
+                host_local,
             })
         })
         .collect::<Vec<_>>();
@@ -232,5 +240,21 @@ mod tests {
         assert_eq!(rows[0].process.as_deref(), Some("frigate"));
         assert_eq!(rows[0].port, 8971);
         assert_eq!(rows[1].transport, "udp");
+        // Bound to every interface, so a peer may reach it.
+        assert!(!rows[0].host_local);
+    }
+
+    #[test]
+    fn loopback_listeners_are_marked_host_local() {
+        let rows = parse_listeners(
+            "tcp LISTEN 0 4096 127.0.0.1:8122 0.0.0.0:* users:((\"umie-serve\",pid=9,fd=3))\ntcp LISTEN 0 4096 [::1]:11434 [::]:* users:((\"ollama\",pid=8,fd=3))\ntcp LISTEN 0 4096 192.168.1.9:8443 0.0.0.0:* users:((\"caddy\",pid=7,fd=3))",
+        );
+        let host_local = rows
+            .iter()
+            .map(|row| (row.port, row.host_local))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(host_local[&8122], true);
+        assert_eq!(host_local[&11434], true);
+        assert_eq!(host_local[&8443], false);
     }
 }

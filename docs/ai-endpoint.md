@@ -58,18 +58,35 @@ backend:
 }
 ```
 
-That is enough for `ai.myc` on that host. For **other** fleet nodes to go direct
-to it, the owner must also publish an `ai` lease in
-`$MYCELIUM_HOME/application-services.json`, following
-[application-owned service leases](application-services.md). Two constraints:
+That is enough for `ai.myc` on that host. For **other** fleet nodes, no extra
+publishing step is needed — the normal scan produces the lease:
 
-- the endpoint must be a mesh-reachable address from the node's topology, not
-  `127.0.0.1` — the gateway deliberately drops remote loopback hints;
-- the lease expires within 300 seconds, so whatever publishes it must refresh it.
+1. `ss -H -lnt` / `lsof` report the listener and its bound address;
+2. the recognizer maps AI software by process or product name (`umie`,
+   `llama-server`, `llama.cpp`, `ollama`, `vLLM`, `SGLang`, `TGI`, `LM Studio`,
+   `bifrost`), or by Ollama's default port (derived confidence);
+3. projection publishes an `ai` observation with an **HTTP** origin — the scheme
+   is stated because the kind's contract is an OpenAI-compatible HTTP surface, not
+   because a port proves anything;
+4. every gateway's `service_kind: "ai"` discovery turns that into a candidate,
+   ordered after this machine and before `ai.fpl.dev`.
 
-Publishing is not automated yet; it is tracked as `mycelium-6us5`. Until then a
-non-owner machine reaches that UMIE through the public edge, which already fronts
-the fleet (`yggdrasil/agora-one`, `yggdrasil/dgx-spark-3539`).
+One deployment rule follows from the second step: **bind the server beyond
+loopback** (`0.0.0.0:8122` or the mesh address). A loopback-only listener is
+published as `http://127.0.0.1:<port>` with `endpoint_scope=host-local`: the
+owning host's gateway accepts it, every peer drops it as a remote loopback hint,
+and nothing is advertised that a peer cannot reach. Scanning used to discard the
+bind address, which is why an AI listener could never be discovered before.
+
+For a service the scan cannot identify, the application-owner lease in
+`$MYCELIUM_HOME/application-services.json` remains the general escape hatch
+([application-owned service leases](application-services.md)): it expires within
+300 seconds, so whatever publishes it must refresh it.
+
+Mesh `ai` candidates are only tried after this machine's backends fail, so a peer
+cannot take over traffic that a local backend can serve. When it is used, the
+request goes to that peer, so the usual gossip trust applies: only advertise and
+accept leases from nodes you would route prompts to.
 
 ## Token accounting
 

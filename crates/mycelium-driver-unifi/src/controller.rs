@@ -319,6 +319,7 @@ impl Device for ControllerDevice {
                     .map(|version| format!("UniFi Network {version}")),
                 state: ServiceState::Up,
                 observed_at: unix_time(),
+                host_local: false,
                 origin: Origin::new(self.meta.id.to_string(), "controller-api"),
             },
         });
