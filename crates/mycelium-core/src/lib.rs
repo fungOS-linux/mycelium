@@ -22,6 +22,7 @@ pub mod error;
 pub mod exec;
 pub mod inspection;
 pub mod inventory;
+pub mod naming;
 pub mod primitives;
 pub mod reconcile;
 pub mod spec;
@@ -57,6 +58,7 @@ pub use inspection::{
     InspectionPlacement, InspectionPlan, ObservationMethod, INSPECTION_SCHEMA_VERSION,
 };
 pub use inventory::{result_from_outcome, CapabilityInfo, Device, Inventory, InvokeResult};
+pub use naming::{fleet_name, is_myc_name, sanitize_label};
 pub use primitives::{
     host_target, optional_str, parse_cidr, required_str, stable_slug, HostTarget,
 };

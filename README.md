@@ -326,7 +326,9 @@ as a listener, a dialer, or both:
 
 ```sh
 export MYCELIUM_PEER_LISTEN=0.0.0.0:7443       # optional
-export MYCELIUM_PEERS=pris.example:7443,neo.example:7443  # optional seeds
+# Optional seeds. Prefix a seed with the name the peer's certificate carries so
+# the seed survives the peer changing networks: name@address:port.
+export MYCELIUM_PEERS=pris.lab.myc@pris.example:7443,neo.example:7443
 export MYCELIUM_PEER_CA=/etc/mycelium/ca.pem
 export MYCELIUM_PEER_CERT=/etc/mycelium/node.pem
 export MYCELIUM_PEER_KEY=/etc/mycelium/node-key.pem
@@ -339,8 +341,11 @@ mycelium peers
 ## Peer enrollment and updates
 
 Enrollment uses one locally held CA to issue a distinct mutual-TLS identity for
-each peer. Bundles contain no CA signing key. Installation stages the peer and
-its native user-service definition, but deliberately does not start it:
+each peer. Every certificate carries the peer's stable fleet name,
+`<name>.<site>.myc`, alongside the addresses known at issuance; peers verify
+that name, so gossip keeps working after a node moves networks. Bundles contain
+no CA signing key. Installation stages the peer and its native user-service
+definition, but deliberately does not start it:
 
 ```sh
 mycelium enroll init --write

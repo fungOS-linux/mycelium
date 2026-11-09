@@ -1206,15 +1206,16 @@ impl Mesh {
     }
 
     async fn dial(&self, seed: &str, connector: TlsConnector) -> Result<(), AnyError> {
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(seed))
+        let (expected_name, address) = split_seed(seed)?;
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
             .await
             .map_err(|_| "TCP connection timed out")??;
         let observed_address = tcp.peer_addr().ok().map(|address| address.ip());
-        let host = seed
+        let host = address
             .rsplit_once(':')
-            .map(|(host, _)| host)
-            .ok_or("seed must be host:port")?;
-        let name = server_name(host.trim_matches(&['[', ']'][..]))?;
+            .map_or(address, |(host, _)| host)
+            .trim_matches(&['[', ']'][..]);
+        let name = server_name(expected_name.unwrap_or(host))?;
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(name, tcp))
             .await
             .map_err(|_| "TLS handshake timed out")??;
@@ -2332,6 +2333,22 @@ fn server_name(name: &str) -> Result<ServerName<'static>, AnyError> {
     }
 }
 
+/// Split a peer seed into its optional expected certificate name and its
+/// `host:port` address.
+///
+/// A stable fleet name lets a seed survive a node changing networks:
+/// `mac-studio.wagar-house.myc@192.168.2.3:7443` is verified against the
+/// certificate name, so the address is only a rendezvous hint.
+fn split_seed(seed: &str) -> Result<(Option<&str>, &str), AnyError> {
+    match seed.split_once('@') {
+        Some((name, address)) if name.is_empty() || address.is_empty() => {
+            Err("seed must be name@host:port".into())
+        }
+        Some((name, address)) => Ok((Some(name), address)),
+        None => Ok((None, seed)),
+    }
+}
+
 fn platform() -> Platform {
     #[cfg(target_os = "macos")]
     return Platform::Darwin;
@@ -2632,6 +2649,20 @@ fn parse_darwin_swap(text: &str) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_seeds_split_into_an_optional_certificate_name() {
+        assert_eq!(
+            split_seed("mac-studio.wagar-house.myc@192.168.2.3:7443").unwrap(),
+            (Some("mac-studio.wagar-house.myc"), "192.168.2.3:7443")
+        );
+        assert_eq!(
+            split_seed("100.80.85.86:7443").unwrap(),
+            (None, "100.80.85.86:7443")
+        );
+        assert!(split_seed("@100.80.85.86:7443").is_err());
+        assert!(split_seed("neo@").is_err());
+    }
 
     fn usage_document(generated_at: u64, schema_version: u16) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({

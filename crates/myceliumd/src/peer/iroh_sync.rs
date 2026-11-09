@@ -227,8 +227,11 @@ pub(super) async fn start(mesh: Arc<Mesh>, tls: &TlsSettings) -> Result<(), AnyE
     }
     let config: SyncConfig = serde_json::from_slice(&read_bounded(&path)?)?;
     config.validate()?;
-    let server_name = std::env::var("MYCELIUM_IROH_SERVER_NAME")
-        .map_err(|_| "MYCELIUM_IROH_SERVER_NAME must match this peer's certificate SAN")?;
+    let server_name = std::env::var("MYCELIUM_IROH_SERVER_NAME").map_err(|_| {
+        "MYCELIUM_IROH_SERVER_NAME is unset: it must name this node's certificate SAN (for \
+         example mac-studio.wagar-house.myc). Run 'mycelium setup --repair' to recover it from \
+         the certificate, then restart myceliumd"
+    })?;
     ServerName::try_from(server_name.clone())?;
     let port: u16 = match std::env::var("MYCELIUM_IROH_PORT") {
         Ok(value) => value.parse()?,

@@ -65,7 +65,7 @@ pub fn run(args: &[String]) -> Result<Vec<String>, String> {
                     serde_json::from_slice(&read(&path)?).map_err(|e| e.to_string())?;
                 config.validate()?;
                 return Ok(vec![format!(
-                    "Iroh already enabled (public relays {}, {} sync seed(s)); no changes written. If the daemon's rendezvous is stale, restart myceliumd and check MYCELIUM_IROH_SERVER_NAME in its environment",
+                    "Iroh already enabled (public relays {}, {} sync seed(s)); no changes written. If the daemon's rendezvous is stale, run 'mycelium setup --repair' so MYCELIUM_IROH_SERVER_NAME is recorded from the certificate, then restart myceliumd",
                     if config.public_relays { "on" } else { "off" },
                     config.seeds.len()
                 )]);
@@ -79,7 +79,7 @@ pub fn run(args: &[String]) -> Result<Vec<String>, String> {
             file.write_all(b"{\"public_relays\":false,\"seeds\":[]}\n")
                 .map_err(|e| e.to_string())?;
             file.sync_all().map_err(|e| e.to_string())?;
-            Ok(vec!["Iroh enabled; set MYCELIUM_IROH_SERVER_NAME to your certificate SAN and restart myceliumd".into()])
+            Ok(vec!["Iroh enabled; run 'mycelium setup --repair' so MYCELIUM_IROH_SERVER_NAME is recorded from the certificate, then restart myceliumd".into()])
         }
         Some("join") if args.len() == 3 && args[2] == "--write" => {
             let seed: SyncRendezvous =

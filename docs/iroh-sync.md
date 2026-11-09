@@ -11,9 +11,10 @@ cargo install --path crates/mycelium-cli --features iroh-sync --locked
 ```
 
 On each already-enrolled peer, retain the existing `MYCELIUM_PEER_CA`,
-`MYCELIUM_PEER_CERT`, and `MYCELIUM_PEER_KEY` settings. Set
-`MYCELIUM_IROH_SERVER_NAME` in its daemon environment to a name/IP present
-in **that peer's certificate SAN**, then:
+`MYCELIUM_PEER_CERT`, and `MYCELIUM_PEER_KEY` settings. The peer's stable name
+(`<name>.<site>.myc`) is written to `MYCELIUM_IROH_SERVER_NAME` at enrollment and
+must be a name present in **that peer's certificate SAN**; installs that predate
+fleet names recover it with `mycelium setup --repair`. Then:
 
 The runtime uses UDP port 7444 for stable saved connection hints across restart;
 `MYCELIUM_IROH_PORT` overrides it (zero/invalid values fail). IPv6 is used when

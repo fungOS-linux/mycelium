@@ -50,9 +50,13 @@ pub(crate) fn sign_csr(
     ca: &Path,
     csr_pem: &str,
     expected_name: &str,
+    site: &str,
     work_dir: &Path,
 ) -> Result<String, String> {
     validate_label("name", expected_name).map_err(|error| error.to_string())?;
+    validate_label("site", site).map_err(|error| error.to_string())?;
+    let fleet = mycelium_core::fleet_name(expected_name, site)
+        .ok_or("name and site do not produce a usable fleet name")?;
     if !ca.join("ca-key.pem").is_file() || !ca.join("ca.pem").is_file() {
         return Err("enrollment CA is missing ca.pem or ca-key.pem".into());
     }
@@ -65,8 +69,10 @@ pub(crate) fn sign_csr(
     std::fs::write(&csr, csr_pem).map_err(|error| format!("stage peer CSR: {error}"))?;
     std::fs::write(
         &extensions,
-        format!("[mycelium_peer]\nextendedKeyUsage=serverAuth,clientAuth\n{}\n",
-            subject_alt_name(&std::collections::BTreeSet::from([expected_name]))),
+        format!(
+            "[mycelium_peer]\nextendedKeyUsage=serverAuth,clientAuth\n{}\n",
+            subject_alt_name(&std::collections::BTreeSet::from([expected_name]), &fleet)
+        ),
     )
     .map_err(|error| format!("stage peer certificate extensions: {error}"))?;
     openssl_string(&[
@@ -137,7 +143,12 @@ pub fn issue(ca: &Path, request: Issue<'_>) -> Result<Vec<String>, ClientError> 
     let addresses = std::iter::once(request.address)
         .chain(request.additional_addresses.iter().map(String::as_str))
         .collect::<std::collections::BTreeSet<_>>();
-    let san = subject_alt_name(&addresses);
+    // The certificate carries a stable name as well as the addresses known at
+    // issuance. Addresses change when a node moves networks; the name is what a
+    // peer verifies, so gossip survives a new LAN.
+    let fleet = mycelium_core::fleet_name(request.name, request.site)
+        .ok_or_else(|| usage("name and site do not produce a usable fleet name"))?;
+    let san = subject_alt_name(&addresses, &fleet);
     openssl(&["genpkey", "-algorithm", "ED25519", "-out", &display(&key)?])?;
     openssl(&[
         "req",
@@ -181,8 +192,8 @@ pub fn issue(ca: &Path, request: Issue<'_>) -> Result<Vec<String>, ClientError> 
     std::fs::write(
         request.output.join("node.env"),
         format!(
-            "MYCELIUM_SITE={}\nMYCELIUM_PEER_LISTEN=0.0.0.0:7443\nMYCELIUM_PEERS={}\nMYCELIUM_PEER_CA=pki/ca.pem\nMYCELIUM_PEER_CERT=pki/node.pem\nMYCELIUM_PEER_KEY=pki/node-key.pem\nMYCELIUM_AUTHORITY_KEYS={}\nMYCELIUM_RELEASE_KEYS={}\nMYCELIUM_ACCESS_KEYS={}\nMYCELIUM_UPDATE_CHANNEL=canary\n",
-            request.site, peer_list, authority_keys, release_keys, access_keys
+            "MYCELIUM_SITE={}\nMYCELIUM_PEER_LISTEN=0.0.0.0:7443\nMYCELIUM_PEERS={}\nMYCELIUM_IROH_SERVER_NAME={}\nMYCELIUM_PEER_CA=pki/ca.pem\nMYCELIUM_PEER_CERT=pki/node.pem\nMYCELIUM_PEER_KEY=pki/node-key.pem\nMYCELIUM_AUTHORITY_KEYS={}\nMYCELIUM_RELEASE_KEYS={}\nMYCELIUM_ACCESS_KEYS={}\nMYCELIUM_UPDATE_CHANNEL=canary\n",
+            request.site, peer_list, fleet, authority_keys, release_keys, access_keys
         ),
     )
     .map_err(ClientError::Io)?;
@@ -191,6 +202,7 @@ pub fn issue(ca: &Path, request: Issue<'_>) -> Result<Vec<String>, ClientError> 
         serde_json::to_vec_pretty(&serde_json::json!({
             "name": request.name,
             "site": request.site,
+            "fleet_name": fleet,
             "address": request.address,
             "addresses": addresses,
             "target": request.target,
@@ -209,6 +221,7 @@ pub fn issue(ca: &Path, request: Issue<'_>) -> Result<Vec<String>, ClientError> 
             &authority_keys,
             &release_keys,
             &access_keys,
+            &fleet,
         ),
     )
     .map_err(ClientError::Io)?;
@@ -280,6 +293,11 @@ pub fn install(bundle: &Path, home: &Path) -> Result<Vec<String>, ClientError> {
     let release_keys = std::env::var("MYCELIUM_RELEASE_KEYS").unwrap_or_default();
     let access_keys = std::env::var("MYCELIUM_ACCESS_KEYS").unwrap_or_default();
     let authority_keys = std::env::var("MYCELIUM_AUTHORITY_KEYS").unwrap_or_default();
+    // The certificate is the source of truth: only a name it carries can be
+    // verified by peers. Bundles issued before fleet names existed have none.
+    let fleet_name = fleet_name_from_names(
+        certificate_dns_names(&pki.join("node.pem")).map_err(|error| usage(&error))?,
+    );
     let peers = peers.join(",");
     std::fs::write(
         home.join("node.env"),
@@ -290,6 +308,7 @@ pub fn install(bundle: &Path, home: &Path) -> Result<Vec<String>, ClientError> {
             &authority_keys,
             &release_keys,
             &access_keys,
+            fleet_name.as_deref(),
         )?,
     )
     .map_err(ClientError::Io)?;
@@ -308,7 +327,7 @@ pub fn install(bundle: &Path, home: &Path) -> Result<Vec<String>, ClientError> {
                 &authority_keys,
                 &release_keys,
                 &access_keys,
-                None,
+                fleet_name.as_deref(),
             )?,
         )
         .map_err(ClientError::Io)?;
@@ -373,16 +392,16 @@ pub(crate) fn install_peer_material(
     let peers = peers.join(",");
     std::fs::write(
         home.join("node.env"),
-        format!("{}{}", resolved_env(
+        resolved_env(
             home,
             site,
             &peers,
             &authority_keys,
             &release_keys,
             &access_keys,
+            iroh_server_name,
         )
-        .map_err(|error| error.to_string())?, iroh_server_name
-            .map(|name| format!("MYCELIUM_IROH_SERVER_NAME={name}\n")).unwrap_or_default()),
+        .map_err(|error| error.to_string())?,
     )
     .map_err(|error| format!("write node environment: {error}"))?;
     if packaged { owner_only(&home.join("node.env")).map_err(|error| error.to_string())?; }
@@ -441,6 +460,23 @@ pub(crate) fn repair_peer_service(
         environment = replace_environment_value(&environment, "MYCELIUM_SITE", site)?;
         std::fs::write(home.join("node.env"), &environment)
             .map_err(|error| format!("update node site: {error}"))?;
+    }
+    // Older installs recorded only addresses. Recover the stable name from the
+    // certificate so a repaired node keeps a `.myc` identity across networks.
+    let certificate = home.join("pki/node.pem");
+    if certificate.is_file() {
+        let names = certificate_dns_names(&certificate)
+            .map_err(|error| format!("read node certificate names: {error}"))?;
+        if let Some(name) = fleet_name_from_names(names) {
+            let recorded = environment
+                .lines()
+                .find_map(|line| line.strip_prefix("MYCELIUM_IROH_SERVER_NAME="));
+            if recorded != Some(name.as_str()) {
+                environment = record_fleet_name(&environment, &name)?;
+                std::fs::write(home.join("node.env"), &environment)
+                    .map_err(|error| format!("record node name: {error}"))?;
+            }
+        }
     }
     let setting = |name: &str| -> Result<&str, String> {
         environment
@@ -645,9 +681,14 @@ fn resolved_env(
     authority_keys: &str,
     release_keys: &str,
     access_keys: &str,
+    iroh_server_name: Option<&str>,
 ) -> Result<String, ClientError> {
     let home = display(home)?;
-    Ok(format!("MYCELIUM_HOME={home}\nMYCELIUM_SITE={site}\nMYCELIUM_PEER_LISTEN=0.0.0.0:7443\nMYCELIUM_PEERS={peers}\nMYCELIUM_PEER_CA={home}/pki/ca.pem\nMYCELIUM_PEER_CERT={home}/pki/node.pem\nMYCELIUM_PEER_KEY={home}/pki/node-key.pem\nMYCELIUM_AUTHORITY_KEYS={authority_keys}\nMYCELIUM_RELEASE_KEYS={release_keys}\nMYCELIUM_ACCESS_KEYS={access_keys}\nMYCELIUM_UPDATE_CHANNEL=canary\n"))
+    let mut environment = format!("MYCELIUM_HOME={home}\nMYCELIUM_SITE={site}\nMYCELIUM_PEER_LISTEN=0.0.0.0:7443\nMYCELIUM_PEERS={peers}\nMYCELIUM_PEER_CA={home}/pki/ca.pem\nMYCELIUM_PEER_CERT={home}/pki/node.pem\nMYCELIUM_PEER_KEY={home}/pki/node-key.pem\nMYCELIUM_AUTHORITY_KEYS={authority_keys}\nMYCELIUM_RELEASE_KEYS={release_keys}\nMYCELIUM_ACCESS_KEYS={access_keys}\nMYCELIUM_UPDATE_CHANNEL=canary\n");
+    if let Some(name) = iroh_server_name {
+        environment.push_str(&format!("MYCELIUM_IROH_SERVER_NAME={name}\n"));
+    }
+    Ok(environment)
 }
 
 fn resolved_systemd(home: &Path) -> Result<String, ClientError> {
@@ -685,6 +726,13 @@ fn validate_peer(peer: &str) -> Result<(), ClientError> {
         || peer.bytes().any(|b| b.is_ascii_whitespace() || b == b',')
     {
         return Err(usage("peer address contains unsafe characters"));
+    }
+    // `name@address:port` names the certificate a peer must present, so a seed
+    // keeps working when the address changes.
+    if let Some((name, address)) = peer.split_once('@') {
+        if name.is_empty() || address.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(usage("peer seed must be name@address:port"));
+        }
     }
     Ok(())
 }
@@ -726,9 +774,10 @@ fn launchd_plist(
     authority_keys: &str,
     release_keys: &str,
     access_keys: &str,
+    fleet_name: &str,
 ) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>dev.fpl.mycelium</string>\n<key>ProgramArguments</key><array><string>MYCELIUM_HOME/bin/mycelium</string><string>_serve</string></array>\n<key>EnvironmentVariables</key><dict>\n<key>MYCELIUM_HOME</key><string>MYCELIUM_HOME</string>\n<key>MYCELIUM_SITE</key><string>{site}</string>\n<key>MYCELIUM_PEER_LISTEN</key><string>0.0.0.0:7443</string>\n<key>MYCELIUM_PEERS</key><string>{peers}</string>\n<key>MYCELIUM_PEER_CA</key><string>MYCELIUM_HOME/pki/ca.pem</string>\n<key>MYCELIUM_PEER_CERT</key><string>MYCELIUM_HOME/pki/node.pem</string>\n<key>MYCELIUM_PEER_KEY</key><string>MYCELIUM_HOME/pki/node-key.pem</string>\n<key>MYCELIUM_AUTHORITY_KEYS</key><string>{authority_keys}</string>\n<key>MYCELIUM_RELEASE_KEYS</key><string>{release_keys}</string>\n<key>MYCELIUM_ACCESS_KEYS</key><string>{access_keys}</string>\n<key>MYCELIUM_UPDATE_CHANNEL</key><string>canary</string>\n</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>MYCELIUM_HOME/daemon.log</string>\n<key>StandardErrorPath</key><string>MYCELIUM_HOME/daemon.log</string>\n</dict></plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>dev.fpl.mycelium</string>\n<key>ProgramArguments</key><array><string>MYCELIUM_HOME/bin/mycelium</string><string>_serve</string></array>\n<key>EnvironmentVariables</key><dict>\n<key>MYCELIUM_HOME</key><string>MYCELIUM_HOME</string>\n<key>MYCELIUM_SITE</key><string>{site}</string>\n<key>MYCELIUM_PEER_LISTEN</key><string>0.0.0.0:7443</string>\n<key>MYCELIUM_PEERS</key><string>{peers}</string>\n<key>MYCELIUM_PEER_CA</key><string>MYCELIUM_HOME/pki/ca.pem</string>\n<key>MYCELIUM_PEER_CERT</key><string>MYCELIUM_HOME/pki/node.pem</string>\n<key>MYCELIUM_PEER_KEY</key><string>MYCELIUM_HOME/pki/node-key.pem</string>\n<key>MYCELIUM_AUTHORITY_KEYS</key><string>{authority_keys}</string>\n<key>MYCELIUM_RELEASE_KEYS</key><string>{release_keys}</string>\n<key>MYCELIUM_ACCESS_KEYS</key><string>{access_keys}</string>\n<key>MYCELIUM_IROH_SERVER_NAME</key><string>{fleet_name}</string>\n<key>MYCELIUM_UPDATE_CHANNEL</key><string>canary</string>\n</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>MYCELIUM_HOME/daemon.log</string>\n<key>StandardErrorPath</key><string>MYCELIUM_HOME/daemon.log</string>\n</dict></plist>\n"
     )
 }
 
@@ -790,21 +839,57 @@ fn validate_address(value: &str) -> Result<(), ClientError> {
     Ok(())
 }
 
-fn subject_alt_name(addresses: &std::collections::BTreeSet<&str>) -> String {
-    format!(
-        "subjectAltName={}",
+/// `subjectAltName` covering the node's stable name plus every address known at
+/// issuance. The fleet name comes first and is not repeated when it is also
+/// listed as an address.
+fn subject_alt_name(addresses: &std::collections::BTreeSet<&str>, fleet_name: &str) -> String {
+    let mut names = vec![format!("DNS:{fleet_name}")];
+    names.extend(
         addresses
             .iter()
+            .filter(|address| **address != fleet_name)
             .map(|address| {
                 if address.parse::<std::net::IpAddr>().is_ok() {
                     format!("IP:{address}")
                 } else {
                     format!("DNS:{address}")
                 }
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    )
+            }),
+    );
+    format!("subjectAltName={}", names.join(","))
+}
+
+/// DNS names in a certificate's subjectAltName. Used to recover the stable node
+/// identity when only addresses were recorded.
+pub(crate) fn certificate_dns_names(path: &Path) -> Result<Vec<String>, String> {
+    let path = path.to_str().ok_or("certificate path is not UTF-8")?;
+    let text = openssl_output(&["x509", "-in", path, "-noout", "-ext", "subjectAltName"])?;
+    Ok(dns_names_from_extension_text(&text))
+}
+
+/// The stable name a certificate carries, if it carries one.
+fn fleet_name_from_names(names: impl IntoIterator<Item = String>) -> Option<String> {
+    names.into_iter().find(|name| mycelium_core::is_myc_name(name))
+}
+
+/// Record the certificate's stable name, replacing an older IP or name.
+fn record_fleet_name(environment: &str, name: &str) -> Result<String, String> {
+    if environment
+        .lines()
+        .any(|line| line.starts_with("MYCELIUM_IROH_SERVER_NAME="))
+    {
+        replace_environment_value(environment, "MYCELIUM_IROH_SERVER_NAME", name)
+    } else {
+        Ok(format!("{environment}MYCELIUM_IROH_SERVER_NAME={name}\n"))
+    }
+}
+
+fn dns_names_from_extension_text(text: &str) -> Vec<String> {
+    text.split([',', '\n'])
+        .filter_map(|entry| entry.trim().strip_prefix("DNS:"))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 fn display(path: impl AsRef<Path>) -> Result<String, ClientError> {
@@ -853,9 +938,49 @@ mod tests {
             "fpl-beachhead-1.internal",
         ]);
         assert_eq!(
-            subject_alt_name(&addresses),
-            "subjectAltName=IP:10.118.0.11,IP:134.209.208.195,DNS:fpl-beachhead-1.internal"
+            subject_alt_name(&addresses, "fpl-beachhead-1.beachhead.myc"),
+            "subjectAltName=DNS:fpl-beachhead-1.beachhead.myc,IP:10.118.0.11,IP:134.209.208.195,DNS:fpl-beachhead-1.internal"
         );
+    }
+
+    #[test]
+    fn enrollment_certificate_names_are_read_back_from_openssl() {
+        // Shape of `openssl x509 -ext subjectAltName`.
+        let text = "X509v3 Subject Alternative Name:\n    DNS:Mac-Studio.Wagar-House.myc, IP Address:192.168.2.3\n";
+        assert_eq!(
+            dns_names_from_extension_text(text),
+            ["mac-studio.wagar-house.myc"]
+        );
+    }
+
+    #[test]
+    fn repair_records_the_certificate_name_and_replaces_a_stale_one() {
+        let named = ["mac-studio.wagar-house.myc".to_owned()];
+        assert_eq!(
+            fleet_name_from_names(named).as_deref(),
+            Some("mac-studio.wagar-house.myc")
+        );
+        assert_eq!(fleet_name_from_names(["neo".to_owned()]), None);
+        assert_eq!(
+            record_fleet_name("MYCELIUM_SITE=lab\n", "neo.lab.myc").unwrap(),
+            "MYCELIUM_SITE=lab\nMYCELIUM_IROH_SERVER_NAME=neo.lab.myc\n"
+        );
+        assert_eq!(
+            record_fleet_name(
+                "MYCELIUM_SITE=lab\nMYCELIUM_IROH_SERVER_NAME=192.168.2.3\n",
+                "neo.lab.myc"
+            )
+            .unwrap(),
+            "MYCELIUM_SITE=lab\nMYCELIUM_IROH_SERVER_NAME=neo.lab.myc\n"
+        );
+    }
+
+    #[test]
+    fn peer_seeds_may_name_the_certificate_to_expect() {
+        assert!(validate_peer("mac-studio.wagar-house.myc@192.168.2.3:7443").is_ok());
+        assert!(validate_peer("192.168.2.3:7443").is_ok());
+        assert!(validate_peer("@192.168.2.3:7443").is_err());
+        assert!(validate_peer("mac-studio.wagar-house.myc@").is_err());
     }
 
     #[test]

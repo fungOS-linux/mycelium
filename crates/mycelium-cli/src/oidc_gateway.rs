@@ -259,7 +259,12 @@ async fn redeem_invite(
                 .enrollment_ca
                 .as_deref()
                 .ok_or("peer enrollment is unavailable on this gateway")?;
-            let node_certificate = crate::enroll::sign_csr(ca, csr, &invitation.name, &root)?;
+            let site = invitation
+                .site
+                .clone()
+                .ok_or("peer invitation has no site")?;
+            let node_certificate =
+                crate::enroll::sign_csr(ca, csr, &invitation.name, &site, &root)?;
             let ca_certificate = fs::read_to_string(ca.join("ca.pem"))
                 .map_err(|error| format!("read mesh CA: {error}"))?;
             let certificate = if invitation.unix_users.is_empty() {
@@ -293,10 +298,7 @@ async fn redeem_invite(
                 Some(crate::invite::PeerEnrollment {
                     ca_certificate,
                     node_certificate,
-                    site: invitation
-                        .site
-                        .clone()
-                        .ok_or("peer invitation has no site")?,
+                    site,
                     peers: invitation.peers.clone(),
                     roles: invitation.roles.clone(),
                 }),
