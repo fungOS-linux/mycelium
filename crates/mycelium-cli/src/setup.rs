@@ -27,6 +27,12 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
             system_service,
         )?;
         lines.extend(install_local_gateway(local_gateway, &home, trust_gateway).await?);
+        // DNS is optional by design, so a resolver that cannot start is
+        // reported here rather than turning a good peer repair into a failure.
+        match crate::dns::ensure(&home).await {
+            Ok(dns) => lines.extend(dns),
+            Err(error) => lines.push(format!("DNS resolver not applied: {error}")),
+        }
         return Ok(lines);
     }
     let claim_path = value(args, "--claim-file").map(expand_home);

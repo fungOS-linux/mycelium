@@ -1,3 +1,4 @@
+use mycelium_dns_policy::canonical_domain;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -877,6 +878,38 @@ fn fleet_name_from_names(names: impl IntoIterator<Item = String>) -> Option<Stri
     names.into_iter().find(|name| mycelium_core::is_myc_name(name))
 }
 
+/// The node's own site and namespace suffix, from the canonical environment
+/// and the certificate it was issued. DNS derives its zone from this rather
+/// than from a second, hand-maintained setting.
+pub(crate) fn identity(home: &Path) -> Result<(String, String), String> {
+    let environment = std::fs::read_to_string(home.join("node.env"))
+        .map_err(|error| format!("read node environment: {error}"))?;
+    identity_from(&environment, certificate_dns_names(&home.join("pki/node.pem"))?)
+}
+
+fn identity_from(
+    environment: &str,
+    names: impl IntoIterator<Item = String>,
+) -> Result<(String, String), String> {
+    let site = environment
+        .lines()
+        .find_map(|line| line.strip_prefix("MYCELIUM_SITE="))
+        .filter(|site| !site.is_empty())
+        .ok_or("node environment is missing MYCELIUM_SITE")?
+        .to_string();
+    let name = fleet_name_from_names(names)
+        .ok_or("node certificate carries no .myc name; re-run setup --repair")?;
+    if name.matches('.').count() < 2 {
+        return Err(format!(
+            "certificate name `{name}` is not `<host>.<site>.<namespace>`"
+        ));
+    }
+    let suffix = name.rsplit('.').next().unwrap_or_default().to_string();
+    canonical_domain(&suffix)
+        .map_err(|error| format!("certificate name `{name}` has no usable namespace: {error}"))?;
+    Ok((site, suffix))
+}
+
 /// Record the certificate's stable name, replacing an older IP or name.
 fn record_fleet_name(environment: &str, name: &str) -> Result<String, String> {
     if environment
@@ -962,6 +995,23 @@ mod tests {
             dns_names_from_extension_text(text),
             ["mac-studio.wagar-house.myc"]
         );
+    }
+
+    #[test]
+    fn dns_identity_comes_from_the_node_identity_not_a_second_setting() {
+        assert_eq!(
+            identity_from(
+                "MYCELIUM_SITE=wagar-house\n",
+                ["mac-studio.wagar-house.myc".to_owned()]
+            )
+            .unwrap(),
+            ("wagar-house".to_string(), "myc".to_string())
+        );
+        assert!(identity_from("MYCELIUM_SITE=\n", ["a.b.myc".to_owned()]).is_err());
+        // Two labels cannot name a host inside a site and a namespace.
+        assert!(identity_from("MYCELIUM_SITE=lab\n", ["mac-studio.myc".to_owned()]).is_err());
+        // An address-only certificate has no namespace to serve.
+        assert!(identity_from("MYCELIUM_SITE=lab\n", ["10.0.0.1".to_owned()]).is_err());
     }
 
     #[test]

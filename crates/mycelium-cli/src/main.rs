@@ -222,6 +222,7 @@ usage:
   mycelium dns zone [--suffix DOMAIN] [--json]
   mycelium dns service-address --prefix CIDR [--json]
   mycelium dns plan --site SITE [--suffix DOMAIN] [--delegations FILE] [--json|--dnsmasq]
+  mycelium dns resolver init --config FILE --site SITE --suffix DOMAIN --reachable CIDR... --write [--service-address CIDR]
   mycelium dns resolver plan|status --config FILE
   mycelium dns resolver apply|run|system-install|system-remove --config FILE --write [--dry-run]
   mycelium dns blocklist plan --source FILE... [--allow DOMAIN]... [--action sinkhole|nxdomain] [--json|--dnsmasq]
@@ -1164,7 +1165,14 @@ async fn enroll_command(args: &[String]) -> Result<Vec<String>, ClientError> {
                 None if packaged::current().map_err(|error| err_usage(&error))? => std::path::PathBuf::from(packaged::HOME),
                 None => myceliumd::home_dir(),
             };
-            enroll::install(std::path::Path::new(bundle), &home)
+            let mut lines = enroll::install(std::path::Path::new(bundle), &home)?;
+            // A fresh node has no daemon socket yet, so this reports a skip
+            // until `setup --repair` completes the resolver.
+            match dns::ensure(&home).await {
+                Ok(dns) => lines.extend(dns),
+                Err(error) => lines.push(format!("DNS resolver not applied: {error}")),
+            }
+            Ok(lines)
         }
         other => Err(err_usage(&format!("unknown enroll action `{other}`"))),
     }

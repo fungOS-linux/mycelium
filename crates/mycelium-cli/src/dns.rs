@@ -5,7 +5,8 @@ use mycelium_core::topology::Topology;
 pub(crate) use mycelium_dns_policy::{canonical_domain, plan, Delegation, DnsRecord};
 use mycelium_dns_policy::{BlockAction, Blocklist, BlocklistSource};
 use mycelium_peer_protocol::WireGuardBinding;
-use std::path::PathBuf;
+use myceliumd::protocol::Request;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn derive_records(
     topology: &Topology,
@@ -221,6 +222,86 @@ pub(crate) fn blocklist(args: &[String]) -> Result<Vec<String>, String> {
     if blocks.len() > 20 {
         lines.push(format!("... {} more", blocks.len() - 20));
     }
+    Ok(lines)
+}
+
+/// Routed prefixes this site can reach, straight from signed bindings. These
+/// are the scopes the resolver may publish peer addresses from; a site with
+/// no signed route yet cannot enumerate its own reachability.
+pub(crate) async fn live_prefixes(site: &str) -> Result<Vec<String>, String> {
+    let mut client = crate::connect()
+        .await
+        .map_err(|error| format!("connect to the daemon: {error}"))?;
+    let value = client
+        .call(&Request::WireGuardBindingList)
+        .await
+        .map_err(|error| format!("read routed prefixes: {error}"))?;
+    let bindings: Vec<WireGuardBinding> =
+        serde_json::from_value(value).map_err(|error| format!("invalid bindings: {error}"))?;
+    let mut prefixes = BTreeSet::new();
+    for binding in bindings.iter().filter(|binding| binding.site == site) {
+        for prefix in &binding.advertised_prefixes {
+            if mycelium_core::parse_cidr(prefix).is_none() {
+                return Err(format!(
+                    "daemon advertised invalid routed prefix `{prefix}`"
+                ));
+            }
+            prefixes.insert(prefix.clone());
+        }
+    }
+    if prefixes.is_empty() {
+        return Err(format!(
+            "no signed routes for site `{site}`; run `mycelium dns resolver init --reachable CIDR`"
+        ));
+    }
+    if prefixes.len() > 32 {
+        return Err("more than 32 routed prefixes; review the site plan".into());
+    }
+    Ok(prefixes.into_iter().collect())
+}
+
+/// Make this node serve `.myc` locally: create the policy file from its own
+/// identity and live routes when it is missing, then apply it. Records are
+/// observed at apply time, so the configuration holds policy, not data.
+pub(crate) async fn ensure(home: &Path) -> Result<Vec<String>, String> {
+    let (site, suffix) = crate::enroll::identity(home)?;
+    let config = home.join("dns/resolver.json");
+    let mut lines = Vec::new();
+    if !config.is_file() {
+        let prefixes = live_prefixes(&site).await?;
+        let managed = home.join("bin/mycelium");
+        let mycelium = if managed.is_file() {
+            managed
+        } else {
+            std::env::current_exe()
+                .map_err(|error| format!("locate the Mycelium binary: {error}"))?
+        };
+        mycelium_driver_dnsmasq::init(
+            &config,
+            mycelium_driver_dnsmasq::InitOptions {
+                site: site.clone(),
+                suffix: suffix.clone(),
+                reachable_prefixes: prefixes,
+                service_address: None,
+                listen: vec![],
+                dnsmasq: None,
+                mycelium: Some(mycelium),
+            },
+            false,
+        )?;
+        lines.push(format!(
+            "initialized DNS policy for {site} at {}",
+            config.display()
+        ));
+    }
+    let applied = mycelium_driver_dnsmasq::command(&[
+        "apply".to_string(),
+        "--config".to_string(),
+        config.display().to_string(),
+        "--write".to_string(),
+    ])
+    .await?;
+    lines.push(format!("DNS resolver: {applied}"));
     Ok(lines)
 }
 

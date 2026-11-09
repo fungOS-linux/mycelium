@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -113,6 +113,102 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// Inputs for a generated resolver configuration. Every field is either the
+/// node's own identity or a reviewed route; nothing here is inferred from a
+/// default that could silently widen what the resolver publishes.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitOptions {
+    pub site: String,
+    pub suffix: String,
+    pub reachable_prefixes: Vec<String>,
+    #[serde(default)]
+    pub service_address: Option<mycelium_dns_policy::FleetDnsAddress>,
+    #[serde(default)]
+    pub listen: Vec<SocketAddr>,
+    #[serde(default)]
+    pub dnsmasq: Option<PathBuf>,
+    #[serde(default)]
+    pub mycelium: Option<PathBuf>,
+}
+
+fn default_dnsmasq() -> Result<PathBuf, String> {
+    for candidate in [
+        "/usr/sbin/dnsmasq",
+        "/opt/homebrew/sbin/dnsmasq",
+        "/usr/local/sbin/dnsmasq",
+        "/usr/bin/dnsmasq",
+    ] {
+        let path = Path::new(candidate);
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+    }
+    Err("dnsmasq was not found at a known path".into())
+}
+
+/// Write the resolver policy for this node. An existing file is never
+/// replaced without `force`: policy review is a human step, and a second
+/// repair must not quietly change what the resolver publishes.
+pub fn init(path: &Path, options: InitOptions, force: bool) -> Result<Value, String> {
+    if fs::symlink_metadata(path).is_ok() && !force {
+        return Err(format!(
+            "{} already exists; refusing to replace reviewed DNS policy",
+            path.display()
+        ));
+    }
+    let settings = Settings {
+        resolver: ResolverConfig {
+            mode: ResolverMode::LocalhostOnly,
+            site: options.site,
+            suffix: options.suffix,
+            listen: if options.listen.is_empty() {
+                vec!["127.0.0.1:53".parse().expect("static listener")]
+            } else {
+                options.listen
+            },
+            upstreams: vec![],
+            service_address: options.service_address,
+            delegations: vec![],
+            namespace_owners: BTreeMap::new(),
+            blocklists: vec![],
+            block_action: mycelium_dns_policy::BlockAction::default(),
+            allowlist: vec![],
+        },
+        dnsmasq: match options.dnsmasq {
+            Some(path) => path,
+            None => default_dnsmasq()?,
+        },
+        mycelium: match options.mycelium {
+            Some(path) => path,
+            None => std::env::current_exe().map_err(|error| error.to_string())?,
+        },
+        reachable_prefixes: options.reachable_prefixes,
+        mesh_sites: true,
+        additional_sites: vec![],
+        refresh_seconds: 30,
+        expiry_seconds: 300,
+        service_aliases: BTreeMap::new(),
+        service_alias_plugins: Vec::new(),
+        service_index_peers: BTreeMap::new(),
+    };
+    settings.validate()?;
+    atomic_write(
+        path,
+        &serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?,
+    )?;
+    Ok(json!({
+        "config": path,
+        "mode": "localhost-only",
+        "site": settings.resolver.site,
+        "suffix": settings.resolver.suffix,
+        "listen": settings.resolver.listen,
+        "reachable_prefixes": settings.reachable_prefixes,
+        "service_address": settings.resolver.service_address,
+        "default_dns_changed": false
+    }))
 }
 
 fn failure(message: impl ToString) -> MyceliumError {
@@ -1000,20 +1096,29 @@ pub async fn command(args: &[String]) -> Result<String, String> {
     let action = args
         .first()
         .map(String::as_str)
-        .ok_or("expected plan|apply|status|run|system-install|system-remove --config FILE")?;
+        .ok_or("expected plan|init|apply|status|run|system-install|system-remove --config FILE")?;
     if !matches!(
         action,
-        "plan" | "apply" | "status" | "run" | "system-install" | "system-remove"
+        "plan" | "init" | "apply" | "status" | "run" | "system-install" | "system-remove"
     ) {
         return Err("unknown resolver action".into());
     }
     let mut config = None;
     let mut write = false;
     let mut dry_run = false;
+    let mut force = false;
+    let mut site = None;
+    let mut suffix = None;
+    let mut service_address: Option<mycelium_dns_policy::FleetDnsAddress> = None;
+    let mut reachable = Vec::new();
+    let mut listen = Vec::new();
+    let mut dnsmasq = None;
+    let mut mycelium = None;
     let mut rest = args[1..].iter();
     let mut seen = BTreeSet::new();
     while let Some(flag) = rest.next() {
-        if !seen.insert(flag) {
+        // Route and listener lists are repeated by design.
+        if !matches!(flag.as_str(), "--reachable" | "--listen") && !seen.insert(flag) {
             return Err("duplicate resolver option".into());
         }
         match flag.as_str() {
@@ -1024,10 +1129,64 @@ pub async fn command(args: &[String]) -> Result<String, String> {
             }
             "--write" => write = true,
             "--dry-run" => dry_run = true,
+            "--force" if action == "init" => force = true,
+            "--site" if action == "init" => {
+                site = Some(rest.next().ok_or("--site requires a name")?.to_string())
+            }
+            "--suffix" if action == "init" => {
+                suffix = Some(rest.next().ok_or("--suffix requires a domain")?.to_string())
+            }
+            "--service-address" if action == "init" => {
+                service_address = Some(
+                    rest.next()
+                        .ok_or("--service-address requires a ULA CIDR")?
+                        .parse()?,
+                )
+            }
+            "--reachable" if action == "init" => reachable.push(
+                rest.next()
+                    .ok_or("--reachable requires a CIDR")?
+                    .to_string(),
+            ),
+            "--listen" if action == "init" => listen.push(
+                rest.next()
+                    .ok_or("--listen requires an address")?
+                    .parse()
+                    .map_err(|_| "invalid --listen address".to_string())?,
+            ),
+            "--dnsmasq" if action == "init" => {
+                dnsmasq = Some(PathBuf::from(
+                    rest.next().ok_or("--dnsmasq requires a path")?,
+                ))
+            }
+            "--mycelium" if action == "init" => {
+                mycelium = Some(PathBuf::from(
+                    rest.next().ok_or("--mycelium requires a path")?,
+                ))
+            }
             _ => return Err("unknown resolver option".into()),
         }
     }
-    let device = ResolverDevice::load(&config.ok_or("--config is required")?)?;
+    let config = config.ok_or("--config is required")?;
+    if action == "init" {
+        let options = InitOptions {
+            site: site.ok_or("dns resolver init requires --site")?,
+            suffix: suffix.ok_or("dns resolver init requires --suffix")?,
+            reachable_prefixes: reachable,
+            service_address,
+            listen,
+            dnsmasq,
+            mycelium,
+        };
+        if dry_run {
+            return Ok(json!({"dry_run": true, "config": config, "options": options}).to_string());
+        }
+        if !write {
+            return Err("dns resolver init requires --write".into());
+        }
+        return Ok(init(&config, options, force)?.to_string());
+    }
+    let device = ResolverDevice::load(&config)?;
     if action == "plan" {
         let records = observe(&device.settings).await?;
         let blocks = device.settings.resolver.blocks()?;
@@ -1337,6 +1496,35 @@ mod tests {
             .unwrap()
             .dry_run
         );
+    }
+
+    #[test]
+    fn init_writes_reviewed_policy_and_refuses_to_replace_it() {
+        let path = std::env::temp_dir().join(format!("resolver-init-{}.json", std::process::id()));
+        let options = || InitOptions {
+            site: "lab".into(),
+            suffix: "myc".into(),
+            reachable_prefixes: vec!["192.0.2.0/24".into()],
+            service_address: None,
+            listen: vec![],
+            dnsmasq: Some("/bin/dnsmasq".into()),
+            mycelium: Some("/bin/mycelium".into()),
+        };
+        let _ = fs::remove_file(&path);
+        let created = init(&path, options(), false).unwrap();
+        assert_eq!(created["site"], "lab");
+        let stored: Settings = read_json(&path).unwrap();
+        assert_eq!(stored.resolver.mode, ResolverMode::LocalhostOnly);
+        assert_eq!(stored.resolver.listen[0].to_string(), "127.0.0.1:53");
+        assert_eq!(stored.reachable_prefixes, ["192.0.2.0/24"]);
+        // A repaired node must not silently widen what it publishes.
+        assert!(init(&path, options(), false).is_err());
+        assert!(init(&path, options(), true).is_ok());
+        // Invalid input fails before anything is written.
+        let mut bad = options();
+        bad.reachable_prefixes = vec!["not-a-cidr".into()];
+        assert!(init(&path, bad, true).is_err());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
