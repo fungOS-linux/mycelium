@@ -1924,7 +1924,7 @@ fn collect_interfaces() -> Vec<PeerInterface> {
             .into_iter()
             .filter_map(|row| {
                 let name = row["ifname"].as_str()?.to_owned();
-                if name == "lo" {
+                if !is_advertisable_interface(&name) {
                     return None;
                 }
                 let mac = row["address"]
@@ -1962,7 +1962,7 @@ fn collect_interfaces() -> Vec<PeerInterface> {
                     interfaces.push(interface);
                 }
                 let name = line.split(':').next().unwrap_or_default();
-                current = (name != "lo0").then(|| PeerInterface {
+                current = is_advertisable_interface(name).then(|| PeerInterface {
                     name: name.to_owned(),
                     mac: None,
                     addresses: Vec::new(),
@@ -2012,6 +2012,23 @@ fn is_publishable_address(address: &IpAddr) -> bool {
 
 fn is_public_mac(value: &str) -> bool {
     value != "00:00:00:00:00:00" && value.split(':').count() == 6
+}
+
+/// Interfaces whose addresses describe where a node can be reached.
+///
+/// Container, VM, and tunnel bridges can number in the hundreds on a busy
+/// host, and a `PeerHello` accepts at most 64 interfaces. Advertising them
+/// adds no address a peer can dial, and enough of them make every receiver
+/// reject the whole hello.
+fn is_advertisable_interface(name: &str) -> bool {
+    name != "lo"
+        && name != "lo0"
+        && ![
+            "veth", "docker", "br-", "bridge", "virbr", "vmenet", "vmnet", "cni", "flannel", "lxc",
+            "lxd", "podman", "sh-", "tap", "tunl",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn validate_digest(digest: &str) -> Result<(), AnyError> {
@@ -2649,6 +2666,16 @@ fn parse_darwin_swap(text: &str) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_and_tunnel_bridges_are_not_advertised() {
+        for name in ["en0", "enp87s0", "eth0", "tailscale0", "wlan0"] {
+            assert!(is_advertisable_interface(name), "{name} should be advertised");
+        }
+        for name in ["lo", "lo0", "veth1234", "docker0", "br-2f4a", "bridge100", "vmenet0", "sh-mg0", "tap0"] {
+            assert!(!is_advertisable_interface(name), "{name} should be skipped");
+        }
+    }
 
     #[test]
     fn peer_seeds_split_into_an_optional_certificate_name() {
