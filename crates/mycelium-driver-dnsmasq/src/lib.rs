@@ -20,6 +20,11 @@ use std::{
 };
 
 const LABEL: &str = "dev.fpl.mycelium-dns";
+/// The root daemon that owns `127.0.0.1:53`, so the system resolver has a
+/// port it can actually use: `/etc/resolver` has no say in the default port.
+const DAEMON_LABEL: &str = "dev.fpl.mycelium-dnsd";
+const DAEMON_HOME: &str = "/var/db/mycelium-dns";
+const DAEMON_PLIST: &str = "/Library/LaunchDaemons/dev.fpl.mycelium-dnsd.plist";
 const MARKER: &str = "# Managed by Mycelium DNS resolver\n";
 fn mesh_sites_default() -> bool {
     true
@@ -605,6 +610,19 @@ fn xml(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
+/// Root resolver daemon. It reads its own copy of the policy so a root-owned
+/// state directory never collides with the user's `~/.mycelium/dns`.
+fn daemon_plist(executable: &Path, config: &Path, home: &Path, log: &Path) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{DAEMON_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>dns</string><string>resolver</string><string>run</string><string>--config</string><string>{}</string><string>--write</string></array>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+        xml(&executable.to_string_lossy()),
+        xml(&config.to_string_lossy()),
+        xml(&home.to_string_lossy()),
+        xml(&log.to_string_lossy()),
+        xml(&log.to_string_lossy()),
+    )
+}
+
 fn launch_plist(executable: &Path, config: &Path, directory: &Path) -> String {
     let mut args = vec![executable.display().to_string()];
     if executable.file_name().and_then(|n| n.to_str()) == Some("mycelium") {
@@ -669,11 +687,82 @@ fn legacy_ours(text: &str) -> bool {
     names_loopback
 }
 
-fn owned_namespace(config: &ResolverConfig, remove: bool) -> Result<Value, String> {
+/// A copy of the resolver policy that binds `127.0.0.1:53`. Root owns the
+/// port; the user's policy is unchanged.
+fn daemon_settings(settings: &Settings) -> Result<Settings, String> {
+    let mut root = settings.clone();
+    root.resolver.listen = vec!["127.0.0.1:53".parse().expect("static listener")];
+    root.validate()?;
+    Ok(root)
+}
+
+fn daemon_installed() -> bool {
+    Path::new(DAEMON_PLIST).exists()
+}
+
+fn install_daemon(settings: &Settings, remove: bool) -> Result<Value, String> {
+    let plist = Path::new(DAEMON_PLIST);
+    if remove {
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("system/{DAEMON_LABEL}")])
+            .output();
+        if plist.exists() {
+            fs::remove_file(plist).map_err(|e| e.to_string())?;
+        }
+        return Ok(json!({"daemon": DAEMON_LABEL, "installed": false}));
+    }
+    let home = Path::new(DAEMON_HOME);
+    let state = home.join(".mycelium/dns");
+    fs::create_dir_all(&state).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(home, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    let config = state.join("settings.json");
+    atomic_write(
+        &config,
+        &serde_json::to_vec_pretty(&daemon_settings(settings)?).map_err(|e| e.to_string())?,
+    )?;
+    atomic_write(
+        plist,
+        daemon_plist(&settings.mycelium, &config, home, &state.join("daemon.log")).as_bytes(),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(plist, fs::Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
+    }
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("system/{DAEMON_LABEL}")])
+        .output();
+    let status = Command::new("launchctl")
+        .arg("bootstrap")
+        .arg("system")
+        .arg(plist)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("could not bootstrap the root DNS daemon".into());
+    }
+    let _ = Command::new("launchctl")
+        .args(["enable", &format!("system/{DAEMON_LABEL}")])
+        .output();
+    Ok(json!({"daemon": DAEMON_LABEL, "installed": true, "listen": "127.0.0.1:53"}))
+}
+
+fn owned_namespace(settings: &Settings, remove: bool) -> Result<Value, String> {
     if !cfg!(target_os = "macos") {
         return Err("OS namespace activation currently supports macOS only".into());
     }
-    let mut active = config.clone();
+    // The namespace must point at the port the daemon actually binds.
+    let mut active = if daemon_installed() || !remove {
+        daemon_settings(settings)?.resolver
+    } else {
+        settings.resolver.clone()
+    };
     if remove && active.mode == ResolverMode::Off {
         active.mode = ResolverMode::LocalhostOnly;
     }
@@ -710,7 +799,10 @@ fn owned_namespace(config: &ResolverConfig, remove: bool) -> Result<Value, Strin
                 .map_err(|e| e.to_string())?;
         }
     }
-    Ok(json!({"namespace":path,"installed":!remove,"default_dns_changed":false}))
+    let daemon = install_daemon(settings, remove)?;
+    let mut value = json!({"namespace":path,"installed":!remove,"default_dns_changed":false});
+    merge(&mut value, daemon);
+    Ok(value)
 }
 
 pub struct ResolverDevice {
@@ -824,7 +916,7 @@ impl Device for ResolverDevice {
                         .await
                         .map_err(failure)?
                 } else {
-                    owned_namespace(&self.settings.resolver, false).map_err(failure)?
+                    owned_namespace(&self.settings, false).map_err(failure)?
                 };
                 if let Some(service) = self.settings.resolver.service_address {
                     merge(
@@ -840,7 +932,7 @@ impl Device for ResolverDevice {
                         .await
                         .map_err(failure)?
                 } else {
-                    owned_namespace(&self.settings.resolver, true).map_err(failure)?
+                    owned_namespace(&self.settings, true).map_err(failure)?
                 };
                 if let Some(service) = self.settings.resolver.service_address {
                     merge(
@@ -1656,6 +1748,26 @@ mod tests {
         bad.reachable_prefixes = vec!["not-a-cidr".into()];
         assert!(init(&path, bad, true).is_err());
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn root_daemon_owns_the_default_port_and_its_own_state() {
+        let settings = settings();
+        let root = daemon_settings(&settings).unwrap();
+        assert_eq!(root.resolver.listen[0].to_string(), "127.0.0.1:53");
+        assert_eq!(root.resolver.suffix, settings.resolver.suffix);
+        let plist = daemon_plist(
+            Path::new("/x/mycelium"),
+            Path::new("/var/db/mycelium-dns/.mycelium/dns/settings.json"),
+            Path::new("/var/db/mycelium-dns"),
+            Path::new("/var/db/mycelium-dns/.mycelium/dns/daemon.log"),
+        );
+        assert!(plist.contains("<string>/x/mycelium</string>"));
+        assert!(plist.contains("<string>--config</string>"));
+        assert!(plist.contains("<key>HOME</key><string>/var/db/mycelium-dns</string>"));
+        assert!(plist.contains(DAEMON_LABEL));
+        // No shell anywhere: the daemon is an argv, not a script.
+        assert!(!plist.contains("/bin/sh"));
     }
 
     #[test]
