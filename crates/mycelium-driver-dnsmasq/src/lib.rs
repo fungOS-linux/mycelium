@@ -26,6 +26,7 @@ fn mesh_sites_default() -> bool {
 }
 mod linux;
 mod linux_namespace;
+mod service_address;
 mod service_dns;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,6 +214,13 @@ pub fn init(path: &Path, options: InitOptions, force: bool) -> Result<Value, Str
 
 fn failure(message: impl ToString) -> MyceliumError {
     MyceliumError::Validation(message.to_string())
+}
+
+/// Fold a step's report into the capability result instead of nesting it.
+fn merge(target: &mut Value, extra: Value) {
+    if let (Some(object), Value::Object(extra)) = (target.as_object_mut(), extra) {
+        object.extend(extra);
+    }
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -692,6 +700,21 @@ impl ResolverDevice {
         })
     }
 }
+
+impl ResolverDevice {
+    /// dnsmasq cannot bind an address the host does not own, so apply is a
+    /// precondition check rather than a silent half-start.
+    fn require_service_address(&self) -> Result<(), String> {
+        match self.settings.resolver.service_address {
+            Some(service) if !service_address::installed(&service)? => Err(format!(
+                "fleet DNS service address {} is not assigned to loopback; run `mycelium dns resolver system-install --config FILE` as root",
+                service.address()
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Device for ResolverDevice {
     fn meta(&self) -> &DeviceMeta {
@@ -749,30 +772,51 @@ impl Device for ResolverDevice {
                 let (zone, expected) = self.settings.resolver.macos_namespace().map_err(failure)?;
                 let blocks = self.settings.resolver.blocks().map_err(failure)?;
                 json!({"mode":self.settings.resolver.mode,"verified_record":first,
+                    "service_address_installed":(match self.settings.resolver.service_address {
+                        Some(service) => service_address::installed(&service).map_err(failure)?,
+                        None => false,
+                    }),
                     "blocking":{"zones":blocks.len(),"skipped":blocks.skipped(),
                         "action":self.settings.resolver.block_action.as_str(),
                         "sources":blocks.sources(),"allowlist":blocks.allowlist().len()},
                     "namespace_installed":if cfg!(target_os="linux") { linux_namespace::installed(&self.settings) } else { fs::read_to_string(Path::new("/etc/resolver").join(zone)).is_ok_and(|s|s==expected) },"default_dns_changed":false})
             }
             "dns.resolver.system-install" => {
-                if cfg!(target_os = "linux") {
+                let mut value = if cfg!(target_os = "linux") {
                     linux_namespace::apply(&self.settings, false)
                         .await
                         .map_err(failure)?
                 } else {
                     owned_namespace(&self.settings.resolver, false).map_err(failure)?
+                };
+                if let Some(service) = self.settings.resolver.service_address {
+                    merge(
+                        &mut value,
+                        service_address::ensure(&service).map_err(failure)?,
+                    );
                 }
+                value
             }
             "dns.resolver.system-remove" => {
-                if cfg!(target_os = "linux") {
+                let mut value = if cfg!(target_os = "linux") {
                     linux_namespace::apply(&self.settings, true)
                         .await
                         .map_err(failure)?
                 } else {
                     owned_namespace(&self.settings.resolver, true).map_err(failure)?
+                };
+                if let Some(service) = self.settings.resolver.service_address {
+                    merge(
+                        &mut value,
+                        service_address::remove(&service).map_err(failure)?,
+                    );
                 }
+                value
             }
-            "dns.resolver.apply" => apply(&self.settings, &self.config).await.map_err(failure)?,
+            "dns.resolver.apply" => {
+                self.require_service_address().map_err(failure)?;
+                apply(&self.settings, &self.config).await.map_err(failure)?
+            }
             "dns.resolver.run" => {
                 supervise(&self.settings).await.map_err(failure)?;
                 json!({"stopped":true})
