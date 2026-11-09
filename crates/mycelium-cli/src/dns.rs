@@ -225,9 +225,14 @@ pub(crate) fn blocklist(args: &[String]) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
-/// Routed prefixes this site can reach, straight from signed bindings. These
-/// are the scopes the resolver may publish peer addresses from; a site with
-/// no signed route yet cannot enumerate its own reachability.
+/// Address scopes this site occupies, so the resolver publishes peer
+/// addresses it can actually reach and nothing else.
+///
+/// Signed bindings describe routed prefixes, which are per-host `/32`s on
+/// most sites and would publish nothing. A site's nodes also report the
+/// addresses they hold, and the covering `/24` (or `/64`) of those is the
+/// subnet the peer is on — that is the scope a site-local resolver answers
+/// from, and it never widens beyond names in the site's own namespace.
 pub(crate) async fn live_prefixes(site: &str) -> Result<Vec<String>, String> {
     let mut client = crate::connect()
         .await
@@ -238,6 +243,13 @@ pub(crate) async fn live_prefixes(site: &str) -> Result<Vec<String>, String> {
         .map_err(|error| format!("read routed prefixes: {error}"))?;
     let bindings: Vec<WireGuardBinding> =
         serde_json::from_value(value).map_err(|error| format!("invalid bindings: {error}"))?;
+    let topology: Topology = serde_json::from_value(
+        client
+            .call(&Request::Topology)
+            .await
+            .map_err(|error| format!("read topology: {error}"))?,
+    )
+    .map_err(|error| format!("invalid topology: {error}"))?;
     let mut prefixes = BTreeSet::new();
     for binding in bindings.iter().filter(|binding| binding.site == site) {
         for prefix in &binding.advertised_prefixes {
@@ -249,15 +261,57 @@ pub(crate) async fn live_prefixes(site: &str) -> Result<Vec<String>, String> {
             prefixes.insert(prefix.clone());
         }
     }
+    // Only nodes this site has a signed route to: an address nobody routed to
+    // is not a scope a site-local resolver should answer from.
+    let routed = bindings
+        .iter()
+        .filter(|binding| binding.site == site)
+        .map(|binding| binding.credential.node_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for node in topology.nodes.values() {
+        if !node.sites.contains(site) || !routed.contains(node.id.as_str()) {
+            continue;
+        }
+        for address in node.ips.keys() {
+            if let Some(prefix) = covering_prefix(*address) {
+                prefixes.insert(prefix);
+            }
+        }
+    }
     if prefixes.is_empty() {
         return Err(format!(
-            "no signed routes for site `{site}`; run `mycelium dns resolver init --reachable CIDR`"
+            "no signed routes or site addresses for `{site}`; pass --reachable to `mycelium dns resolver init`"
         ));
     }
     if prefixes.len() > 32 {
-        return Err("more than 32 routed prefixes; review the site plan".into());
+        return Err(format!(
+            "site `{site}` spans {} scopes; review them and pass --reachable",
+            prefixes.len()
+        ));
     }
     Ok(prefixes.into_iter().collect())
+}
+
+/// The subnet a peer address sits on. Never wider than a `/24` or `/64`, so
+/// one reported address cannot claim an entire private range.
+fn covering_prefix(address: IpAddr) -> Option<String> {
+    match address {
+        IpAddr::V4(address)
+            if !address.is_loopback() && !address.is_link_local() && !address.is_unspecified() =>
+        {
+            let network = u32::from(address) & 0xffff_ff00;
+            Some(format!("{}/24", std::net::Ipv4Addr::from(network)))
+        }
+        IpAddr::V6(address)
+            if !address.is_loopback()
+                && !address.is_unspecified()
+                && !address.is_unicast_link_local() =>
+        {
+            let network = u128::from(address) & (u128::MAX << 64);
+            Some(format!("{}/64", std::net::Ipv6Addr::from(network)))
+        }
+        _ => None,
+    }
 }
 
 /// `mycelium dns resolver init` from a node's own point of view: fill in the
@@ -343,15 +397,29 @@ pub(crate) async fn ensure(home: &Path) -> Result<Vec<String>, String> {
             config.display()
         ));
     }
-    let applied = mycelium_driver_dnsmasq::command(&[
+    let command = [
         "apply".to_string(),
         "--config".to_string(),
         config.display().to_string(),
         "--write".to_string(),
-    ])
-    .await?;
-    lines.push(format!("DNS resolver: {applied}"));
-    Ok(lines)
+    ];
+    // A repair restarts the daemon, so the first apply can land before gossip
+    // has repopulated. Retry only that condition, and only for a minute.
+    let mut last = String::new();
+    for attempt in 0..12 {
+        match mycelium_driver_dnsmasq::command(&command).await {
+            Ok(applied) => {
+                lines.push(format!("DNS resolver: {applied}"));
+                return Ok(lines);
+            }
+            Err(error) if error.contains("no fresh reachable records") && attempt < 11 => {
+                last = error;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last)
 }
 
 #[cfg(test)]
