@@ -410,7 +410,11 @@ async fn observation(settings: &Settings) -> Result<(Vec<DnsRecord>, u64), Strin
     // The daemon socket belongs to the user who enrolled, not to whoever is
     // asking. Without this, a root install reads root's home, fails to reach
     // the socket, and silently falls back to a stale retained snapshot.
-    if let Some(home) = settings.mycelium.parent().and_then(Path::parent) {
+    if let Some(home) = settings
+        .mycelium
+        .ancestors()
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(".mycelium"))
+    {
         command.env("MYCELIUM_HOME", home);
     }
     let output = tokio::time::timeout(Duration::from_secs(10), command.output())
