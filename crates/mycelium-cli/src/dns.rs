@@ -2,28 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use mycelium_core::topology::Topology;
+pub(crate) use mycelium_dns_policy::{canonical_domain, plan, Delegation, DnsRecord};
 use mycelium_peer_protocol::WireGuardBinding;
-use serde::Serialize;
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub(crate) struct DnsRecord {
-    pub name: String,
-    pub address: IpAddr,
-    pub site: String,
-    pub node: String,
-}
 
 pub(crate) fn derive_records(
     topology: &Topology,
     bindings: &[WireGuardBinding],
     suffix: &str,
 ) -> Result<Vec<DnsRecord>, String> {
-    let suffix = suffix.trim_matches('.').to_ascii_lowercase();
-    if suffix.is_empty() {
-        return Err("DNS suffix cannot be empty".into());
-    }
+    let suffix = canonical_domain(suffix)?;
     let mut records = BTreeSet::new();
-    let mut names = BTreeMap::<String, IpAddr>::new();
+    let mut names = BTreeMap::<String, String>::new();
+    let mut addresses = BTreeMap::<(String, bool), IpAddr>::new();
     for binding in bindings {
         let prefixes = binding
             .advertised_prefixes
@@ -52,7 +42,13 @@ pub(crate) fn derive_records(
                 .filter(|address| prefixes.iter().any(|prefix| prefix.contains(*address)))
             {
                 let name = format!("{label}.{site}.{suffix}");
-                if let Some(previous) = names.insert(name.clone(), address) {
+                if let Some(owner) = names.insert(name.clone(), node.id.clone()) {
+                    if owner != node.id {
+                        return Err(format!("DNS name `{name}` has competing node owners"));
+                    }
+                }
+                if let Some(previous) = addresses.insert((name.clone(), address.is_ipv4()), address)
+                {
                     if previous != address {
                         return Err(format!(
                             "DNS name `{name}` maps to both {previous} and {address}"
@@ -158,7 +154,7 @@ mod tests {
             );
         }
         topology.nodes.insert(node.id.clone(), node);
-        let binding = WireGuardBinding {
+        let mut binding = WireGuardBinding {
             credential: mycelium_peer_protocol::TransportCredentialBinding {
                 node_id: "identity".into(),
                 kind: mycelium_peer_protocol::TransportKind::WireGuard,
@@ -171,9 +167,30 @@ mod tests {
             endpoint: None,
             advertised_prefixes: vec!["192.168.10.0/24".into()],
         };
-        let records = derive_records(&topology, &[binding], "mycelium").unwrap();
+        let records = derive_records(&topology, &[binding.clone()], "mycelium").unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "front-camera.home.mycelium");
         assert_eq!(records[0].address.to_string(), "192.168.10.30");
+        let v6 = "2001:db8::30".parse().unwrap();
+        topology.nodes.get_mut("camera").unwrap().ips.insert(
+            v6,
+            IpRecord {
+                addr: v6,
+                prefix: Some(64),
+                vlan: None,
+                origins: BTreeSet::new(),
+            },
+        );
+        binding.advertised_prefixes.push("2001:db8::/64".into());
+        assert_eq!(
+            derive_records(&topology, &[binding.clone()], "mycelium")
+                .unwrap()
+                .len(),
+            2
+        );
+        let mut competing = topology.nodes["camera"].clone();
+        competing.id = "other-camera".into();
+        topology.nodes.insert(competing.id.clone(), competing);
+        assert!(derive_records(&topology, &[binding], "mycelium").is_err());
     }
 }

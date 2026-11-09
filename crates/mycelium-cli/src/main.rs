@@ -220,6 +220,9 @@ usage:
   mycelium egress list [--json]
   mycelium egress probe --server HOST:PORT... [--bind IP] [--port PORT] [--json]
   mycelium dns zone [--suffix DOMAIN] [--json]
+  mycelium dns plan --site SITE [--suffix DOMAIN] [--delegations FILE] [--json|--dnsmasq]
+  mycelium dns resolver plan|status --config FILE
+  mycelium dns resolver apply|run|system-install|system-remove --config FILE --write [--dry-run]
   mycelium security status|events [--json]
   mycelium security scan [--stig-content PATH --stig-profile ID] [--remediation-plan] [--json]
   mycelium security sinks list [--json]
@@ -1534,23 +1537,110 @@ async fn egress_command(args: &[String]) -> Result<Vec<String>, ClientError> {
 }
 
 async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
-    if args.first().map(String::as_str) != Some("zone") {
-        return Err(err_usage("dns currently supports `zone`"));
+    let action = args.first().map(String::as_str).unwrap_or("");
+    if action == "resolver" {
+        return mycelium_driver_dnsmasq::command(&args[1..])
+            .await
+            .map(|output| vec![output])
+            .map_err(|error| err_usage(&error));
     }
-    let suffix = args
-        .windows(2)
-        .find(|pair| pair[0] == "--suffix")
-        .map(|pair| pair[1].as_str())
-        .unwrap_or("mycelium");
+    if !matches!(action, "zone" | "plan") {
+        return Err(err_usage(
+            "dns supports `zone` and read-only `plan`; apply is not supported",
+        ));
+    }
+    let mut suffix = "mycelium";
+    let mut site = None;
+    let mut delegation_file = None;
+    let mut json = false;
+    let mut dnsmasq = false;
+    let mut options = std::collections::BTreeSet::new();
+    let mut rest = args[1..].iter();
+    while let Some(flag) = rest.next() {
+        if !options.insert(flag.as_str()) {
+            return Err(err_usage("duplicate DNS option"));
+        }
+        match flag.as_str() {
+            "--json" => json = true,
+            "--dnsmasq" if action == "plan" => dnsmasq = true,
+            "--suffix" => {
+                suffix = rest
+                    .next()
+                    .ok_or_else(|| err_usage("--suffix needs a domain"))?
+            }
+            "--site" if action == "plan" => {
+                site = Some(
+                    rest.next()
+                        .ok_or_else(|| err_usage("--site needs a site"))?
+                        .as_str(),
+                )
+            }
+            "--delegations" if action == "plan" => {
+                delegation_file = Some(
+                    rest.next()
+                        .ok_or_else(|| err_usage("--delegations needs a file"))?,
+                )
+            }
+            _ => return Err(err_usage("unknown DNS option; no writes are supported")),
+        }
+    }
+    if json && dnsmasq {
+        return Err(err_usage("choose --json or --dnsmasq"));
+    }
+    if action == "plan" && site.is_none() {
+        return Err(err_usage("dns plan requires --site"));
+    }
+    dns::canonical_domain(suffix).map_err(|e| err_usage(&e))?;
+    let delegations: Vec<dns::Delegation> = if let Some(path) = delegation_file {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(65537).read_to_end(&mut bytes))
+            .map_err(|e| err_usage(&format!("read DNS delegations: {e}")))?;
+        if bytes.len() > 65536 {
+            return Err(err_usage("DNS delegation file exceeds 64 KiB"));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| err_usage("invalid DNS delegation document"))?
+    } else {
+        Vec::new()
+    };
+    if let Some(site) = site {
+        dns::plan(site, suffix, Vec::new(), delegations.clone()).map_err(|e| err_usage(&e))?;
+    }
     let mut client = connect().await?;
     let topology: Topology = serde_json::from_value(client.call(&Request::Topology).await?)
         .map_err(|error| err_usage(&format!("invalid topology response: {error}")))?;
-    let bindings: Vec<mycelium_peer_protocol::WireGuardBinding> =
+    let mut bindings: Vec<mycelium_peer_protocol::WireGuardBinding> =
         serde_json::from_value(client.call(&Request::WireGuardBindingList).await?)
             .map_err(|error| err_usage(&format!("invalid WireGuard bindings: {error}")))?;
+    if let Some(site) = site {
+        bindings.retain(|binding| binding.site == site);
+    }
     let records =
         dns::derive_records(&topology, &bindings, suffix).map_err(|error| err_usage(&error))?;
-    if args.iter().any(|arg| arg == "--json") {
+    if action == "plan" {
+        let plan =
+            dns::plan(site.unwrap(), suffix, records, delegations).map_err(|e| err_usage(&e))?;
+        if dnsmasq {
+            return Ok(vec![plan.dnsmasq]);
+        }
+        if json {
+            return Ok(vec![
+                serde_json::to_string(&plan).map_err(|e| err_usage(&e.to_string()))?
+            ]);
+        }
+        let mut lines = vec![
+            format!("DNS plan for {} (read-only; apply unsupported)", plan.site),
+            plan.dnsmasq,
+        ];
+        lines.extend(
+            plan.verification_required
+                .iter()
+                .map(|check| format!("verify: {check}")),
+        );
+        return Ok(lines);
+    }
+    if json {
         return Ok(vec![serde_json::to_string(&records).map_err(|error| {
             err_usage(&format!("serialize DNS records: {error}"))
         })?]);

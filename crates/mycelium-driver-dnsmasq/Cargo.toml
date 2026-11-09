@@ -1,0 +1,20 @@
+[package]
+name = "mycelium-driver-dnsmasq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Gated optional local DNS resolver management"
+
+[dependencies]
+mycelium-plugins-lua.workspace = true
+mycelium-core.workspace = true
+mycelium-dns-policy.workspace = true
+fpl-resource-observation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+
+[[bin]]
+name = "mycelium-dns-resolver"
+path = "src/main.rs"

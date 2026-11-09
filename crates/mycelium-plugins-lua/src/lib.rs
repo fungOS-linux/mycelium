@@ -130,7 +130,28 @@ fn err(plugin: &str, e: &mlua::Error) -> MyceliumError {
 /// device: `mlua::Lua` is not shareable across threads, and per-device
 /// globals keep plugin state from bleeding between appliances.
 fn instantiate(source: &str, name: &str) -> Result<Lua> {
+    instantiate_inner(source, name, false)
+}
+
+fn instantiate_inner(source: &str, name: &str, bounded: bool) -> Result<Lua> {
     let lua = Lua::new();
+    if bounded {
+        lua.set_memory_limit(8 * 1024 * 1024)
+            .map_err(|e| err(name, &e))?;
+        let ticks = std::sync::atomic::AtomicUsize::new(0);
+        lua.set_hook(
+            mlua::HookTriggers::new().every_nth_instruction(1000),
+            move |_, _| {
+                if ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 200 {
+                    return Err(mlua::Error::RuntimeError(
+                        "service provider instruction budget exceeded".into(),
+                    ));
+                }
+                Ok(mlua::VmState::Continue)
+            },
+        )
+        .map_err(|e| err(name, &e))?;
+    }
     {
         // Remove dangerous stdlib entries before loading user code.
         const DANGEROUS: &[&str] =
@@ -950,6 +971,48 @@ fn result_from_plan(plugin: &Plugin, plan: &serde_json::Value) -> Result<CapResu
         message: plan.get("message").and_then(|m| m.as_str()).map(str::to_owned),
         dry_run: false,
     })
+}
+
+pub fn dns_aliases(source: &str, context: serde_json::Value) -> Result<BTreeMap<String, String>> {
+    const NAME: &str = "dns-policy";
+    if source.len() > 65536 || !validate_json_bounds(&context) {
+        return Err(MyceliumError::Plugin {
+            plugin: NAME.into(),
+            message: "DNS policy input exceeds bound".into(),
+        });
+    }
+    let lua = instantiate_inner(source, NAME, true)?;
+    let policy: Table = lua.globals().get("dns_policy").map_err(|e| err(NAME, &e))?;
+    let aliases: mlua::Function = policy.get("aliases").map_err(|e| err(NAME, &e))?;
+    let result: JsonBridge = aliases
+        .call(JsonBridge(context))
+        .map_err(|e| err(NAME, &e))?;
+    if !validate_json_bounds(&result.0)
+        || serde_json::to_vec(&result.0)
+            .map_err(|e| MyceliumError::Plugin {
+                plugin: NAME.into(),
+                message: e.to_string(),
+            })?
+            .len()
+            > 8192
+    {
+        return Err(MyceliumError::Plugin {
+            plugin: NAME.into(),
+            message: "DNS policy output exceeds bound".into(),
+        });
+    }
+    let result: BTreeMap<String, String> =
+        serde_json::from_value(result.0).map_err(|_| MyceliumError::Plugin {
+            plugin: NAME.into(),
+            message: "DNS aliases must be a string map".into(),
+        })?;
+    if result.len() > 32 {
+        return Err(MyceliumError::Plugin {
+            plugin: NAME.into(),
+            message: "too many DNS aliases".into(),
+        });
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
