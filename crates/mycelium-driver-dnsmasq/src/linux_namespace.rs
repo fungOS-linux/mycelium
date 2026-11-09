@@ -286,6 +286,7 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
     }
     let links = snapshot_links()?;
     command("/usr/bin/getent", &["ahosts", "example.org"])?;
+    let mut expected = std::collections::BTreeSet::new();
     let first = if remove {
         None
     } else {
@@ -297,11 +298,12 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
         // Every address observed for that name: the OS may return a subset in
         // any order, and any of them proves the delegate reaches our zone.
         let expected_name = first.name.clone();
-        let expected: std::collections::BTreeSet<String> = records
-            .iter()
-            .filter(|record| record.name == expected_name)
-            .map(|record| record.address.to_string())
-            .collect();
+        expected.extend(
+            records
+                .iter()
+                .filter(|record| record.name == expected_name)
+                .map(|record| record.address.to_string()),
+        );
         // No pre-check against the running resolver: it refreshes on its own
         // interval, so a record observed now may not be in the zone yet. The
         // authoritative check is the OS answer below, which runs after the
