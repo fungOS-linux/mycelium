@@ -307,3 +307,6 @@ mod tests {
     }
 }
 pub mod resolver;
+pub mod service_address;
+
+pub use service_address::FleetDnsAddress;

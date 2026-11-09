@@ -1,5 +1,5 @@
 //! Optional resolver policy. Naming is separate from reachability and grants.
-use crate::{canonical_domain, plan, Delegation, DnsRecord};
+use crate::{canonical_domain, plan, Delegation, DnsRecord, FleetDnsAddress};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 
@@ -22,6 +22,9 @@ pub struct ResolverConfig {
     pub listen: Vec<SocketAddr>,
     /// Explicit upstreams, never inferred from a resolver pointing at ourselves.
     pub upstreams: Vec<SocketAddr>,
+    /// Anycast DNS service address (`<fleet-prefix>::53`) this resolver answers too.
+    #[serde(default)]
+    pub service_address: Option<FleetDnsAddress>,
     #[serde(default)]
     pub delegations: Vec<Delegation>,
     /// Explicit child namespace owner; addresses derive from fresh reachable records.
@@ -123,6 +126,24 @@ impl ResolverConfig {
         );
         for address in &self.listen {
             config.push_str(&format!("listen-address={}\n", address.ip()));
+        }
+        if let Some(service) = self.service_address {
+            if port != 53 {
+                return Err("fleet DNS service address requires port 53".into());
+            }
+            let service_ip = IpAddr::V6(service.address());
+            if self.listen.iter().any(|listener| listener.ip() == service_ip)
+                || self.upstreams.iter().any(|upstream| upstream.ip() == service_ip)
+                || admitted_records
+                    .iter()
+                    .any(|record| record.address == service_ip)
+            {
+                return Err(
+                    "fleet DNS service address conflicts with a listener, upstream, or record"
+                        .into(),
+                );
+            }
+            config.push_str(&format!("listen-address={service_ip}\n"));
         }
         for server in &self.upstreams {
             config.push_str(&format!("server={}#{}\n", server.ip(), server.port()));
@@ -296,6 +317,20 @@ mod tests {
             assert!(c.render(vec![]).is_err());
         }
     }
+    #[test]
+    fn fleet_service_address_renders_and_requires_port_53() {
+        let mut config = config();
+        config.mode = ResolverMode::LanServing;
+        config.listen = vec!["127.0.0.1:53".parse().unwrap()];
+        config.service_address = Some("fd7a:115c:a1e0::/48".parse().unwrap());
+        let rendered = config.render(Vec::new()).unwrap();
+        assert!(rendered.contains("listen-address=fd7a:115c:a1e0::53"));
+        config.listen = vec!["127.0.0.1:1053".parse().unwrap()];
+        assert!(config.render(Vec::new()).is_err());
+        config.listen = vec!["[fd7a:115c:a1e0::53]:53".parse().unwrap()];
+        assert!(config.render(Vec::new()).is_err());
+    }
+
     fn config() -> ResolverConfig {
         ResolverConfig {
             namespace_owners: Default::default(),
@@ -304,6 +339,7 @@ mod tests {
             suffix: "myc".into(),
             listen: vec!["127.0.0.1:1053".parse().unwrap()],
             upstreams: vec!["1.1.1.1:53".parse().unwrap()],
+            service_address: None,
             delegations: vec![],
         }
     }

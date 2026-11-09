@@ -220,6 +220,7 @@ usage:
   mycelium egress list [--json]
   mycelium egress probe --server HOST:PORT... [--bind IP] [--port PORT] [--json]
   mycelium dns zone [--suffix DOMAIN] [--json]
+  mycelium dns service-address --prefix CIDR [--json]
   mycelium dns plan --site SITE [--suffix DOMAIN] [--delegations FILE] [--json|--dnsmasq]
   mycelium dns resolver plan|status --config FILE
   mycelium dns resolver apply|run|system-install|system-remove --config FILE --write [--dry-run]
@@ -1543,6 +1544,40 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
             .await
             .map(|output| vec![output])
             .map_err(|error| err_usage(&error));
+    }
+    if action == "service-address" {
+        let mut prefix = None;
+        let mut json = false;
+        let mut rest = args[1..].iter();
+        while let Some(flag) = rest.next() {
+            match flag.as_str() {
+                "--prefix" => {
+                    prefix = Some(
+                        rest.next()
+                            .ok_or_else(|| err_usage("--prefix needs an IPv6 ULA CIDR"))?,
+                    )
+                }
+                "--json" => json = true,
+                _ => return Err(err_usage("unknown DNS service-address option")),
+            }
+        }
+        let service = mycelium_dns_policy::FleetDnsAddress::parse(
+            prefix.ok_or_else(|| err_usage("dns service-address needs --prefix"))?,
+        )
+        .map_err(|error| err_usage(&error))?;
+        if json {
+            return Ok(vec![
+                serde_json::to_string(&serde_json::json!({
+                    "prefix": service.to_string(),
+                    "address": service.address().to_string(),
+                }))
+                .map_err(|error| err_usage(&error.to_string()))?,
+            ]);
+        }
+        return Ok(vec![
+            service.address().to_string(),
+            format!("fleet DNS service address for {service}"),
+        ]);
     }
     if !matches!(action, "zone" | "plan") {
         return Err(err_usage(

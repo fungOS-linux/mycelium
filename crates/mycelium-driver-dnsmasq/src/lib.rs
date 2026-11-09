@@ -1059,6 +1059,7 @@ mod tests {
                 site: "lab".into(),
                 suffix: "myc".into(),
                 listen: vec!["127.0.0.1:1053".parse().unwrap()],
+                service_address: None,
                 upstreams: vec![],
                 delegations: vec![],
             },
