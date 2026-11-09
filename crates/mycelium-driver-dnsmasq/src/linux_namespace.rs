@@ -291,9 +291,17 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
     } else {
         let records = observe(settings).await?;
         let first = records
-            .into_iter()
-            .next()
+            .first()
+            .cloned()
             .ok_or("no fresh record for OS qualification")?;
+        // Every address observed for that name: the OS may return a subset in
+        // any order, and any of them proves the delegate reaches our zone.
+        let expected_name = first.name.clone();
+        let expected: std::collections::BTreeSet<String> = records
+            .iter()
+            .filter(|record| record.name == expected_name)
+            .map(|record| record.address.to_string())
+            .collect();
         // No pre-check against the running resolver: it refreshes on its own
         // interval, so a record observed now may not be in the zone yet. The
         // authoritative check is the OS answer below, which runs after the
@@ -327,7 +335,6 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
         if let Some(first) = &first {
             // systemd-resolved acknowledges the delegate before it serves it,
             // so one immediate lookup can land on the old configuration.
-            let expected = first.address.to_string();
             let mut answered = false;
             for _ in 0..40 {
                 // `getent` exits non-zero for a name it cannot resolve yet;
@@ -340,10 +347,11 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
                     .filter(|output| output.status.success())
                     .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
                     .unwrap_or_default();
-                if answer
-                    .lines()
-                    .any(|line| line.split_whitespace().next() == Some(expected.as_str()))
-                {
+                if answer.lines().any(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .is_some_and(|address| expected.contains(address))
+                }) {
                     answered = true;
                     break;
                 }
