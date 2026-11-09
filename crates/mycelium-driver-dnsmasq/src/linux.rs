@@ -16,10 +16,13 @@ fn argument(path: &Path) -> Result<String, String> {
     ))
 }
 fn unit(executable: &Path, config: &Path) -> Result<String, String> {
-    let prefix = if executable.file_name().and_then(|s| s.to_str()) == Some("mycelium") {
-        " dns resolver"
-    } else {
+    // Only the legacy standalone adapter binary lacks the `dns resolver`
+    // subcommand; every other name is the CLI, including renamed builds.
+    let prefix = if executable.file_name().and_then(|s| s.to_str()) == Some("mycelium-dns-resolver")
+    {
         ""
+    } else {
+        " dns resolver"
     };
     Ok(format!("{MARKER}[Unit]\nDescription=Mycelium local DNS companion\n[Service]\nExecStart={}{} run --config {} --write\nRestart=on-failure\nRestartSec=15\n[Install]\nWantedBy=default.target\n", argument(executable)?, prefix, argument(config)?))
 }
@@ -155,6 +158,19 @@ mod tests {
         assert!(rendered.contains("\"/home/a %%u/bin/mycelium\" dns resolver run"));
         assert!(rendered.starts_with(MARKER));
         assert!(!rendered.contains("User="));
+        // A renamed CLI build still needs the `dns resolver` subcommand.
+        let renamed = unit(
+            Path::new("/home/a/bin/mycelium-master"),
+            Path::new("/home/a/dns.json"),
+        )
+        .unwrap();
+        assert!(renamed.contains("\"mycelium-master\" dns resolver run"));
+        let legacy = unit(
+            Path::new("/home/a/bin/mycelium-dns-resolver"),
+            Path::new("/home/a/dns.json"),
+        )
+        .unwrap();
+        assert!(legacy.contains("\"mycelium-dns-resolver\" run"));
     }
     #[test]
     fn reject_nonabsolute_and_injected_paths() {
