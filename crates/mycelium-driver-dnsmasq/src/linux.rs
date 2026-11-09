@@ -164,13 +164,13 @@ mod tests {
             Path::new("/home/a/dns.json"),
         )
         .unwrap();
-        assert!(renamed.contains("\"mycelium-master\" dns resolver run"));
+        assert!(renamed.contains("/home/a/bin/mycelium-master\" dns resolver run"));
         let legacy = unit(
             Path::new("/home/a/bin/mycelium-dns-resolver"),
             Path::new("/home/a/dns.json"),
         )
         .unwrap();
-        assert!(legacy.contains("\"mycelium-dns-resolver\" run"));
+        assert!(legacy.contains("/home/a/bin/mycelium-dns-resolver\" run"));
     }
     #[test]
     fn reject_nonabsolute_and_injected_paths() {
