@@ -612,12 +612,13 @@ fn xml(value: &str) -> String {
 }
 /// Root resolver daemon. It reads its own copy of the policy so a root-owned
 /// state directory never collides with the user's `~/.mycelium/dns`.
-fn daemon_plist(executable: &Path, config: &Path, home: &Path, log: &Path) -> String {
+fn daemon_plist(executable: &Path, config: &Path, home: &Path, mesh: &Path, log: &Path) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{DAEMON_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>dns</string><string>resolver</string><string>run</string><string>--config</string><string>{}</string><string>--write</string></array>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{DAEMON_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>dns</string><string>resolver</string><string>run</string><string>--config</string><string>{}</string><string>--write</string></array>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>MYCELIUM_HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
         xml(&executable.to_string_lossy()),
         xml(&config.to_string_lossy()),
         xml(&home.to_string_lossy()),
+        xml(&mesh.to_string_lossy()),
         xml(&log.to_string_lossy()),
         xml(&log.to_string_lossy()),
     )
@@ -763,6 +764,14 @@ fn install_daemon(settings: &Settings, config_path: &Path, remove: bool) -> Resu
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
     }
+    // HOME is the daemon's own state; MYCELIUM_HOME is where the user's
+    // daemon socket lives, and observation needs it. Without this split the
+    // daemon rendered an empty zone.
+    let mesh = config_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("resolver config must live under a Mycelium home")?
+        .to_path_buf();
     let config = state.join("settings.json");
     atomic_write(
         &config,
@@ -770,7 +779,14 @@ fn install_daemon(settings: &Settings, config_path: &Path, remove: bool) -> Resu
     )?;
     atomic_write(
         plist,
-        daemon_plist(&settings.mycelium, &config, home, &state.join("daemon.log")).as_bytes(),
+        daemon_plist(
+            &settings.mycelium,
+            &config,
+            home,
+            &mesh,
+            &state.join("daemon.log"),
+        )
+        .as_bytes(),
     )?;
     #[cfg(unix)]
     {
@@ -1224,6 +1240,14 @@ async fn supervise(settings: &Settings) -> Result<(), String> {
         return Err("supervisor currently activates localhost-only".into());
     }
     let directory = state_dir()?;
+    // A leftover dnsmasq from a previous supervisor keeps the port, and then
+    // every restart looks like a crash loop. Say so instead.
+    for listener in &settings.resolver.listen {
+        std::net::UdpSocket::bind(listener)
+            .map_err(|error| format!("DNS listener {listener} is already in use: {error}"))?;
+        std::net::TcpListener::bind(listener)
+            .map_err(|error| format!("DNS TCP listener {listener} is already in use: {error}"))?;
+    }
     let path = directory.join("dnsmasq.conf");
     let snapshot = directory.join("retained.json");
     let initial_settings = service_dns::resolved(settings)?;
@@ -1826,11 +1850,14 @@ mod tests {
             Path::new("/x/mycelium"),
             Path::new("/var/db/mycelium-dns/.mycelium/dns/settings.json"),
             Path::new("/var/db/mycelium-dns"),
+            Path::new("/Users/a/.mycelium"),
             Path::new("/var/db/mycelium-dns/.mycelium/dns/daemon.log"),
         );
         assert!(plist.contains("<string>/x/mycelium</string>"));
         assert!(plist.contains("<string>--config</string>"));
         assert!(plist.contains("<key>HOME</key><string>/var/db/mycelium-dns</string>"));
+        // Observations come from the user's daemon socket, not root's state.
+        assert!(plist.contains("<key>MYCELIUM_HOME</key><string>/Users/a/.mycelium</string>"));
         assert!(plist.contains(DAEMON_LABEL));
         // No shell anywhere: the daemon is an argv, not a script.
         assert!(!plist.contains("/bin/sh"));
