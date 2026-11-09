@@ -297,7 +297,9 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
         // The supervisor refreshes every refresh interval, so the record just
         // observed may not be in the running configuration yet.
         let mut verified = false;
-        for _ in 0..30 {
+        // Longer than one refresh interval (30s), or a record that appeared
+        // between refreshes can never be verified.
+        for _ in 0..120 {
             if verify(settings, &first).is_ok() {
                 verified = true;
                 break;
