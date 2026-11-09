@@ -1033,6 +1033,7 @@ fn certificate_names(route_hosts: &[String]) -> Vec<String> {
         "mcp.myc",
         "home.myc",
         "webhook.myc",
+        "store.myc",
         "*.myc",
         "localhost",
         "127.0.0.1",
@@ -1615,6 +1616,16 @@ fn default_routes(home: &Path) -> Value {
                 "hosts": ["webhook.myc"],
                 "service_kind": "webhook",
                 "priority": 10
+            },
+            {
+                // The Spore Store is a local service: it advertises kind
+                // `store` when it runs, and the gateway serves `store.myc`
+                // from loopback. With no service the name resolves to nothing
+                // rather than forwarding to a third party.
+                "name": "store",
+                "hosts": ["store.myc"],
+                "service_kind": "store",
+                "priority": 10
             }
         ]
     })
@@ -1878,7 +1889,7 @@ mod tests {
             .flat_map(|route| route["hosts"].as_array().unwrap())
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
-        for expected in ["ai.myc", "mcp.myc", "home.myc", "webhook.myc"] {
+        for expected in ["ai.myc", "mcp.myc", "home.myc", "webhook.myc", "store.myc"] {
             assert!(hosts.contains(&expected));
         }
     }
@@ -2061,7 +2072,14 @@ mod tests {
     #[test]
     fn certificate_names_cover_capability_hosts() {
         let names = certificate_names(&["tools.myc".to_owned()]);
-        for expected in ["ai.myc", "mcp.myc", "home.myc", "webhook.myc", "tools.myc"] {
+        for expected in [
+            "ai.myc",
+            "mcp.myc",
+            "home.myc",
+            "webhook.myc",
+            "store.myc",
+            "tools.myc",
+        ] {
             assert!(names.contains(&expected.to_owned()));
         }
     }
