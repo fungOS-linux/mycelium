@@ -641,6 +641,34 @@ fn gui_domain() -> Result<String, String> {
     Ok(format!("gui/{id}"))
 }
 
+/// A namespace file that only names our loopback was written by an older
+/// Mycelium. Any other server, or any directive we would not write, means the
+/// file belongs to someone else.
+fn legacy_ours(text: &str) -> bool {
+    let mut names_loopback = false;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if line.starts_with('#') {
+            continue;
+        }
+        if line == "nameserver 127.0.0.1" {
+            names_loopback = true;
+            continue;
+        }
+        let known = line
+            .strip_prefix("port ")
+            .or_else(|| line.strip_prefix("timeout "))
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some()
+            || line
+                .strip_prefix("domain ")
+                .is_some_and(|value| canonical_domain(value).is_ok());
+        if !known {
+            return false;
+        }
+    }
+    names_loopback
+}
+
 fn owned_namespace(config: &ResolverConfig, remove: bool) -> Result<Value, String> {
     if !cfg!(target_os = "macos") {
         return Err("OS namespace activation currently supports macOS only".into());
@@ -658,12 +686,14 @@ fn owned_namespace(config: &ResolverConfig, remove: bool) -> Result<Value, Strin
     if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("refusing symlink namespace file".into());
     }
-    if path.exists()
-        && !fs::read_to_string(&path)
-            .map_err(|e| e.to_string())?
-            .starts_with(MARKER)
-    {
-        return Err("namespace already owned by another resolver; unchanged".into());
+    if path.exists() {
+        let existing = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        // Accept our own marker, or a file that only names our loopback: that
+        // is what older installs wrote before the marker existed, and refusing
+        // it would leave a host permanently unable to take ownership.
+        if !existing.starts_with(MARKER) && !legacy_ours(&existing) {
+            return Err("namespace already owned by another resolver; unchanged".into());
+        }
     }
     if remove {
         if path.exists() {
@@ -1626,6 +1656,20 @@ mod tests {
         bad.reachable_prefixes = vec!["not-a-cidr".into()];
         assert!(init(&path, bad, true).is_err());
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn adopts_a_namespace_file_that_only_names_our_loopback() {
+        // What older installs wrote, with no marker line.
+        assert!(legacy_ours("nameserver 127.0.0.1\nport 53\n"));
+        assert!(legacy_ours(
+            "# hand written\ndomain myc\nnameserver 127.0.0.1\nport 5335\ntimeout 2\n"
+        ));
+        // Another resolver, another directive, or nothing at all is not ours.
+        assert!(!legacy_ours("nameserver 192.0.2.53\n"));
+        assert!(!legacy_ours("nameserver 127.0.0.1\nsearch example.com\n"));
+        assert!(!legacy_ours(""));
+        assert!(!legacy_ours("port 53\n"));
     }
 
     #[test]
