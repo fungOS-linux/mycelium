@@ -226,6 +226,24 @@ const STUB_HOME: &str = "/var/lib/mycelium-dns";
 const RESOLV: &str = "/etc/resolv.conf";
 const RESOLV_BACKUP: &str = "/etc/resolv.conf.mycelium-backup";
 
+/// System-scoped control. `control` above drives the user manager, and root
+/// has no user bus, so the stub must not reuse it.
+fn system_control(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("systemctl")
+        .arg("--system")
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl --system {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 fn stub_settings(settings: &Settings) -> Result<Settings, String> {
     let mut root = settings.clone();
     root.resolver.listen = vec!["127.0.0.1:53".parse().expect("static listener")];
@@ -266,11 +284,11 @@ pub(super) async fn install_stub(settings: &Settings, remove: bool) -> Result<Va
     }
     let unit = Path::new(STUB_UNIT_PATH);
     if remove {
-        let _ = control(&["disable", "--now", STUB_UNIT]);
+        let _ = system_control(&["disable", "--now", STUB_UNIT]);
         if unit.exists() {
             fs::remove_file(unit).map_err(|e| e.to_string())?;
         }
-        control(&["daemon-reload"])?;
+        system_control(&["daemon-reload"])?;
         let backup = Path::new(RESOLV_BACKUP);
         if backup.exists() {
             fs::rename(backup, RESOLV).map_err(|e| e.to_string())?;
@@ -296,8 +314,8 @@ pub(super) async fn install_stub(settings: &Settings, remove: bool) -> Result<Va
         unit,
         stub_unit(&settings.mycelium, &config, &mesh_home(settings)?)?.as_bytes(),
     )?;
-    control(&["daemon-reload"])?;
-    control(&["enable", "--now", STUB_UNIT])?;
+    system_control(&["daemon-reload"])?;
+    system_control(&["enable", "--now", STUB_UNIT])?;
     // Keep the previous resolver reachable if this host ever has to roll back.
     let backup = Path::new(RESOLV_BACKUP);
     if !backup.exists() {
