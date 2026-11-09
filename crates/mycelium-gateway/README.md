@@ -29,13 +29,14 @@ the file changes:
 {
   "mycelium_bin": "/Users/example/.local/bin/mycelium",
   "service_refresh_secs": 15,
-  "default_route": "bifrost",
+  "default_route": "ai",
   "routes": [
     {
-      "name": "bifrost",
+      "name": "ai",
       "hosts": ["ai.myc"],
-      "upstream": "http://127.0.0.1:4001",
+      "upstream": ["http://127.0.0.1:4001", "https://ai.fpl.dev"],
       "service_kind": "ai",
+      "remote_token_file": "/Users/example/.fpl/bifrost-api-key",
       "priority": 10
     },
     {
@@ -48,32 +49,72 @@ the file changes:
 }
 ```
 
+`upstream` accepts one URL or an ordered list. The gateway does not trust the
+written order to describe locality: it derives candidates from the addresses
+and the service catalog.
+
 The most specific `Host` wins: an exact `ai.myc` route beats `*.myc`, then
 `priority` breaks ties, then route name. `default_route` is the fallback when no
 host pattern matches.
 
 ### Local-first service discovery
 
-`upstream` is the local backend and is always tried first. When `service_kind`
-is set, the gateway refreshes the authenticated Mycelium service catalog every
-`service_refresh_secs` and appends matching endpoints:
+Candidates are tried in one order, derived rather than configured:
 
-1. the static local `upstream`;
-2. fresh service endpoints owned by this node;
-3. fresh endpoints owned by other nodes.
+1. this machine: loopback `upstream` entries;
+2. this mesh: fresh service endpoints owned by this node, then other nodes;
+3. the public edge: non-loopback `upstream` entries, in written order.
 
-Only connection failures advance to the next candidate. A timeout or an
-HTTP response does not retry, because replaying a non-idempotent request could
-duplicate work. Remote loopback hints are ignored; a peer's `127.0.0.1` is not
-this host. `mycelium_bin` is required for any route with `service_kind`.
+With `service_kind` set, the gateway refreshes the authenticated Mycelium service
+catalog every `service_refresh_secs`. Only connection failures advance to the
+next candidate. A timeout or an HTTP response does not retry, because replaying a
+non-idempotent request could duplicate work. Remote loopback hints are ignored; a
+peer's `127.0.0.1` is not this host. `mycelium_bin` is required for any route
+with `service_kind`.
 
-The caller's bearer token is forwarded only to the local static upstream and
-local service endpoints. A remote candidate is unauthenticated unless the
-route sets `remote_token_env`, which names an environment variable holding the
-remote bearer token. This keeps the local app key from leaking to peers.
+### Credentials per target
+
+- loopback candidates — the caller's `Authorization` is forwarded unchanged;
+- configured non-loopback `upstream` entries — the caller's `Authorization` is
+  forwarded, unless the route sets `remote_token_env` or `remote_token_file`, in
+  which case that credential replaces it;
+- discovered peers — only the configured remote credential is sent. A peer never
+  receives a credential minted for this host, and a discovered peer is skipped
+  with a log line when no remote credential is configured.
+
+`remote_token_file` reads the token at request time, so rotating the file does
+not need a gateway restart and the secret never has to appear in a launchd plist
+or systemd unit.
+
+### Token accounting
+
+The gateway is the one hop every client shares, so it is where tokens are
+counted. For completion requests it reads the OpenAI `usage` object from the JSON
+body or from the final SSE event. A streaming request that did not ask for usage
+gets `stream_options.include_usage` added, unless the client set the field
+explicitly or `metering.stream_usage` is `false`.
+
+Counters are kept per route and per model, plus a rolling 60-second window for
+throughput. Requests whose upstream reports no usage are counted as **unmetered**
+rather than estimated: an estimate that looks exact is worse than a visible gap.
+
+```sh
+curl -sk https://ai.myc/.mycelium/usage   # JSON snapshot
+curl -sk https://ai.myc/.mycelium/metrics # Prometheus text
+mycelium gateway usage [--json]
+mycelium gateway usage --fleet [--json]
+```
+
+With `--usage PATH`, the gateway persists the counters (schema
+`mycelium.gateway-usage.v1`) and `myceliumd` republishes them in gossiped
+`platform_metrics` as `mycelium_ai.*`. `mycelium gateway usage --fleet` sums the
+fresh snapshots each peer reports. A stale snapshot is not gossiped, so a stopped
+gateway disappears from the fleet total instead of looking idle. One request
+traverses one gateway; do not chain `.myc` gateways or the same tokens are counted
+twice.
 
 `/healthz` reports the route count, discovered endpoint count, local node id,
-and whether auth is required.
+auth requirement, and whether stream metering is on.
 
 Run it on a nonprivileged port for development:
 
@@ -186,14 +227,15 @@ holding the caller token.
 
 For the local static upstream, the gateway authenticates the caller and
 forwards `Authorization` unchanged. Point it at a service that accepts the same
-token (for example the Bifrost local key), or put credential injection in the
-layer that owns the upstream secret. Remote discovery candidates use
-`remote_token_env` as described above.
+token (for example the Bifrost local key), or use `remote_token_file` to hold the
+edge credential.
 
 Requests and responses are proxied, not replayed. Response bodies are streamed,
-so SSE chat completions arrive incrementally. Request bodies are bounded at
-32 MiB. HTTP Upgrade/WebSocket traffic is not proxied yet. `x-forwarded-proto`
-reports `https` on the TLS listener.
+so SSE chat completions arrive incrementally, except that successful
+non-streaming completion responses are buffered (bounded at 32 MiB) to read their
+`usage` object. Request bodies are bounded at 32 MiB. HTTP Upgrade/WebSocket
+traffic is not proxied yet. `x-forwarded-proto` reports `https` on the TLS
+listener.
 
 The gateway binds one address. Binding `:80` or `:443` belongs to the
 Spore/Confluence ingress layer: the service manager owns the privileged socket,

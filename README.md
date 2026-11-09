@@ -82,6 +82,19 @@ repairs the local gateway installation. The lifecycle supports macOS
 LaunchAgents and Linux systemd units; on Linux the installer needs
 passwordless sudo. See [docs/releases.md](docs/releases.md).
 
+`ai.myc` is the single AI endpoint: clients that used to be configured with a
+provider URL point here instead. It serves from this machine first, then a
+UMIE lease on the mesh, then `https://ai.fpl.dev`, and counts tokens at that one
+hop so usage can be rolled up across the fleet:
+
+```sh
+mycelium gateway usage          # this machine
+mycelium gateway usage --fleet  # gossiped totals from every peer
+```
+
+See [docs/ai-endpoint.md](docs/ai-endpoint.md) for the route, credential and
+accounting rules, and for client configuration.
+
 ### Shell completion
 
 Completion definitions are generated from the CLI's usage contract, so newly
