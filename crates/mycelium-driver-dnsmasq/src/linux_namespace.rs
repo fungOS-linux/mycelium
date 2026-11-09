@@ -330,7 +330,16 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
             let expected = first.address.to_string();
             let mut answered = false;
             for _ in 0..40 {
-                let answer = command("/usr/bin/getent", &["ahosts", &first.name])?;
+                // `getent` exits non-zero for a name it cannot resolve yet;
+                // that is a retry, not a failure of the install.
+                let answer = Command::new("/usr/bin/timeout")
+                    .args(["15", "/usr/bin/getent", "ahosts", &first.name])
+                    .env("LC_ALL", "C")
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                    .unwrap_or_default();
                 if answer
                     .lines()
                     .any(|line| line.split_whitespace().next() == Some(expected.as_str()))
