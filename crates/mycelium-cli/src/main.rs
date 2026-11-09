@@ -1550,6 +1550,11 @@ async fn egress_command(args: &[String]) -> Result<Vec<String>, ClientError> {
 async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     let action = args.first().map(String::as_str).unwrap_or("");
     if action == "resolver" {
+        if args.get(1).map(String::as_str) == Some("init") {
+            return dns::resolver_init(&args[2..])
+                .await
+                .map_err(|error| err_usage(&error));
+        }
         return mycelium_driver_dnsmasq::command(&args[1..])
             .await
             .map(|output| vec![output])

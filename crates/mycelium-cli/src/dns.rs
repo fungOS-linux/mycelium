@@ -260,6 +260,52 @@ pub(crate) async fn live_prefixes(site: &str) -> Result<Vec<String>, String> {
     Ok(prefixes.into_iter().collect())
 }
 
+/// `mycelium dns resolver init` from a node's own point of view: fill in the
+/// site, namespace and routed prefixes that can be derived here, so a rollout
+/// never hand-copies site data. Anything given explicitly wins.
+fn given(values: &[String], name: &str) -> bool {
+    values.iter().any(|value| value == name)
+}
+
+pub(crate) async fn resolver_init(args: &[String]) -> Result<Vec<String>, String> {
+    let mut forward = Vec::new();
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--site" | "--suffix" | "--reachable" | "--config" | "--doh" | "--doh-listen"
+            | "--dnsmasq" | "--mycelium" => {
+                let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                forward.push(flag.clone());
+                forward.push(value.clone());
+            }
+            "--write" | "--dry-run" | "--force" => forward.push(flag.clone()),
+            _ => return Err(format!("unknown resolver init option `{flag}`")),
+        }
+    }
+    if !given(&forward, "--config") {
+        return Err("resolver init needs --config".into());
+    }
+    let home = myceliumd::home_dir();
+    let (site, suffix) = crate::enroll::identity(&home)?;
+    if !given(&forward, "--site") {
+        forward.push("--site".to_string());
+        forward.push(site.clone());
+    }
+    if !given(&forward, "--suffix") {
+        forward.push("--suffix".to_string());
+        forward.push(suffix);
+    }
+    if !given(&forward, "--reachable") {
+        for prefix in live_prefixes(&site).await? {
+            forward.push("--reachable".to_string());
+            forward.push(prefix);
+        }
+    }
+    let mut command = vec!["init".to_string()];
+    command.extend(forward);
+    Ok(vec![mycelium_driver_dnsmasq::command(&command).await?])
+}
+
 /// Make this node serve `.myc` locally: create the policy file from its own
 /// identity and live routes when it is missing, then apply it. Records are
 /// observed at apply time, so the configuration holds policy, not data.
