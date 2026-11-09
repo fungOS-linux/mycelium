@@ -692,6 +692,10 @@ fn legacy_ours(text: &str) -> bool {
 fn daemon_settings(settings: &Settings) -> Result<Settings, String> {
     let mut root = settings.clone();
     root.resolver.listen = vec!["127.0.0.1:53".parse().expect("static listener")];
+    // The daemon and any user agent must not fight over the forwarder port.
+    if let Some(doh) = root.resolver.doh.as_mut() {
+        doh.listen = "127.0.0.1:5356".parse().expect("static listener");
+    }
     root.validate()?;
     Ok(root)
 }
@@ -700,7 +704,18 @@ fn daemon_installed() -> bool {
     Path::new(DAEMON_PLIST).exists()
 }
 
-fn install_daemon(settings: &Settings, remove: bool) -> Result<Value, String> {
+/// One resolver per host: the daemon replaces a user-scoped agent, which
+/// could never own port 53 anyway.
+fn retire_user_agent(config: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = fs::metadata(config).ok()?.uid();
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/{LABEL}")])
+        .output();
+    Some(uid)
+}
+
+fn install_daemon(settings: &Settings, config_path: &Path, remove: bool) -> Result<Value, String> {
     let plist = Path::new(DAEMON_PLIST);
     if remove {
         let _ = Command::new("launchctl")
@@ -711,6 +726,7 @@ fn install_daemon(settings: &Settings, remove: bool) -> Result<Value, String> {
         }
         return Ok(json!({"daemon": DAEMON_LABEL, "installed": false}));
     }
+    let user = retire_user_agent(config_path);
     let home = Path::new(DAEMON_HOME);
     let state = home.join(".mycelium/dns");
     fs::create_dir_all(&state).map_err(|e| e.to_string())?;
@@ -750,10 +766,13 @@ fn install_daemon(settings: &Settings, remove: bool) -> Result<Value, String> {
     let _ = Command::new("launchctl")
         .args(["enable", &format!("system/{DAEMON_LABEL}")])
         .output();
-    Ok(json!({"daemon": DAEMON_LABEL, "installed": true, "listen": "127.0.0.1:53"}))
+    Ok(
+        json!({"daemon": DAEMON_LABEL, "installed": true, "listen": "127.0.0.1:53",
+        "user_agent_retired": user}),
+    )
 }
 
-fn owned_namespace(settings: &Settings, remove: bool) -> Result<Value, String> {
+fn owned_namespace(settings: &Settings, config_path: &Path, remove: bool) -> Result<Value, String> {
     if !cfg!(target_os = "macos") {
         return Err("OS namespace activation currently supports macOS only".into());
     }
@@ -799,7 +818,7 @@ fn owned_namespace(settings: &Settings, remove: bool) -> Result<Value, String> {
                 .map_err(|e| e.to_string())?;
         }
     }
-    let daemon = install_daemon(settings, remove)?;
+    let daemon = install_daemon(settings, config_path, remove)?;
     let mut value = json!({"namespace":path,"installed":!remove,"default_dns_changed":false});
     merge(&mut value, daemon);
     Ok(value)
@@ -916,7 +935,7 @@ impl Device for ResolverDevice {
                         .await
                         .map_err(failure)?
                 } else {
-                    owned_namespace(&self.settings, false).map_err(failure)?
+                    owned_namespace(&self.settings, &self.config, false).map_err(failure)?
                 };
                 if let Some(service) = self.settings.resolver.service_address {
                     merge(
@@ -932,7 +951,7 @@ impl Device for ResolverDevice {
                         .await
                         .map_err(failure)?
                 } else {
-                    owned_namespace(&self.settings, true).map_err(failure)?
+                    owned_namespace(&self.settings, &self.config, true).map_err(failure)?
                 };
                 if let Some(service) = self.settings.resolver.service_address {
                     merge(
@@ -1752,9 +1771,20 @@ mod tests {
 
     #[test]
     fn root_daemon_owns_the_default_port_and_its_own_state() {
-        let settings = settings();
+        let mut settings = settings();
+        settings.resolver.doh = Some(mycelium_dns_policy::resolver::DohUpstream {
+            endpoint: "https://dns.example/dns-query".into(),
+            listen: "127.0.0.1:5336".parse().unwrap(),
+            timeout_seconds: 5,
+            max_inflight: 8,
+        });
         let root = daemon_settings(&settings).unwrap();
         assert_eq!(root.resolver.listen[0].to_string(), "127.0.0.1:53");
+        // The daemon must not fight a user agent for the forwarder port.
+        assert_eq!(
+            root.resolver.doh.as_ref().unwrap().listen.to_string(),
+            "127.0.0.1:5356"
+        );
         assert_eq!(root.resolver.suffix, settings.resolver.suffix);
         let plist = daemon_plist(
             Path::new("/x/mycelium"),
