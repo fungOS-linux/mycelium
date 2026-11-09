@@ -294,21 +294,10 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
             .into_iter()
             .next()
             .ok_or("no fresh record for OS qualification")?;
-        // The supervisor refreshes every refresh interval, so the record just
-        // observed may not be in the running configuration yet.
-        let mut verified = false;
-        // Longer than one refresh interval (30s), or a record that appeared
-        // between refreshes can never be verified.
-        for _ in 0..120 {
-            if verify(settings, &first).is_ok() {
-                verified = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        if !verified {
-            return Err("running resolver does not serve the observed record yet".into());
-        }
+        // No pre-check against the running resolver: it refreshes on its own
+        // interval, so a record observed now may not be in the zone yet. The
+        // authoritative check is the OS answer below, which runs after the
+        // delegate is installed and must match this record exactly.
         Some(first)
     };
     let (server, suffix) = parameters(settings)?;
