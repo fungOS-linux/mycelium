@@ -320,7 +320,15 @@ pub fn run(
             .find(|p| p.artifact_digest == current_digest)
             .ok_or("active worker has no currently authorized manifest")?;
         if candidate.artifact_digest != current_digest {
-            crate::automatic_upgrade_allowed(Some(&current.version), &candidate.version)?;
+            // The worker manifest was matched by digest, so this release is
+            // verified rather than merely recorded.
+            let running = myceliumd::updates::RunningRelease {
+                version: Some(current.version.clone()),
+                source: "binary digest",
+                digest: Some(current_digest.clone()),
+                digest_matches: true,
+            };
+            let _ = crate::automatic_upgrade_allowed(&running, &candidate.version)?;
             let due = first_seen
                 .saturating_add(config.minimum_age_secs)
                 .saturating_add(crate::node_rollout_offset(config.rollout_window_secs));

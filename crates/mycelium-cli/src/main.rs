@@ -2327,25 +2327,12 @@ async fn update_auto_run() -> Result<Vec<String>, ClientError> {
         return Ok(vec!["automatic updates disabled".into()]);
     }
     let mut client = connect().await?;
-    let releases = client.call(&Request::ReleaseList).await?;
+    let release_list = client.call(&Request::ReleaseList).await?;
+    let releases = myceliumd::updates::parse_releases(&release_list);
     let targets = mycelium_peer_protocol::local_compatible_targets();
-    let release = releases
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|value| {
-            serde_json::from_value::<mycelium_peer_protocol::ReleaseManifest>(value.clone()).ok()
-        })
-        .filter(|release| release.channel == policy.channel && targets.contains(&release.target))
-        .max_by_key(|release| {
-            let preference = targets
-                .iter()
-                .position(|target| target == &release.target)
-                .map(|index| targets.len() - index)
-                .unwrap_or_default();
-            (release.version.clone(), preference)
-        });
-    let Some(release) = release else {
+    let Some(release) =
+        myceliumd::updates::select_release(&releases, &policy.channel, &targets).cloned()
+    else {
         return Ok(vec![format!(
             "no compatible signed release on channel {}",
             policy.channel
@@ -2361,11 +2348,11 @@ async fn update_auto_run() -> Result<Vec<String>, ClientError> {
             release.version
         )]);
     }
-    let installed_digest = std::env::current_exe()
-        .ok()
-        .and_then(|path| std::fs::read(path).ok())
-        .map(|bytes| mycelium_peer_protocol::sha256_hex(&bytes));
-    if installed_digest.as_deref() == Some(&release.artifact_digest) {
+    // `running_release` is the single source of truth for what is executing:
+    // it prefers a published release whose digest matches the binary, then the
+    // recorded state, and reports whether that identity was verified.
+    let running = myceliumd::updates::running_release(&releases);
+    if running.digest.as_deref() == Some(release.artifact_digest.as_str()) {
         return Ok(vec![format!(
             "release {} is already active",
             release.version
@@ -2374,10 +2361,12 @@ async fn update_auto_run() -> Result<Vec<String>, ClientError> {
 
     let now = unix_now();
     let mut state = myceliumd::read_update_state();
-    if let Err(reason) =
-        automatic_upgrade_allowed(state.release_version.as_deref(), &release.version)
-    {
-        return Ok(vec![reason]);
+    match automatic_upgrade_allowed(&running, &release.version) {
+        Err(reason) => return Ok(vec![reason]),
+        // A host running a local build is not a downgrade target: record why
+        // the signed release is being installed over it, then continue.
+        Ok(Some(note)) => eprintln!("mycelium: {note}"),
+        Ok(None) => {}
     }
     if state.staged_digest.as_deref() != Some(&release.artifact_digest) {
         state.staged_digest = Some(release.artifact_digest.clone());
@@ -2461,22 +2450,38 @@ fn node_rollout_offset(window_secs: u64) -> u64 {
     u64::from_str_radix(&digest[..16], 16).unwrap_or_default() % window_secs
 }
 
-fn automatic_upgrade_allowed(active: Option<&str>, candidate: &str) -> Result<(), String> {
-    let Some(active) = active else {
+/// May the updater replace what is running with `candidate`, automatically?
+///
+/// A verified release is a floor: the updater never steps a host back from a
+/// release it is actually running. A recorded release that no longer matches the
+/// bytes on disk is *not* a floor, because keeping it would freeze the host the
+/// moment a local build replaced a newer release — the channel may never publish
+/// anything above that recorded version again. Such a host converges to the
+/// channel's newest signed release, with a note explaining why.
+fn automatic_upgrade_allowed(
+    running: &myceliumd::updates::RunningRelease,
+    candidate: &str,
+) -> Result<Option<String>, String> {
+    let Some(active) = running.version.as_deref() else {
         return Err(format!(
             "release {candidate} requires one manual signed bootstrap activation"
         ));
     };
-    let active_version = semver::Version::parse(active)
-        .map_err(|error| format!("active release version `{active}` is invalid: {error}"))?;
     let candidate_version = semver::Version::parse(candidate)
         .map_err(|error| format!("candidate release version `{candidate}` is invalid: {error}"))?;
+    if !running.digest_matches {
+        return Ok(Some(format!(
+            "running binary is a local build, not the recorded release {active}; installing signed {candidate} to return to the release channel"
+        )));
+    }
+    let active_version = semver::Version::parse(active)
+        .map_err(|error| format!("active release version `{active}` is invalid: {error}"))?;
     if candidate_version <= active_version {
         return Err(format!(
             "refusing automatic non-upgrade: active={active} candidate={candidate}"
         ));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn install_update_scheduler() -> Result<(), ClientError> {
@@ -5333,14 +5338,6 @@ mod ssh_command_tests {
     }
 
     #[test]
-    fn automatic_updates_require_bootstrap_and_strictly_newer_version() {
-        assert!(automatic_upgrade_allowed(None, "0.2.0").is_err());
-        assert!(automatic_upgrade_allowed(Some("0.2.0"), "0.2.0").is_err());
-        assert!(automatic_upgrade_allowed(Some("0.2.0"), "0.1.9").is_err());
-        assert!(automatic_upgrade_allowed(Some("0.2.0"), "0.2.1").is_ok());
-    }
-
-    #[test]
     fn ssh_options_keep_remote_command_after_separator() {
         let args = [
             "titan",
@@ -5460,6 +5457,52 @@ mod ssh_command_tests {
             argv.last().map(String::as_str),
             Some("fpladmin@192.168.1.48:/tmp/agent")
         );
+    }
+
+    fn running_release(version: Option<&str>, digest_matches: bool) -> myceliumd::updates::RunningRelease {
+        myceliumd::updates::RunningRelease {
+            version: version.map(str::to_owned),
+            source: "update state",
+            digest: Some("00".repeat(32)),
+            digest_matches,
+        }
+    }
+
+    #[test]
+    fn automatic_updates_never_step_back_a_verified_release() {
+        let active = running_release(Some("0.2.26"), true);
+        assert!(automatic_upgrade_allowed(&active, "0.2.26").is_err());
+        // A string comparison would call 0.2.9 newer than 0.2.26.
+        assert!(automatic_upgrade_allowed(&active, "0.2.9").is_err());
+        assert_eq!(automatic_upgrade_allowed(&active, "0.2.27").unwrap(), None);
+    }
+
+    #[test]
+    fn a_local_build_converges_to_the_channel_instead_of_freezing() {
+        // neo's shape: the state recorded 0.2.26, a dev binary replaced it, and
+        // the channel only offers 0.2.9. Keeping 0.2.26 as a floor would mean
+        // the host never updates again.
+        let local = running_release(Some("0.2.26"), false);
+        let note = automatic_upgrade_allowed(&local, "0.2.9")
+            .unwrap()
+            .expect("a local build should converge and say why");
+        assert!(note.contains("local build"), "{note}");
+        assert!(note.contains("0.2.26"), "{note}");
+        assert!(note.contains("0.2.9"), "{note}");
+    }
+
+    #[test]
+    fn a_host_without_any_recorded_release_still_needs_a_manual_bootstrap() {
+        let fresh = running_release(None, false);
+        let error = automatic_upgrade_allowed(&fresh, "0.2.9").unwrap_err();
+        assert!(error.contains("manual signed bootstrap"), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_candidate_version_is_reported_not_activated() {
+        let active = running_release(Some("0.2.26"), true);
+        let error = automatic_upgrade_allowed(&active, "not-a-version").unwrap_err();
+        assert!(error.contains("invalid"), "{error}");
     }
 
     #[test]

@@ -369,13 +369,22 @@ async fn update_check(checks: &mut Vec<Value>, client: &mut Client) {
     let running = myceliumd::updates::running_release(&releases);
     let (installed, source, digest_matches) =
         (running.version, running.source, running.digest_matches);
+    let policy = myceliumd::read_update_policy();
     let (status, detail) = if !digest_matches {
         match installed.as_deref() {
             Some(version) => (
                 "warn",
                 format!(
-                    "update state records {version} ({source}), but the running binary does not match its digest; latest {channel} is {}",
-                    latest.version
+                    "update state records {version} ({source}), but the running binary is a local build; {}",
+                    if policy.enabled {
+                        format!(
+                            "automatic updates on channel {} will install the newest signed {} release",
+                            policy.channel, latest.version
+                        )
+                    } else {
+                        "automatic updates are disabled; run `mycelium update apply --write` to adopt a signed release"
+                            .to_owned()
+                    }
                 ),
             ),
             None => (

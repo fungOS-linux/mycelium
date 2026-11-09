@@ -29,6 +29,22 @@ latest manifest's signature is invalid.
 Version selection is semantic-version based. Earlier code compared version
 strings, so `0.2.14` sorted below `0.2.4`.
 
+### What automatic updates refuse
+
+`update auto-run` never steps a host back from a release it is actually running.
+The floor is the version of the **verified running binary**, not the version in
+`UpdateState`: if a local build replaced a released binary, the recorded version
+is a claim about bytes that are no longer executing. Keeping it as a floor would
+freeze the host as soon as the channel publishes anything below that recorded
+version (observed on neo: recorded `0.2.26`, channel latest `0.2.9`, every cycle
+logged `refusing automatic non-upgrade`).
+
+So a host with a verified release refuses older candidates and logs
+`refusing automatic non-upgrade`; a host running a local build installs the
+channel's newest signed release with a note saying why; and a host that never
+recorded a release still requires one manual `mycelium update apply --write`
+bootstrap before an agent may replace its binary.
+
 ## Reporting
 
 Use the fleet view for a per-host update report:
