@@ -13,12 +13,13 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(mycelium_gateway::server::run_with_tls(
+    runtime.block_on(mycelium_gateway::server::run_with_options(
         config.listen,
         config.routes,
         config.token_file,
         config.reload_secs,
         config.tls.map(|tls| (tls.cert, tls.key)),
+        config.usage,
     ))
 }
 
@@ -29,6 +30,7 @@ struct Config {
     token_file: Option<PathBuf>,
     reload_secs: u64,
     tls: Option<TlsFiles>,
+    usage: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +51,7 @@ mod args {
         let mut reload_secs = 1;
         let mut tls_cert = None;
         let mut tls_key = None;
+        let mut usage = None;
         let mut index = 0;
 
         while index < argv.len() {
@@ -92,6 +95,12 @@ mod args {
                         argv.get(index).ok_or("--tls-key requires a path")?,
                     ));
                 }
+                "--usage" => {
+                    index += 1;
+                    usage = Some(PathBuf::from(
+                        argv.get(index).ok_or("--usage requires a path")?,
+                    ));
+                }
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -111,13 +120,14 @@ mod args {
                 (None, None) => None,
                 _ => return Err("--tls-cert and --tls-key must be provided together".into()),
             },
+            usage,
         })
     }
 
     fn print_usage() {
         println!(
             "mycelium-gateway --listen 127.0.0.1:8080 [--routes gateway.json] \
-             [--token-file TOKEN] [--reload-secs 1] \
+             [--token-file TOKEN] [--reload-secs 1] [--usage usage.json] \
              [--tls-cert CERT --tls-key KEY]"
         );
     }
@@ -158,5 +168,16 @@ mod tests {
         let config = parse(&[]).unwrap();
         assert_eq!(config.listen, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(config.tls, None);
+        assert_eq!(config.usage, None);
+    }
+
+    #[test]
+    fn records_usage_only_when_asked() {
+        let config = parse(&["--usage", "/home/u/.mycelium/gateway/usage.json"]).unwrap();
+        assert_eq!(
+            config.usage,
+            Some(PathBuf::from("/home/u/.mycelium/gateway/usage.json"))
+        );
+        assert!(parse(&["--usage"]).is_err());
     }
 }

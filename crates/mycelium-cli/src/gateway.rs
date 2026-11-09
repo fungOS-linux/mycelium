@@ -28,6 +28,7 @@ const HTTPS_SERVICE_UNIT: &str = "mycelium-https.service";
 const SYSTEM_CA_PATH: &str = "/usr/local/share/ca-certificates/mycelium-gateway.crt";
 
 const USAGE: &str = "mycelium gateway status [--json] [--path MYCELIUM-HOME]\n\
+mycelium gateway usage [--json] [--fleet] [--path MYCELIUM-HOME]\n\
 mycelium gateway install [--write|--dry-run] [--trust-cert] [--listen ADDR] [--routes PATH] [--cert PATH --key PATH] [--gateway-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]\n\
 mycelium gateway uninstall [--write|--dry-run] [--path MYCELIUM-HOME]";
 
@@ -36,6 +37,7 @@ pub struct Paths {
     pub home: PathBuf,
     pub dir: PathBuf,
     pub routes: PathBuf,
+    pub usage: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
     pub ca: PathBuf,
@@ -62,6 +64,7 @@ impl Paths {
             home: home.to_path_buf(),
             dir,
             routes: home.join("gateway/routes.json"),
+            usage: home.join("gateway/usage.json"),
             cert,
             key,
             ca: home.join("gateway/ca.pem"),
@@ -229,6 +232,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     };
     match action {
         "status" | "" => status(rest).await,
+        "usage" => usage(rest).await,
         "install" => install(rest).await,
         "uninstall" => uninstall(rest),
         "help" | "--help" | "-h" => Ok(USAGE.lines().map(str::to_owned).collect()),
@@ -245,6 +249,188 @@ pub async fn status(args: &[String]) -> Result<Vec<String>, String> {
         return Ok(vec![value.to_string()]);
     }
     Ok(render_status(&value))
+}
+
+/// Token usage recorded by the local gateway, or rolled up across the fleet from
+/// the `mycelium_ai.*` platform metrics every daemon gossips.
+async fn usage(args: &[String]) -> Result<Vec<String>, String> {
+    let mut json_output = false;
+    let mut fleet = false;
+    let mut home = myceliumd::home_dir();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json_output = true,
+            "--fleet" => fleet = true,
+            "--path" => {
+                index += 1;
+                home = expand_home(args.get(index).ok_or("--path requires a directory")?);
+            }
+            other => return Err(format!("unknown gateway usage argument `{other}`")),
+        }
+        index += 1;
+    }
+    if fleet {
+        return fleet_usage(json_output).await;
+    }
+    let path = Paths::discover(&home).usage;
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "no token usage at {}: {error} (the gateway records usage while it runs)",
+            path.display()
+        )
+    })?;
+    let snapshot: mycelium_peer_protocol::gateway_usage::GatewayUsageSnapshot =
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if snapshot.schema_version != mycelium_peer_protocol::gateway_usage::GATEWAY_USAGE_SCHEMA_VERSION
+    {
+        return Err(format!(
+            "{} was written by a different gateway (schema {})",
+            path.display(),
+            snapshot.schema_version
+        ));
+    }
+    if json_output {
+        return Ok(vec![serde_json::to_string(&snapshot)
+            .map_err(|error| format!("encode usage: {error}"))?]);
+    }
+    Ok(render_usage(&snapshot))
+}
+
+fn render_usage(snapshot: &mycelium_peer_protocol::gateway_usage::GatewayUsageSnapshot) -> Vec<String> {
+    let totals = &snapshot.totals;
+    let mut lines = vec![format!(
+        "gateway ai usage (recorded {}, window {}s):",
+        snapshot.generated_at, snapshot.window_seconds
+    )];
+    lines.push(format!(
+        "  requests: {} (metered {}, unmetered {})",
+        totals.requests,
+        totals.metered_requests,
+        totals.unmetered_requests()
+    ));
+    lines.push(format!(
+        "  tokens: {} prompt, {} completion, {} cached",
+        totals.prompt_tokens, totals.completion_tokens, totals.cached_tokens
+    ));
+    lines.push(format!(
+        "  throughput: {:.2} tok/s now, {:.2} tok/s while generating",
+        snapshot.window.tokens_per_second(snapshot.window_seconds),
+        snapshot.window.generation_tokens_per_second()
+    ));
+    if totals.metered_requests < totals.requests {
+        lines.push(
+            "  note: unmetered requests are ones whose upstream reported no usage".into(),
+        );
+    }
+    for (label, counts) in [("route", &snapshot.routes), ("model", &snapshot.models)] {
+        if counts.is_empty() {
+            continue;
+        }
+        lines.push(format!("  by {label}:"));
+        for (name, counts) in counts {
+            lines.push(format!(
+                "    {name}: {} requests, {} prompt, {} completion",
+                counts.requests, counts.prompt_tokens, counts.completion_tokens
+            ));
+        }
+    }
+    lines
+}
+
+async fn fleet_usage(json_output: bool) -> Result<Vec<String>, String> {
+    use myceliumd::protocol::Request;
+    let mut client = crate::connect().await.map_err(|error| error.to_string())?;
+    let peers = client
+        .call(&Request::PeerList)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(render_fleet_usage(&peers, unix_now(), json_output))
+}
+
+/// Aggregate the usage each peer gossiped. Hosts with no gateway, a stale
+/// snapshot, or an older daemon simply do not appear: an absent row is honest,
+/// a zero row would be a guess.
+fn render_fleet_usage(peers: &Value, now: u64, json_output: bool) -> Vec<String> {
+    use mycelium_peer_protocol::gateway_usage::{GatewayUsageMetrics, TokenCounts};
+    let mut rows = Vec::new();
+    let mut total = TokenCounts::default();
+    let mut throughput = 0.0;
+    let mut generating = 0.0;
+    for peer in peers.as_array().into_iter().flatten() {
+        let metrics: std::collections::BTreeMap<String, String> =
+            serde_json::from_value(peer["health"]["platform_metrics"].clone()).unwrap_or_default();
+        let Some(usage) = GatewayUsageMetrics::from_platform_metrics(&metrics) else {
+            continue;
+        };
+        if !usage.is_fresh(now) {
+            continue;
+        }
+        total.add(&usage.totals);
+        throughput += usage.tokens_per_second();
+        generating += usage.generation_tokens_per_second();
+        rows.push(json!({
+            "hostname": peer["hello"]["hostname"],
+            "node_id": peer["hello"]["node_id"],
+            "updated_at": usage.updated_at,
+            "requests": usage.totals.requests,
+            "metered_requests": usage.totals.metered_requests,
+            "prompt_tokens": usage.totals.prompt_tokens,
+            "completion_tokens": usage.totals.completion_tokens,
+            "tokens_per_second": usage.tokens_per_second(),
+            "generation_tokens_per_second": usage.generation_tokens_per_second(),
+        }));
+    }
+    if json_output {
+        return vec![json!({
+            "hosts": rows.len(),
+            "totals": json!({
+                "requests": total.requests,
+                "metered_requests": total.metered_requests,
+                "prompt_tokens": total.prompt_tokens,
+                "completion_tokens": total.completion_tokens,
+                "cached_tokens": total.cached_tokens,
+                "generation_millis": total.generation_millis,
+                "tokens_per_second": throughput,
+                "generation_tokens_per_second": generating,
+            }),
+            "rows": rows,
+        })
+        .to_string()];
+    }
+    if rows.is_empty() {
+        return vec!["fleet ai usage: no gateway on any peer has recorded usage yet".into()];
+    }
+    let mut lines = vec![format!(
+        "fleet ai usage ({} machines): {} requests, {} prompt tokens, {} completion tokens, {:.2} tok/s",
+        rows.len(),
+        total.requests,
+        total.prompt_tokens,
+        total.completion_tokens,
+        throughput
+    )];
+    for row in rows {
+        lines.push(format!(
+            "  {} requests={} prompt={} completion={} tok/s={:.2}",
+            row["hostname"].as_str().unwrap_or("?"),
+            row["requests"],
+            row["prompt_tokens"],
+            row["completion_tokens"],
+            row["tokens_per_second"].as_f64().unwrap_or(0.0)
+        ));
+    }
+    lines.push(
+        "  note: hosts without a gateway, or with one that stopped reporting, are absent".into(),
+    );
+    lines
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn status_options(args: &[String]) -> Result<(PathBuf, bool), String> {
@@ -945,11 +1131,12 @@ fn render_gateway_plist(
     listen: SocketAddr,
 ) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{gateway}</string><string>--listen</string><string>{listen}</string><string>--routes</string><string>{routes}</string><string>--reload-secs</string><string>1</string><string>--tls-cert</string><string>{cert}</string><string>--tls-key</string><string>{key}</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{gateway}</string><string>--listen</string><string>{listen}</string><string>--routes</string><string>{routes}</string><string>--usage</string><string>{usage}</string><string>--reload-secs</string><string>1</string><string>--tls-cert</string><string>{cert}</string><string>--tls-key</string><string>{key}</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n",
         label = xml(GATEWAY_LABEL),
         gateway = xml(&gateway_bin.display().to_string()),
         listen = listen,
         routes = xml(&routes.display().to_string()),
+        usage = xml(&paths.usage.display().to_string()),
         cert = xml(&material.cert.display().to_string()),
         key = xml(&material.key.display().to_string()),
         log = xml(&paths.dir.join("gateway.log").display().to_string()),
@@ -968,6 +1155,7 @@ fn render_https_plist(paths: &Paths, forwarder_bin: &Path, listen: SocketAddr) -
 }
 
 fn render_gateway_unit(
+    usage: &Path,
     listen: SocketAddr,
     gateway_bin: &Path,
     routes: &Path,
@@ -976,13 +1164,14 @@ fn render_gateway_unit(
     let user = current_user()?;
     let group = current_group()?;
     Ok(format!(
-        "[Unit]\nDescription=Mycelium local .myc HTTPS gateway\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={user}\nGroup={group}\nEnvironment={home}\nExecStart={gateway} --listen {listen} --routes {routes} --reload-secs 1 --tls-cert {cert} --tls-key {key}\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Mycelium local .myc HTTPS gateway\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={user}\nGroup={group}\nEnvironment={home}\nExecStart={gateway} --listen {listen} --routes {routes} --usage {usage} --reload-secs 1 --tls-cert {cert} --tls-key {key}\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n",
         home = systemd_quote(&format!(
             "HOME={}",
             user_home()?.display()
         )),
         gateway = systemd_quote(&gateway_bin.display().to_string()),
         routes = systemd_quote(&routes.display().to_string()),
+        usage = systemd_quote(&usage.display().to_string()),
         cert = systemd_quote(&material.cert.display().to_string()),
         key = systemd_quote(&material.key.display().to_string()),
     ))
@@ -1059,7 +1248,7 @@ fn install_gateway_service(
             )?;
         }
         Platform::Linux => {
-            let unit = render_gateway_unit(listen, gateway_bin, routes, material)?;
+            let unit = render_gateway_unit(&paths.usage, listen, gateway_bin, routes, material)?;
             install_system_unit(&paths.dir, GATEWAY_UNIT, &unit)?;
         }
     }
@@ -1384,17 +1573,26 @@ fn default_routes(home: &Path) -> Value {
     } else {
         std::env::current_exe().unwrap_or_else(|_| home.join("bin/mycelium"))
     };
+    // `ai.myc` is the one AI endpoint every client is configured with. It serves
+    // from this machine first, then an `ai` lease discovered on the mesh, and
+    // finally the public Bifrost edge. The file only becomes a credential
+    // override when it exists; without it the caller's own key reaches the edge.
+    let cloud_key = user_home().ok().map(|home| home.join(".fpl/bifrost-api-key"));
+    let mut ai_route = json!({
+        "name": "ai",
+        "hosts": ["ai.myc", "api.myc"],
+        "upstream": ["http://127.0.0.1:4000", "https://ai.fpl.dev"],
+        "service_kind": "ai",
+        "priority": 10
+    });
+    if let Some(cloud_key) = cloud_key.as_deref().filter(|path| path.is_file()) {
+        ai_route["remote_token_file"] = json!(cloud_key.display().to_string());
+    }
     json!({
         "mycelium_bin": mycelium.display().to_string(),
         "service_refresh_secs": 15,
         "routes": [
-            {
-                "name": "bifrost",
-                "hosts": ["ai.myc", "api.myc"],
-                "upstream": "http://127.0.0.1:4000",
-                "service_kind": "ai",
-                "priority": 10
-            },
+            ai_route,
             {
                 "name": "mcp",
                 "hosts": ["mcp.myc"],
@@ -1682,6 +1880,107 @@ mod tests {
     }
 
     #[test]
+    fn the_ai_route_falls_back_to_the_public_edge() {
+        let routes = default_routes(Path::new("/tmp/mycelium-home"));
+        let ai = routes["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["name"] == "ai")
+            .expect("the ai route is what every client points at");
+        let upstreams = ai["upstream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(upstreams, vec!["http://127.0.0.1:4000", "https://ai.fpl.dev"]);
+        assert_eq!(ai["service_kind"], "ai");
+    }
+
+    #[test]
+    fn fleet_usage_sums_fresh_hosts_and_drops_stale_ones() {
+        use mycelium_peer_protocol::gateway_usage::{
+            GatewayUsageMetrics, TokenCounts, GATEWAY_USAGE_MAX_AGE_SECONDS,
+        };
+        let peer = |hostname: &str, updated_at: u64, completion: u64| {
+            let usage = GatewayUsageMetrics {
+                updated_at,
+                window_seconds: 60,
+                totals: TokenCounts {
+                    requests: 2,
+                    metered_requests: 2,
+                    prompt_tokens: 10,
+                    completion_tokens: completion,
+                    ..TokenCounts::default()
+                },
+                window: TokenCounts {
+                    requests: 1,
+                    metered_requests: 1,
+                    completion_tokens: 60,
+                    generation_millis: 60_000,
+                    ..TokenCounts::default()
+                },
+            };
+            json!({
+                "hello": {"hostname": hostname, "node_id": hostname},
+                "health": {"platform_metrics": usage.to_platform_metrics()}
+            })
+        };
+        let now = 10_000;
+        let peers = json!([
+            peer("agora-one", now - 5, 30),
+            peer("titan", now - 10, 10),
+            peer("gone", now - GATEWAY_USAGE_MAX_AGE_SECONDS - 60, 999),
+            json!({"hello": {"hostname": "no-gateway"}, "health": {"platform_metrics": {}}}),
+        ]);
+        let rendered = render_fleet_usage(&peers, now, false).join("\n");
+        assert!(
+            rendered.contains("fleet ai usage (2 machines): 4 requests, 20 prompt tokens, 40 completion tokens"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("agora-one requests=2 prompt=10 completion=30 tok/s=1.00"));
+        assert!(!rendered.contains("gone"), "{rendered}");
+        assert!(!rendered.contains("no-gateway"), "{rendered}");
+
+        let collected: Value = serde_json::from_str(&render_fleet_usage(&peers, now, true)[0]).unwrap();
+        assert_eq!(collected["hosts"], json!(2));
+        assert_eq!(collected["totals"]["completion_tokens"], json!(40));
+        assert_eq!(collected["rows"][0]["hostname"], json!("agora-one"));
+    }
+
+    #[test]
+    fn usage_rendering_makes_unmetered_requests_visible() {
+        use mycelium_peer_protocol::gateway_usage::{GatewayUsageSnapshot, TokenCounts};
+        let snapshot = GatewayUsageSnapshot {
+            schema_version: 1,
+            generated_at: 100,
+            window_seconds: 60,
+            totals: TokenCounts {
+                requests: 3,
+                metered_requests: 2,
+                prompt_tokens: 40,
+                completion_tokens: 10,
+                generation_millis: 2_000,
+                ..TokenCounts::default()
+            },
+            window: TokenCounts {
+                requests: 1,
+                metered_requests: 1,
+                completion_tokens: 60,
+                generation_millis: 1_000,
+                ..TokenCounts::default()
+            },
+            ..GatewayUsageSnapshot::default()
+        };
+        let rendered = render_usage(&snapshot).join("\n");
+        assert!(rendered.contains("requests: 3 (metered 2, unmetered 1)"), "{rendered}");
+        assert!(rendered.contains("throughput: 1.00 tok/s now"), "{rendered}");
+        assert!(rendered.contains("60.00 tok/s while generating"), "{rendered}");
+        assert!(rendered.contains("unmetered requests"), "{rendered}");
+    }
+
+    #[test]
     fn home_route_has_no_invented_backend() {
         let routes = default_routes(Path::new("/tmp/mycelium-home"));
         let home = routes["routes"]
@@ -1787,6 +2086,7 @@ mod tests {
             generated: false,
         };
         let gateway = render_gateway_unit(
+            Path::new("/home/a/.mycelium/gateway/usage.json"),
             listen,
             Path::new("/home/a/.mycelium/bin/mycelium-gateway"),
             Path::new("/home/a/.mycelium/gateway/routes.json"),
@@ -1794,6 +2094,7 @@ mod tests {
         )
         .unwrap();
         assert!(gateway.contains("--listen 127.0.0.1:10443"));
+        assert!(gateway.contains("--usage \"/home/a/.mycelium/gateway/usage.json\""));
         assert!(gateway.contains("Restart=on-failure"));
         assert!(gateway.contains("mycelium-gateway"));
         let socket = render_https_socket_unit();

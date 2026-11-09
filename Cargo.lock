@@ -2701,6 +2701,7 @@ dependencies = [
  "axum",
  "futures-util",
  "hyper-util",
+ "mycelium-peer-protocol",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",

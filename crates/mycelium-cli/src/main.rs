@@ -109,6 +109,7 @@ usage:
   mycelium setup --repair [--site SITE] [--path MYCELIUM-HOME] [--system-service] [--local-gateway] [--trust-cert]
   mycelium setup --packaged --claim-file PATH | --packaged --repair
   mycelium gateway status [--json]
+  mycelium gateway usage [--json] [--fleet]
   mycelium gateway install [--write|--dry-run] [--trust-cert] [--routes PATH] [--cert PATH --key PATH] [--gateway-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]
   mycelium gateway uninstall [--write|--dry-run]
   mycelium doctor [--json] [--fix] [--trust-cert]

@@ -1,5 +1,6 @@
 //! Symmetric, transport-neutral messages exchanged by Mycelium peers.
 
+pub mod gateway_usage;
 pub mod identity;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -9,10 +9,11 @@ pub struct Route {
     pub name: String,
     #[serde(default)]
     pub hosts: Vec<String>,
-    /// Static upstream, normally the local backend. Tried before discovered
-    /// services. Omit for a discovery-only route.
-    #[serde(default)]
-    pub upstream: Option<String>,
+    /// Upstream candidates in the order the operator wrote them. Accepts one
+    /// URL or a list; loopback entries are always tried before discovered peers
+    /// and before public fallbacks. Omit for a discovery-only route.
+    #[serde(default, rename = "upstream", deserialize_with = "one_or_many")]
+    pub upstreams: Vec<String>,
     /// Mycelium service kind used for remote candidates, e.g. `ai`.
     #[serde(default)]
     pub service_kind: Option<String>,
@@ -20,8 +21,34 @@ pub struct Route {
     /// The caller's local token is never forwarded to a discovered peer.
     #[serde(default)]
     pub remote_token_env: Option<String>,
+    /// File holding the bearer token for remote candidates. Use this when the
+    /// service manager cannot pass an environment file (launchd).
+    #[serde(default)]
+    pub remote_token_file: Option<PathBuf>,
     #[serde(default)]
     pub priority: i32,
+}
+
+impl Route {
+    pub fn upstream_urls(&self) -> impl Iterator<Item = reqwest::Url> + '_ {
+        self.upstreams
+            .iter()
+            .filter_map(|value| reqwest::Url::parse(value).ok())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MeteringConfig {
+    /// Ask streaming OpenAI-compatible upstreams to close with a usage event.
+    /// Without it a stream reports generated text but no token counts.
+    pub stream_usage: bool,
+}
+
+impl Default for MeteringConfig {
+    fn default() -> Self {
+        Self { stream_usage: true }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -36,6 +63,24 @@ pub struct GatewayConfig {
     pub mycelium_bin: Option<PathBuf>,
     #[serde(default = "default_service_refresh_secs")]
     pub service_refresh_secs: u64,
+    #[serde(default)]
+    pub metering: MeteringConfig,
+}
+
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(url) => vec![url],
+        OneOrMany::Many(urls) => urls,
+    })
 }
 
 fn default_service_refresh_secs() -> u64 {
@@ -49,6 +94,7 @@ impl Default for GatewayConfig {
             default_route: None,
             mycelium_bin: None,
             service_refresh_secs: default_service_refresh_secs(),
+            metering: MeteringConfig::default(),
         }
     }
 }
@@ -113,13 +159,19 @@ impl GatewayConfig {
                     route.name
                 )));
             }
-            if route.upstream.is_none() && route.service_kind.is_none() {
+            if route.upstreams.len() > 8 {
+                return Err(ConfigError::Validation(format!(
+                    "route `{}` has more than 8 upstreams",
+                    route.name
+                )));
+            }
+            if route.upstreams.is_empty() && route.service_kind.is_none() {
                 return Err(ConfigError::Validation(format!(
                     "route `{}` needs upstream or service_kind",
                     route.name
                 )));
             }
-            if let Some(upstream) = &route.upstream {
+            for upstream in &route.upstreams {
                 if !upstream.starts_with("http://") && !upstream.starts_with("https://") {
                     return Err(ConfigError::Validation(format!(
                         "route `{}` upstream must be an http(s) URL",
@@ -157,6 +209,12 @@ impl GatewayConfig {
             {
                 return Err(ConfigError::Validation(format!(
                     "route `{}` has an empty remote_token_env",
+                    route.name
+                )));
+            }
+            if route.remote_token_env.is_some() && route.remote_token_file.is_some() {
+                return Err(ConfigError::Validation(format!(
+                    "route `{}` sets both remote_token_env and remote_token_file",
                     route.name
                 )));
             }
@@ -266,5 +324,63 @@ mod tests {
             }"#,
         );
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn upstream_accepts_one_url_or_a_fallback_list() {
+        let single = config(
+            r#"{
+                "routes": [{
+                    "name": "ai",
+                    "hosts": ["ai.myc"],
+                    "upstream": "http://127.0.0.1:4000"
+                }]
+            }"#,
+        );
+        assert!(single.validate().is_ok());
+        assert_eq!(single.routes[0].upstreams, vec!["http://127.0.0.1:4000"]);
+
+        let many = config(
+            r#"{
+                "routes": [{
+                    "name": "ai",
+                    "hosts": ["ai.myc"],
+                    "upstream": ["http://127.0.0.1:4000", "https://ai.fpl.dev"]
+                }]
+            }"#,
+        );
+        assert!(many.validate().is_ok());
+        assert_eq!(many.routes[0].upstreams.len(), 2);
+        assert_eq!(
+            many.routes[0]
+                .upstream_urls()
+                .map(|url| url.to_string())
+                .collect::<Vec<_>>(),
+            vec!["http://127.0.0.1:4000/", "https://ai.fpl.dev/"]
+        );
+    }
+
+    #[test]
+    fn a_route_cannot_carry_two_remote_credentials() {
+        let config = config(
+            r#"{
+                "routes": [{
+                    "name": "ai",
+                    "hosts": ["ai.myc"],
+                    "upstream": ["http://127.0.0.1:4000", "https://ai.fpl.dev"],
+                    "remote_token_env": "MYCELIUM_AI_TOKEN",
+                    "remote_token_file": "/run/secrets/ai-token"
+                }]
+            }"#,
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn metering_is_on_unless_turned_off() {
+        let enabled = config(r#"{"routes": []}"#);
+        assert!(enabled.metering.stream_usage);
+        let disabled = config(r#"{"routes": [], "metering": {"stream_usage": false}}"#);
+        assert!(!disabled.metering.stream_usage);
     }
 }

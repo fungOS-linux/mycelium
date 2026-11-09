@@ -49,7 +49,7 @@ impl ServiceIndex {
         Self::from_catalog(&local_node, &catalog, now())
     }
 
-    fn from_catalog(
+    pub(crate) fn from_catalog(
         local_node: &str,
         catalog: &serde_json::Value,
         now: u64,
@@ -139,7 +139,7 @@ impl ServiceIndex {
     }
 }
 
-fn is_loopback(url: &reqwest::Url) -> bool {
+pub(crate) fn is_loopback(url: &reqwest::Url) -> bool {
     url.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")
             || host

@@ -2352,7 +2352,44 @@ fn collect_health() -> Result<HostHealth, AnyError> {
     #[cfg(target_os = "macos")]
     let mut health = collect_darwin()?;
     add_update_health(&mut health);
+    add_gateway_usage(&mut health);
     Ok(health)
+}
+
+/// Publish the token counters the local gateway persists so every peer can roll
+/// them up. A snapshot that is not fresh is dropped instead of gossiped: a
+/// gateway that stopped running must not look like a fleet that went quiet.
+fn add_gateway_usage(health: &mut HostHealth) {
+    let path = crate::home_dir().join("gateway/usage.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    match gateway_usage_metrics(&bytes, now()) {
+        Ok(metrics) => health.platform_metrics.extend(metrics),
+        Err(error) => eprintln!("gateway usage: {}: {error}", path.display()),
+    }
+}
+
+fn gateway_usage_metrics(
+    bytes: &[u8],
+    now: u64,
+) -> Result<BTreeMap<String, String>, String> {
+    use mycelium_peer_protocol::gateway_usage::{
+        GatewayUsageMetrics, GatewayUsageSnapshot, GATEWAY_USAGE_SCHEMA_VERSION,
+    };
+    let snapshot: GatewayUsageSnapshot =
+        serde_json::from_slice(bytes).map_err(|error| format!("unreadable usage: {error}"))?;
+    if snapshot.schema_version != GATEWAY_USAGE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported usage schema {}",
+            snapshot.schema_version
+        ));
+    }
+    let metrics = GatewayUsageMetrics::from_snapshot(&snapshot);
+    if !metrics.is_fresh(now) {
+        return Err("usage snapshot is stale".into());
+    }
+    Ok(metrics.to_platform_metrics())
 }
 
 fn add_update_health(health: &mut HostHealth) {
@@ -2595,6 +2632,43 @@ fn parse_darwin_swap(text: &str) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage_document(generated_at: u64, schema_version: u16) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": schema_version,
+            "generated_at": generated_at,
+            "window_seconds": 60,
+            "totals": {"requests": 3, "metered_requests": 2,
+                "prompt_tokens": 40, "completion_tokens": 12},
+            "window": {"requests": 1, "completion_tokens": 4, "generation_millis": 1000}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn fresh_gateway_usage_is_gossiped_and_stale_usage_is_dropped() {
+        let metrics = gateway_usage_metrics(&usage_document(1_000, 1), 1_060).unwrap();
+        assert_eq!(
+            metrics.get("mycelium_ai.completion_tokens").map(String::as_str),
+            Some("12")
+        );
+        assert_eq!(
+            metrics.get("mycelium_ai.window_completion_tokens").map(String::as_str),
+            Some("4")
+        );
+        // A stopped gateway must not report yesterday's traffic as current.
+        assert!(gateway_usage_metrics(
+            &usage_document(1_000, 1),
+            1_000 + mycelium_peer_protocol::gateway_usage::GATEWAY_USAGE_MAX_AGE_SECONDS + 1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn usage_from_another_schema_is_not_reinterpreted() {
+        assert!(gateway_usage_metrics(&usage_document(1_000, 99), 1_060).is_err());
+        assert!(gateway_usage_metrics(b"not json", 1_060).is_err());
+    }
 
     #[test]
     fn renewal_gossip_is_origin_bound_and_slot_bounded() {
