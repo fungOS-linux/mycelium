@@ -73,8 +73,11 @@ impl Settings {
                 sites.insert(record.site.clone());
             }
         }
+        // Lists are read where the policy is applied, so the files stay the
+        // only source of truth; a failed read fails the render.
+        let blocks = self.resolver.blocks()?;
         self.resolver
-            .render_for_sites(records, &sites.into_iter().collect::<Vec<_>>())
+            .render_with(records, &sites.into_iter().collect::<Vec<_>>(), &blocks)
     }
     fn validate(&self) -> Result<(), String> {
         let aliases = service_dns::aliases(self)?;
@@ -89,7 +92,7 @@ impl Settings {
             return Err("invalid service index peer identity".into());
         }
         self.resolver
-            .render_for_sites(vec![], &self.additional_sites)?;
+            .render_with(vec![], &self.additional_sites, &self.resolver.blocks()?)?;
         if !self.dnsmasq.is_absolute() || !self.mycelium.is_absolute() {
             return Err("binary paths must be absolute".into());
         }
@@ -648,7 +651,11 @@ impl Device for ResolverDevice {
                     .ok_or_else(|| failure("no fresh reachable peer records"))?;
                 verify(&self.settings, first).map_err(failure)?;
                 let (zone, expected) = self.settings.resolver.macos_namespace().map_err(failure)?;
+                let blocks = self.settings.resolver.blocks().map_err(failure)?;
                 json!({"mode":self.settings.resolver.mode,"verified_record":first,
+                    "blocking":{"zones":blocks.len(),"skipped":blocks.skipped(),
+                        "action":self.settings.resolver.block_action.as_str(),
+                        "sources":blocks.sources(),"allowlist":blocks.allowlist().len()},
                     "namespace_installed":if cfg!(target_os="linux") { linux_namespace::installed(&self.settings) } else { fs::read_to_string(Path::new("/etc/resolver").join(zone)).is_ok_and(|s|s==expected) },"default_dns_changed":false})
             }
             "dns.resolver.system-install" => {
@@ -1023,8 +1030,12 @@ pub async fn command(args: &[String]) -> Result<String, String> {
     let device = ResolverDevice::load(&config.ok_or("--config is required")?)?;
     if action == "plan" {
         let records = observe(&device.settings).await?;
+        let blocks = device.settings.resolver.blocks()?;
         return Ok(
             json!({"mode":device.settings.resolver.mode,"records":records,
+            "blocking":{"zones":blocks.len(),"skipped":blocks.skipped(),
+                "action":device.settings.resolver.block_action.as_str(),
+                "sources":blocks.sources(),"allowlist":blocks.allowlist().len()},
             "dnsmasq":device.settings.render(records.clone())?,
             "lan_activation_supported":false,"dhcp_changed":false})
             .to_string(),
@@ -1062,6 +1073,9 @@ mod tests {
                 service_address: None,
                 upstreams: vec![],
                 delegations: vec![],
+                blocklists: vec![],
+                block_action: mycelium_dns_policy::BlockAction::default(),
+                allowlist: vec![],
             },
             dnsmasq: "/bin/dnsmasq".into(),
             mycelium: "/bin/mycelium".into(),
@@ -1323,5 +1337,38 @@ mod tests {
             .unwrap()
             .dry_run
         );
+    }
+
+    #[test]
+    fn blocking_sources_render_into_the_config_and_never_shadow_the_namespace() {
+        let mut settings = settings();
+        let path = std::env::temp_dir().join(format!("driver-block-{}", std::process::id()));
+        fs::write(&path, "0.0.0.0 ads.example.com\n||tracker.example.net^\n").unwrap();
+        settings.resolver.blocklists =
+            vec![mycelium_dns_policy::BlocklistSource { path: path.clone() }];
+        settings.resolver.allowlist = vec!["example.org".into()];
+        let recorded = DnsRecord {
+            name: "neo.lab.myc".into(),
+            address: "192.0.2.20".parse().unwrap(),
+            site: "lab".into(),
+            node: "neo".into(),
+        };
+        let text = settings.render(vec![recorded.clone()]).unwrap();
+        assert!(text.contains("address=/ads.example.com/0.0.0.0\n"));
+        assert!(text.contains("address=/ads.example.com/::\n"));
+        assert!(text.contains("address=/tracker.example.net/0.0.0.0\n"));
+        // Blocking never displaces an authoritative mesh name.
+        assert!(text.contains("host-record=neo.lab.myc,192.0.2.20\n"));
+        settings.resolver.block_action = mycelium_dns_policy::BlockAction::Nxdomain;
+        let text = settings.render(vec![recorded.clone()]).unwrap();
+        assert!(text.contains("local=/ads.example.com/\n"));
+        assert!(!text.contains("address=/ads.example.com/"));
+        // A mesh name in a list, and a list that is not a list, both stop the
+        // render instead of being silently dropped.
+        fs::write(&path, "node.lab.myc\n").unwrap();
+        assert!(settings.render(vec![recorded.clone()]).is_err());
+        fs::write(&path, "<html>rate limited</html>\n").unwrap();
+        assert!(settings.render(vec![recorded]).is_err());
+        let _ = fs::remove_file(&path);
     }
 }

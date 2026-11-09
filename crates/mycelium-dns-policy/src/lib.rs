@@ -128,7 +128,7 @@ pub fn plan(
     })
 }
 
-fn within(name: &str, zone: &str) -> bool {
+pub(crate) fn within(name: &str, zone: &str) -> bool {
     name == zone || name.ends_with(&format!(".{zone}"))
 }
 
@@ -306,7 +306,9 @@ mod tests {
         assert!(serde_json::from_str::<Delegation>(r#"{"zone":"shroud.svc","site":"lab","owner":"shroud","server":"192.0.2.53","port":53,"members":[]}"#).is_err());
     }
 }
+pub mod blocklist;
 pub mod resolver;
 pub mod service_address;
 
+pub use blocklist::{BlockAction, Blocklist, BlocklistSource, SourceStat};
 pub use service_address::FleetDnsAddress;

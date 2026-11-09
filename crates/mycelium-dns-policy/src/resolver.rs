@@ -1,4 +1,5 @@
 //! Optional resolver policy. Naming is separate from reachability and grants.
+use crate::blocklist::{BlockAction, Blocklist, BlocklistSource};
 use crate::{canonical_domain, plan, Delegation, DnsRecord, FleetDnsAddress};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
@@ -31,6 +32,15 @@ pub struct ResolverConfig {
     /// This authorizes catch-all DNS, not TLS issuance or application access.
     #[serde(default)]
     pub namespace_owners: std::collections::BTreeMap<String, String>,
+    /// Local, already-fetched blocking sources; empty disables blocking.
+    /// Fetching is a separate explicit step, so rendering stays deterministic.
+    #[serde(default)]
+    pub blocklists: Vec<BlocklistSource>,
+    #[serde(default)]
+    pub block_action: BlockAction,
+    /// Domains that must never be blocked, including their whole subtree.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
 }
 
 impl ResolverConfig {
@@ -44,6 +54,22 @@ impl ResolverConfig {
         &self,
         records: Vec<DnsRecord>,
         additional_sites: &[String],
+    ) -> Result<String, String> {
+        self.render_with(records, additional_sites, &Blocklist::default())
+    }
+
+    /// Load the configured local lists against this resolver's namespace.
+    pub fn blocks(&self) -> Result<Blocklist, String> {
+        Blocklist::load(&self.blocklists, &self.suffix, &self.allowlist)
+    }
+
+    /// Render with an already-loaded blocklist so `apply` and `plan` share one
+    /// parse, and so a caller can report counts without rendering twice.
+    pub fn render_with(
+        &self,
+        records: Vec<DnsRecord>,
+        additional_sites: &[String],
+        blocks: &Blocklist,
     ) -> Result<String, String> {
         let mut sites = std::collections::BTreeSet::new();
         if additional_sites.len() > 32 {
@@ -132,8 +158,14 @@ impl ResolverConfig {
                 return Err("fleet DNS service address requires port 53".into());
             }
             let service_ip = IpAddr::V6(service.address());
-            if self.listen.iter().any(|listener| listener.ip() == service_ip)
-                || self.upstreams.iter().any(|upstream| upstream.ip() == service_ip)
+            if self
+                .listen
+                .iter()
+                .any(|listener| listener.ip() == service_ip)
+                || self
+                    .upstreams
+                    .iter()
+                    .any(|upstream| upstream.ip() == service_ip)
                 || admitted_records
                     .iter()
                     .any(|record| record.address == service_ip)
@@ -144,6 +176,27 @@ impl ResolverConfig {
                 );
             }
             config.push_str(&format!("listen-address={service_ip}\n"));
+        }
+        // A block entry at or below a delegated or owned namespace is shadowed
+        // by that namespace's more specific directive, so the operator would
+        // see a rule that never fires. Fail instead of serving a half policy.
+        for delegation in &self.delegations {
+            if let Some(entry) = blocks.covers(&delegation.zone) {
+                return Err(format!(
+                    "blocklist entry `{entry}` is shadowed by delegated namespace {}",
+                    delegation.zone
+                ));
+            }
+        }
+        for namespace in self.namespace_owners.keys() {
+            if let Some(entry) = blocks.covers(namespace) {
+                return Err(format!(
+                    "blocklist entry `{entry}` is shadowed by owned namespace {namespace}"
+                ));
+            }
+        }
+        if !blocks.is_empty() {
+            config.push_str(&blocks.render(self.block_action));
         }
         for server in &self.upstreams {
             config.push_str(&format!("server={}#{}\n", server.ip(), server.port()));
@@ -341,6 +394,9 @@ mod tests {
             upstreams: vec!["1.1.1.1:53".parse().unwrap()],
             service_address: None,
             delegations: vec![],
+            blocklists: vec![],
+            block_action: BlockAction::default(),
+            allowlist: vec![],
         }
     }
     #[test]

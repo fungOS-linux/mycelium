@@ -224,6 +224,8 @@ usage:
   mycelium dns plan --site SITE [--suffix DOMAIN] [--delegations FILE] [--json|--dnsmasq]
   mycelium dns resolver plan|status --config FILE
   mycelium dns resolver apply|run|system-install|system-remove --config FILE --write [--dry-run]
+  mycelium dns blocklist plan --source FILE... [--allow DOMAIN]... [--action sinkhole|nxdomain] [--json|--dnsmasq]
+  mycelium dns blocklist check NAME --source FILE... [--allow DOMAIN]... [--json]
   mycelium security status|events [--json]
   mycelium security scan [--stig-content PATH --stig-profile ID] [--remediation-plan] [--json]
   mycelium security sinks list [--json]
@@ -1545,6 +1547,9 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
             .map(|output| vec![output])
             .map_err(|error| err_usage(&error));
     }
+    if action == "blocklist" {
+        return dns::blocklist(&args[1..]).map_err(|error| err_usage(&error));
+    }
     if action == "service-address" {
         let mut prefix = None;
         let mut json = false;
@@ -1581,7 +1586,7 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     }
     if !matches!(action, "zone" | "plan") {
         return Err(err_usage(
-            "dns supports `zone` and read-only `plan`; apply is not supported",
+            "dns supports `zone`, read-only `plan`, `resolver` and `blocklist`",
         ));
     }
     let mut suffix = "mycelium";
