@@ -148,7 +148,12 @@ pub fn issue(ca: &Path, request: Issue<'_>) -> Result<Vec<String>, ClientError> 
     // peer verifies, so gossip survives a new LAN.
     let fleet = mycelium_core::fleet_name(request.name, request.site)
         .ok_or_else(|| usage("name and site do not produce a usable fleet name"))?;
-    let san = subject_alt_name(&addresses, &fleet);
+    // Keep the node's CN as a name too: seeds written before fleet names were
+    // introduced verify against it, so rotating a certificate does not break
+    // peers that still dial `pris:7443`.
+    let mut san_names = addresses.clone();
+    san_names.insert(request.name);
+    let san = subject_alt_name(&san_names, &fleet);
     openssl(&["genpkey", "-algorithm", "ED25519", "-out", &display(&key)?])?;
     openssl(&[
         "req",
@@ -940,6 +945,12 @@ mod tests {
         assert_eq!(
             subject_alt_name(&addresses, "fpl-beachhead-1.beachhead.myc"),
             "subjectAltName=DNS:fpl-beachhead-1.beachhead.myc,IP:10.118.0.11,IP:134.209.208.195,DNS:fpl-beachhead-1.internal"
+        );
+        let mut with_legacy_name = addresses.clone();
+        with_legacy_name.insert("fpl-beachhead-1");
+        assert_eq!(
+            subject_alt_name(&with_legacy_name, "fpl-beachhead-1.beachhead.myc"),
+            "subjectAltName=DNS:fpl-beachhead-1.beachhead.myc,IP:10.118.0.11,IP:134.209.208.195,DNS:fpl-beachhead-1,DNS:fpl-beachhead-1.internal"
         );
     }
 
