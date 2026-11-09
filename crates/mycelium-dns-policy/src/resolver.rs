@@ -322,12 +322,12 @@ mod tests {
         let mut config = config();
         config.mode = ResolverMode::LanServing;
         config.listen = vec!["127.0.0.1:53".parse().unwrap()];
-        config.service_address = Some("fd7a:115c:a1e0::/48".parse().unwrap());
+        config.service_address = Some("fd42:6d79:6365::/48".parse().unwrap());
         let rendered = config.render(Vec::new()).unwrap();
-        assert!(rendered.contains("listen-address=fd7a:115c:a1e0::53"));
+        assert!(rendered.contains("listen-address=fd42:6d79:6365::53"));
         config.listen = vec!["127.0.0.1:1053".parse().unwrap()];
         assert!(config.render(Vec::new()).is_err());
-        config.listen = vec!["[fd7a:115c:a1e0::53]:53".parse().unwrap()];
+        config.listen = vec!["[fd42:6d79:6365::53]:53".parse().unwrap()];
         assert!(config.render(Vec::new()).is_err());
     }
 

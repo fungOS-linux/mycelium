@@ -10,6 +10,10 @@ use std::net::Ipv6Addr;
 use std::str::FromStr;
 
 /// A ULA prefix plus the derived `<prefix>::53` service address.
+///
+/// Generate one random `/48` per fleet and keep it in the enrollment CA. Do
+/// not reuse Tailscale's `fd7a:115c:a1e0::/48`; both planes may coexist on the
+/// same host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FleetDnsAddress {
     prefix: Ipv6Addr,
@@ -100,17 +104,17 @@ mod tests {
 
     #[test]
     fn derives_the_service_address_from_a_ula_prefix() {
-        let service: FleetDnsAddress = "fd7a:115c:a1e0::/48".parse().unwrap();
-        assert_eq!(service.address().to_string(), "fd7a:115c:a1e0::53");
-        assert_eq!(service.prefix().to_string(), "fd7a:115c:a1e0::");
+        let service: FleetDnsAddress = "fd42:6d79:6365::/48".parse().unwrap();
+        assert_eq!(service.address().to_string(), "fd42:6d79:6365::53");
+        assert_eq!(service.prefix().to_string(), "fd42:6d79:6365::");
         assert_eq!(service.prefix_len(), 48);
-        assert_eq!(service.to_string(), "fd7a:115c:a1e0::/48");
+        assert_eq!(service.to_string(), "fd42:6d79:6365::/48");
     }
 
     #[test]
     fn supports_site_scoped_64_bit_prefixes() {
-        let service: FleetDnsAddress = "fd7a:115c:a1e0:12::/64".parse().unwrap();
-        assert_eq!(service.address().to_string(), "fd7a:115c:a1e0:12::53");
+        let service: FleetDnsAddress = "fd42:6d79:6365:12::/64".parse().unwrap();
+        assert_eq!(service.address().to_string(), "fd42:6d79:6365:12::53");
     }
 
     #[test]
@@ -125,9 +129,9 @@ mod tests {
 
     #[test]
     fn serializes_as_a_cidr_string() {
-        let service: FleetDnsAddress = "fd7a:115c:a1e0::/48".parse().unwrap();
+        let service: FleetDnsAddress = "fd42:6d79:6365::/48".parse().unwrap();
         let encoded = serde_json::to_string(&service).unwrap();
-        assert_eq!(encoded, "\"fd7a:115c:a1e0::/48\"");
+        assert_eq!(encoded, "\"fd42:6d79:6365::/48\"");
         let decoded: FleetDnsAddress = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, service);
     }
