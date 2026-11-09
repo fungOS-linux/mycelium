@@ -294,7 +294,19 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
             .into_iter()
             .next()
             .ok_or("no fresh record for OS qualification")?;
-        verify(settings, &first)?;
+        // The supervisor refreshes every refresh interval, so the record just
+        // observed may not be in the running configuration yet.
+        let mut verified = false;
+        for _ in 0..30 {
+            if verify(settings, &first).is_ok() {
+                verified = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if !verified {
+            return Err("running resolver does not serve the observed record yet".into());
+        }
         Some(first)
     };
     let (server, suffix) = parameters(settings)?;
