@@ -168,8 +168,11 @@ pub fn init(path: &Path, options: InitOptions, force: bool) -> Result<Value, Str
             mode: ResolverMode::LocalhostOnly,
             site: options.site,
             suffix: options.suffix,
+            // Port 53 needs root on both platforms. The resolver is a user
+            // service and the OS wiring carries the port, so default to an
+            // unprivileged one and let an operator ask for 53 explicitly.
             listen: if options.listen.is_empty() {
-                vec!["127.0.0.1:53".parse().expect("static listener")]
+                vec!["127.0.0.1:5335".parse().expect("static listener")]
             } else {
                 options.listen
             },
@@ -1612,7 +1615,7 @@ mod tests {
         assert_eq!(created["site"], "lab");
         let stored: Settings = read_json(&path).unwrap();
         assert_eq!(stored.resolver.mode, ResolverMode::LocalhostOnly);
-        assert_eq!(stored.resolver.listen[0].to_string(), "127.0.0.1:53");
+        assert_eq!(stored.resolver.listen[0].to_string(), "127.0.0.1:5335");
         assert_eq!(stored.reachable_prefixes, ["192.0.2.0/24"]);
         // A repaired node must not silently widen what it publishes.
         assert!(init(&path, options(), false).is_err());
