@@ -800,19 +800,26 @@ fn install_daemon(settings: &Settings, config_path: &Path, remove: bool) -> Resu
         Duration::from_secs(5),
     )
     .unwrap_or(false);
-    let started = if loaded {
-        launchctl(
+    // launchd throttles a job that has been crash-looping, and then refuses
+    // `kickstart` even when the job is now healthy. Fall back to a full
+    // bootout/bootstrap rather than reporting a failure we can fix.
+    let kickstarted = loaded
+        && launchctl(
             &["kickstart", "-k", &format!("system/{DAEMON_LABEL}")],
             Duration::from_secs(15),
-        )?
-    } else {
-        launchctl(
+        )
+        .unwrap_or(false);
+    if !kickstarted {
+        let _ = launchctl(
+            &["bootout", &format!("system/{DAEMON_LABEL}")],
+            Duration::from_secs(10),
+        );
+        if !launchctl(
             &["bootstrap", "system", DAEMON_PLIST],
             Duration::from_secs(15),
-        )?
-    };
-    if !started {
-        return Err("could not start the root DNS daemon".into());
+        )? {
+            return Err("could not start the root DNS daemon".into());
+        }
     }
     let _ = launchctl(
         &["enable", &format!("system/{DAEMON_LABEL}")],
