@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mycelium_peer_protocol::AccessStatement;
+use mycelium_peer_protocol::{AccessRecord, AccessStatement};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -54,9 +54,10 @@ pub fn run(args: &[String], state: &Value) -> Result<Vec<String>, String> {
         Some("client-config") => client_config(args),
         Some("profile") => profile(args),
         Some("host-policy") => host_policy(args, state),
+        Some("directory") => directory(args, state),
         Some(action) => Err(format!("unknown access ssh action `{action}`")),
         None => Err(
-            "access ssh needs ca-init, issue, krl, host-bundle, host-apply, host-rollout, or client-config"
+            "access ssh needs ca-init, issue, krl, host-bundle, host-apply, host-rollout, directory, or client-config"
                 .into(),
         ),
     }
@@ -520,6 +521,417 @@ pub(crate) fn renewal_statement(args: &[String], state: &Value) -> Result<(Acces
     scopes.retain(|s| !s.starts_with("ssh-renewal:")); scopes.push(scope);
     let key = value(args,"--signing-key").map(PathBuf::from).unwrap_or_else(|| myceliumd::home_dir().join("access.key"));
     Ok((statement,key))
+}
+
+/// One host's installed SSH acceptance: the roles each Unix account will take.
+///
+/// This is observed host state, not a grant. `directory collect` reads it from
+/// `/etc/ssh/mycelium/principals/<user>`; `directory show` intersects it with the
+/// signed grants the local access view has converged.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SshDirectoryInventory {
+    version: u32,
+    #[serde(default)]
+    targets: Vec<SshDirectoryTarget>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SshDirectoryTarget {
+    /// Operator-facing target name. It is a lookup hint, never a credential.
+    id: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    site: Option<String>,
+    /// Unix account -> accepted roles, exactly as installed on the host.
+    #[serde(default)]
+    accounts: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// The active grants one principal holds, already narrowed to roles and accounts.
+struct HeldGrant {
+    grant_id: String,
+    roles: BTreeSet<String>,
+    unix_users: BTreeSet<String>,
+}
+
+/// One target as this principal may use it.
+#[derive(Debug, Serialize)]
+struct DirectoryTarget {
+    id: String,
+    label: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    site: Option<String>,
+    /// Whether this caller may open a shell on the target.
+    shell: bool,
+    /// Roles the principal holds that this host accepts.
+    roles: Vec<String>,
+    /// Unix accounts the principal may log in as.
+    accounts: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryView {
+    principal: String,
+    roles: Vec<String>,
+    unix_users: Vec<String>,
+    grants: Vec<String>,
+    /// Records the access view carried that failed their own signature check.
+    /// They never contribute entitlements; they are listed so a corrupt or
+    /// forged gossip record is visible instead of silently shrinking the view.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unverified: Vec<String>,
+    targets: Vec<DirectoryTarget>,
+}
+
+fn directory_path() -> PathBuf {
+    myceliumd::home_dir().join("ssh/directory.json")
+}
+
+fn directory(args: &[String], state: &Value) -> Result<Vec<String>, String> {
+    match args.get(1).map(String::as_str) {
+        Some("collect") => directory_collect(args),
+        Some(action) if !action.starts_with('-') => Err(format!(
+            "unknown access ssh directory action `{action}`; use `show` or `collect`"
+        )),
+        _ => directory_show(args, state),
+    }
+}
+
+fn directory_show(args: &[String], state: &Value) -> Result<Vec<String>, String> {
+    let principal = match value(args, "--principal") {
+        Some(principal) => {
+            validate_principal(principal)?;
+            principal.to_owned()
+        }
+        None => profile_principal()?,
+    };
+    let path = value(args, "--from")
+        .map(PathBuf::from)
+        .unwrap_or_else(directory_path);
+    let inventory = load_directory(&path)?;
+    let (held, unverified) = held_grants(state, &principal, now()?)?;
+    let view = directory_view(
+        &principal,
+        &held,
+        &inventory,
+        args.iter().any(|argument| argument == "--all"),
+        unverified,
+    );
+    if args.iter().any(|argument| argument == "--json") {
+        return Ok(vec![serde_json::to_string_pretty(&view)
+            .map_err(|error| format!("encode SSH directory: {error}"))?]);
+    }
+    Ok(render_directory(&view))
+}
+
+/// Collect each target's installed acceptance into one inventory file.
+///
+/// The remote read touches root-owned policy, so it uses the same
+/// non-interactive `sudo -n` contract `host-apply` relies on. A target that
+/// cannot be read fails the collection instead of contributing an empty,
+/// misleading entry.
+fn directory_collect(args: &[String]) -> Result<Vec<String>, String> {
+    require_write(args)?;
+    let destination = Path::new(required(args, "--path")?);
+    let targets = repeated(args, "--target");
+    if targets.is_empty() {
+        return Err("directory collect needs at least one --target SSH-HOST".into());
+    }
+    let site = value(args, "--site").map(str::to_owned);
+    let mut inventory = SshDirectoryInventory {
+        version: 1,
+        targets: Vec::new(),
+    };
+    for target in &targets {
+        config_atom_value("SSH target", target)?;
+        if inventory.targets.iter().any(|entry| entry.id == *target) {
+            return Err(format!("duplicate --target `{target}`"));
+        }
+        inventory.targets.push(SshDirectoryTarget {
+            id: (*target).to_owned(),
+            label: Some((*target).to_owned()),
+            kind: Some("host".into()),
+            site: site.clone(),
+            accounts: collect_host_acceptance(target)?,
+        });
+    }
+    inventory.targets.sort_by(|a, b| a.id.cmp(&b.id));
+    let staging = destination_staging(destination)?;
+    fs::write(
+        &staging.path,
+        serde_json::to_vec_pretty(&inventory)
+            .map_err(|error| format!("encode SSH directory inventory: {error}"))?,
+    )
+    .map_err(|error| format!("write staged SSH directory inventory: {error}"))?;
+    private_permissions(&staging.path, 0o600)?;
+    fs::rename(&staging.path, destination).map_err(|error| {
+        format!(
+            "install SSH directory inventory {}: {error}",
+            destination.display()
+        )
+    })?;
+    let accounts = inventory
+        .targets
+        .iter()
+        .map(|target| target.accounts.len())
+        .sum::<usize>();
+    Ok(vec![format!(
+        "wrote SSH directory {}; {} hosts, {} accounts",
+        destination.display(),
+        inventory.targets.len(),
+        accounts
+    )])
+}
+
+fn collect_host_acceptance(target: &str) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let directory = "/etc/ssh/mycelium/principals";
+    let listing = ssh_capture(target, &["ls", "-1", directory])?;
+    let mut accounts = BTreeMap::new();
+    for account in listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        config_atom_value("Unix account", account)?;
+        let path = format!("{directory}/{account}");
+        let contents = ssh_capture(target, &["cat", &path])?;
+        accounts.insert(
+            account.to_owned(),
+            parse_role_principals(account, &contents)?,
+        );
+    }
+    Ok(accounts)
+}
+
+fn ssh_capture(target: &str, remote: &[&str]) -> Result<String, String> {
+    let output = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=15",
+            target,
+            "sudo",
+            "-n",
+            "--",
+        ])
+        .args(remote)
+        .output()
+        .map_err(|error| format!("run ssh {target}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "read SSH acceptance from {target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| format!("{target} returned non-UTF-8 principal data"))
+}
+
+fn parse_role_principals(account: &str, contents: &str) -> Result<BTreeSet<String>, String> {
+    let mut roles = BTreeSet::new();
+    for line in contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let role = line.strip_prefix("mycelium-role-").ok_or_else(|| {
+            format!("account `{account}` accepts `{line}`, which is not a Mycelium role principal")
+        })?;
+        config_atom_value("role", role)?;
+        roles.insert(role.to_owned());
+    }
+    Ok(roles)
+}
+
+fn load_directory(path: &Path) -> Result<SshDirectoryInventory, String> {
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "read SSH directory inventory {}: {error}; collect one with `mycelium access ssh directory collect --target HOST --path {} --write`",
+            path.display(),
+            path.display()
+        )
+    })?;
+    let inventory: SshDirectoryInventory = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse SSH directory inventory {}: {error}", path.display()))?;
+    if inventory.version != 1 {
+        return Err(format!(
+            "SSH directory inventory {} needs version 1",
+            path.display()
+        ));
+    }
+    Ok(inventory)
+}
+
+fn profile_principal() -> Result<String, String> {
+    let path = profile_path();
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "read SSH profile {}: {error}; pass --principal or set one with `mycelium access ssh profile set`",
+            path.display()
+        )
+    })?;
+    let profile: SshClientProfile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse SSH profile {}: {error}", path.display()))?;
+    validate_profile(&profile)?;
+    Ok(profile.principal)
+}
+
+/// Principals are `name` or `oidc:<issuer>#<subject>`; the latter carries `:`,
+/// `/` and `#`, so the SSH-config atom rules do not apply.
+fn validate_principal(principal: &str) -> Result<(), String> {
+    if principal.is_empty()
+        || principal.len() > 256
+        || !principal.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err("principal must be 1-256 printable, whitespace-free characters".into());
+    }
+    Ok(())
+}
+
+fn held_grants(
+    state: &Value,
+    principal: &str,
+    at: u64,
+) -> Result<(Vec<HeldGrant>, Vec<String>), String> {
+    let mut held = Vec::new();
+    let mut unverified = Vec::new();
+    for entry in state["grants"].as_array().into_iter().flatten() {
+        if entry["active"].as_bool() != Some(true) {
+            continue;
+        }
+        let record: AccessRecord = serde_json::from_value(entry["record"].clone())
+            .map_err(|error| format!("decode access record: {error}"))?;
+        let statement = record.statement.clone();
+        if record.verify().is_err() {
+            if let AccessStatement::Grant { grant_id, .. } = &statement {
+                unverified.push(grant_id.clone());
+            }
+            continue;
+        }
+        let AccessStatement::Grant {
+            grant_id,
+            principal: owner,
+            roles,
+            unix_users,
+            not_before,
+            not_after,
+            ..
+        } = statement
+        else {
+            continue;
+        };
+        if owner != principal || at < not_before || at >= not_after {
+            continue;
+        }
+        held.push(HeldGrant {
+            grant_id,
+            roles: roles.into_iter().collect(),
+            unix_users: unix_users.into_iter().collect(),
+        });
+    }
+    held.sort_by(|a, b| a.grant_id.cmp(&b.grant_id));
+    unverified.sort();
+    unverified.dedup();
+    Ok((held, unverified))
+}
+
+/// A target is visible only when a held role is accepted for an account the
+/// grant actually names. Roles alone are not enough: the host's
+/// `principals/<user>` file decides which account takes them.
+fn directory_view(
+    principal: &str,
+    grants: &[HeldGrant],
+    inventory: &SshDirectoryInventory,
+    include_all: bool,
+    unverified: Vec<String>,
+) -> DirectoryView {
+    let mut roles = BTreeSet::new();
+    let mut unix_users = BTreeSet::new();
+    let mut grant_ids = Vec::new();
+    for grant in grants {
+        roles.extend(grant.roles.iter().cloned());
+        unix_users.extend(grant.unix_users.iter().cloned());
+        grant_ids.push(grant.grant_id.clone());
+    }
+    let mut targets = Vec::new();
+    for target in &inventory.targets {
+        let mut accepted = BTreeSet::new();
+        let mut accounts = BTreeSet::new();
+        for (account, account_roles) in &target.accounts {
+            if !unix_users.contains(account) {
+                continue;
+            }
+            let allowed = account_roles
+                .intersection(&roles)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if allowed.is_empty() {
+                continue;
+            }
+            accepted.extend(allowed);
+            accounts.insert(account.clone());
+        }
+        let shell = !accounts.is_empty();
+        if !shell && !include_all {
+            continue;
+        }
+        targets.push(DirectoryTarget {
+            id: target.id.clone(),
+            label: target.label.clone().unwrap_or_else(|| target.id.clone()),
+            kind: target.kind.clone().unwrap_or_else(|| "host".into()),
+            site: target.site.clone(),
+            shell,
+            roles: accepted.into_iter().collect(),
+            accounts: accounts.into_iter().collect(),
+        });
+    }
+    targets.sort_by(|a, b| a.id.cmp(&b.id));
+    DirectoryView {
+        principal: principal.to_owned(),
+        roles: roles.into_iter().collect(),
+        unix_users: unix_users.into_iter().collect(),
+        grants: grant_ids,
+        unverified,
+        targets,
+    }
+}
+
+fn render_directory(view: &DirectoryView) -> Vec<String> {
+    let mut lines = vec![format!("principal {}", view.principal)];
+    if view.roles.is_empty() {
+        lines.push("roles none (no active grant)".into());
+    } else {
+        lines.push(format!("roles {}", view.roles.join(", ")));
+    }
+    if !view.unverified.is_empty() {
+        lines.push(format!(
+            "unverified grants {} (excluded)",
+            view.unverified.join(", ")
+        ));
+    }
+    if view.targets.is_empty() {
+        lines.push("targets none".into());
+        return lines;
+    }
+    lines.push(format!("targets {}", view.targets.len()));
+    for target in &view.targets {
+        if !target.shell {
+            lines.push(format!("  {} no shell", target.id));
+            continue;
+        }
+        lines.push(format!(
+            "  {} accounts={} roles={}",
+            target.id,
+            target.accounts.join(","),
+            target.roles.join(",")
+        ));
+    }
+    lines
 }
 
 fn host_rollout(args: &[String]) -> Result<Vec<String>, String> {
@@ -2144,5 +2556,187 @@ mod tests {
             "certificate serial 42 should be revoked"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn signed_record(statement: serde_json::Value) -> serde_json::Value {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let statement: AccessStatement = serde_json::from_value(statement).unwrap();
+        serde_json::to_value(AccessRecord::sign(&key, statement).unwrap()).unwrap()
+    }
+
+    fn directory_state(grants: &[(bool, serde_json::Value)]) -> serde_json::Value {
+        serde_json::json!({
+            "grants": grants
+                .iter()
+                .map(|(active, statement)| serde_json::json!({
+                    "active": active,
+                    "record": signed_record(statement.clone()),
+                }))
+                .collect::<Vec<_>>(),
+            "revocations": []
+        })
+    }
+
+    fn grant(id: &str, principal: &str, roles: &[&str], users: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "grant",
+            "grant_id": id,
+            "principal": principal,
+            "serial": 1,
+            "roles": roles,
+            "unix_users": users,
+            "not_before": 1,
+            "not_after": 9_999_999_999u64
+        })
+    }
+
+    fn directory_target(id: &str, accounts: &[(&str, &[&str])]) -> SshDirectoryTarget {
+        SshDirectoryTarget {
+            id: id.to_owned(),
+            label: None,
+            kind: None,
+            site: None,
+            accounts: accounts
+                .iter()
+                .map(|(account, roles)| {
+                    (
+                        (*account).to_owned(),
+                        roles.iter().map(|role| (*role).to_owned()).collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn directory_inventory(targets: Vec<SshDirectoryTarget>) -> SshDirectoryInventory {
+        SshDirectoryInventory {
+            version: 1,
+            targets,
+        }
+    }
+
+    #[test]
+    fn directory_lists_only_targets_the_principal_can_reach() {
+        let state = directory_state(&[(
+            true,
+            grant(
+                "avery",
+                "ajmwagar",
+                &["network-admin", "home-operator"],
+                &["ajmwagar"],
+            ),
+        )]);
+        let inventory = directory_inventory(vec![
+            directory_target("batty", &[("mames", &["home-operator"])]),
+            directory_target("agora-one", &[("ajmwagar", &["network-admin"])]),
+            directory_target("pris", &[("ajmwagar", &["network-admin", "home-operator"])]),
+        ]);
+        let (held, unverified) = held_grants(&state, "ajmwagar", now().unwrap()).unwrap();
+        let view = directory_view("ajmwagar", &held, &inventory, false, unverified);
+        assert_eq!(view.roles, vec!["home-operator", "network-admin"]);
+        assert_eq!(
+            view.targets
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agora-one", "pris"]
+        );
+        assert!(view.targets.iter().all(|target| target.shell));
+        assert_eq!(
+            view.targets[1].roles,
+            vec!["home-operator", "network-admin"]
+        );
+        assert_eq!(view.targets[0].accounts, vec!["ajmwagar"]);
+    }
+
+    #[test]
+    fn directory_hides_targets_whose_account_the_grant_does_not_name() {
+        let state = directory_state(&[(
+            true,
+            grant("avery", "ajmwagar", &["network-admin"], &["ajmwagar"]),
+        )]);
+        let inventory = directory_inventory(vec![directory_target(
+            "batty",
+            &[("mames", &["network-admin"])],
+        )]);
+        let (held, unverified) = held_grants(&state, "ajmwagar", now().unwrap()).unwrap();
+        assert!(
+            directory_view("ajmwagar", &held, &inventory, false, unverified)
+                .targets
+                .is_empty()
+        );
+
+        let (held, _) = held_grants(&state, "ajmwagar", now().unwrap()).unwrap();
+        let all = directory_view("ajmwagar", &held, &inventory, true, Vec::new());
+        assert_eq!(all.targets.len(), 1);
+        assert!(!all.targets[0].shell);
+    }
+
+    #[test]
+    fn directory_ignores_expired_inactive_and_foreign_grants() {
+        let expired = serde_json::json!({
+            "kind": "grant", "grant_id": "old", "principal": "ajmwagar", "serial": 1,
+            "roles": ["network-admin"], "unix_users": ["ajmwagar"],
+            "not_before": 1, "not_after": 2
+        });
+        let state = directory_state(&[
+            (
+                false,
+                grant("muted", "ajmwagar", &["network-admin"], &["ajmwagar"]),
+            ),
+            (true, expired),
+            (
+                true,
+                grant("other", "mames", &["network-admin"], &["ajmwagar"]),
+            ),
+        ]);
+        let inventory = directory_inventory(vec![directory_target(
+            "agora-one",
+            &[("ajmwagar", &["network-admin"])],
+        )]);
+        let (held, unverified) = held_grants(&state, "ajmwagar", now().unwrap()).unwrap();
+        assert!(held.is_empty());
+        assert!(unverified.is_empty());
+        assert!(
+            directory_view("ajmwagar", &held, &inventory, false, unverified)
+                .targets
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn directory_excludes_records_that_fail_their_signature() {
+        let mut record = signed_record(grant(
+            "forged",
+            "ajmwagar",
+            &["network-admin"],
+            &["ajmwagar"],
+        ));
+        record["statement"]["roles"] = serde_json::json!(["fleet-admin"]);
+        let state = serde_json::json!({"grants": [{"active": true, "record": record}]});
+        let inventory = directory_inventory(vec![directory_target(
+            "agora-one",
+            &[("ajmwagar", &["fleet-admin"])],
+        )]);
+        let (held, unverified) = held_grants(&state, "ajmwagar", now().unwrap()).unwrap();
+        assert!(held.is_empty());
+        assert_eq!(unverified, vec!["forged"]);
+        let view = directory_view("ajmwagar", &held, &inventory, false, unverified);
+        assert!(view.targets.is_empty());
+        assert_eq!(render_directory(&view)[1], "roles none (no active grant)");
+    }
+
+    #[test]
+    fn directory_collect_accepts_only_role_principals() {
+        assert_eq!(
+            parse_role_principals(
+                "ajmwagar",
+                "mycelium-role-network-admin\nmycelium-role-home-operator\n"
+            )
+            .unwrap(),
+            BTreeSet::from(["home-operator".to_owned(), "network-admin".to_owned()])
+        );
+        assert!(parse_role_principals("ajmwagar", "mycelium-role-network-admin\n").is_ok());
+        assert!(parse_role_principals("ajmwagar", "somebody-else\n").is_err());
     }
 }

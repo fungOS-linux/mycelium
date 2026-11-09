@@ -132,6 +132,39 @@ On an enrolled Linux host, apply the bundle transactionally:
 sudo -E mycelium access ssh host-apply --bundle /path/to/host-bundle --write
 ```
 
+### Answer which hosts a principal can reach
+
+Grants say what roles a principal holds. Hosts say which roles each Unix
+account accepts. `directory` joins the two and lists only the targets where
+both agree, so a caller never sees a host it cannot open a shell on.
+
+Collect the host side once per rollout; it reads
+`/etc/ssh/mycelium/principals/<user>` through the same non-interactive `sudo -n`
+contract `host-apply` uses:
+
+```sh
+mycelium access ssh directory collect \
+  --target agora-one --target pris \
+  --site wagar-house \
+  --path ~/.mycelium/ssh/directory.json --write
+```
+
+Then query it for a principal. `--principal` defaults to the SSH client
+profile; OIDC principals such as `oidc:https://sso.fpl.dev#<subject>` work
+unchanged.
+
+```sh
+mycelium access ssh directory --json
+mycelium access ssh directory --principal 'oidc:https://sso.fpl.dev#abc' --json
+mycelium access ssh directory --all --json   # include targets with shell=false
+```
+
+The JSON carries the `soil:mycelium` directory target shape (`id`, `label`,
+`kind`, `site`, `shell`) plus the roles and Unix accounts that matched. A grant
+whose signature does not verify contributes nothing and is reported under
+`unverified` instead of silently shrinking the directory. A target that cannot
+be read fails `collect`; it is never recorded as an empty, misleading entry.
+
 ## Automatic certificate renewal
 
 The invitation is a one-time enrollment mechanism, not a renewable bearer
