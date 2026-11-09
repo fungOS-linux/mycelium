@@ -704,23 +704,49 @@ fn daemon_installed() -> bool {
     Path::new(DAEMON_PLIST).exists()
 }
 
+/// `launchctl bootout` blocks until a `KeepAlive` job exits, which can be
+/// forever. No install path may wait on that, so every call is bounded.
+fn launchctl(args: &[&str], wait: Duration) -> Result<bool, String> {
+    let mut child = Command::new("launchctl")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("launchctl {}: {error}", args.join(" ")))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => return Ok(status.success()),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(false);
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
 /// One resolver per host: the daemon replaces a user-scoped agent, which
 /// could never own port 53 anyway.
 fn retire_user_agent(config: &Path) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     let uid = fs::metadata(config).ok()?.uid();
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("gui/{uid}/{LABEL}")])
-        .output();
+    let _ = launchctl(
+        &["bootout", &format!("gui/{uid}/{LABEL}")],
+        Duration::from_secs(5),
+    );
     Some(uid)
 }
 
 fn install_daemon(settings: &Settings, config_path: &Path, remove: bool) -> Result<Value, String> {
     let plist = Path::new(DAEMON_PLIST);
     if remove {
-        let _ = Command::new("launchctl")
-            .args(["bootout", &format!("system/{DAEMON_LABEL}")])
-            .output();
+        let _ = launchctl(
+            &["bootout", &format!("system/{DAEMON_LABEL}")],
+            Duration::from_secs(10),
+        );
         if plist.exists() {
             fs::remove_file(plist).map_err(|e| e.to_string())?;
         }
@@ -751,21 +777,31 @@ fn install_daemon(settings: &Settings, config_path: &Path, remove: bool) -> Resu
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(plist, fs::Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
     }
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("system/{DAEMON_LABEL}")])
-        .output();
-    let status = Command::new("launchctl")
-        .arg("bootstrap")
-        .arg("system")
-        .arg(plist)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("could not bootstrap the root DNS daemon".into());
+    // The job may be loaded already; restart it in place rather than waiting
+    // for a bootout that a `KeepAlive` job never satisfies.
+    let loaded = launchctl(
+        &["print", &format!("system/{DAEMON_LABEL}")],
+        Duration::from_secs(5),
+    )
+    .unwrap_or(false);
+    let started = if loaded {
+        launchctl(
+            &["kickstart", "-k", &format!("system/{DAEMON_LABEL}")],
+            Duration::from_secs(15),
+        )?
+    } else {
+        launchctl(
+            &["bootstrap", "system", DAEMON_PLIST],
+            Duration::from_secs(15),
+        )?
+    };
+    if !started {
+        return Err("could not start the root DNS daemon".into());
     }
-    let _ = Command::new("launchctl")
-        .args(["enable", &format!("system/{DAEMON_LABEL}")])
-        .output();
+    let _ = launchctl(
+        &["enable", &format!("system/{DAEMON_LABEL}")],
+        Duration::from_secs(5),
+    );
     Ok(
         json!({"daemon": DAEMON_LABEL, "installed": true, "listen": "127.0.0.1:53",
         "user_agent_retired": user}),
