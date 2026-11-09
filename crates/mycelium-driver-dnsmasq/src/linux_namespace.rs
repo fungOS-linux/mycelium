@@ -6,7 +6,7 @@ const FILE: &str = "mycelium.dns-delegate";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const RESOLVECTL: &str = "/usr/bin/resolvectl";
 const BUSCTL: &str = "/usr/bin/busctl";
-fn command(executable: &str, args: &[&str]) -> Result<String, String> {
+pub(super) fn command(executable: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new("/usr/bin/timeout")
         .arg("15")
         .arg(executable)
@@ -67,6 +67,11 @@ fn previous(path: &Path) -> Result<Option<Vec<u8>>, String> {
         Err(e) => Err(e.to_string()),
     }
 }
+/// Whether this host can route a suffix through resolved's delegate API.
+pub(super) fn available() -> bool {
+    backend().is_ok()
+}
+
 fn backend() -> Result<(), String> {
     command(SYSTEMCTL, &["is-active", "--quiet", "systemd-resolved"])?;
     if !supported(&command(SYSTEMCTL, &["--version"])?) {

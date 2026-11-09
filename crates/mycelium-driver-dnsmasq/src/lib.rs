@@ -1000,9 +1000,15 @@ impl Device for ResolverDevice {
             }
             "dns.resolver.system-install" => {
                 let mut value = if cfg!(target_os = "linux") {
-                    linux_namespace::apply(&self.settings, false)
-                        .await
-                        .map_err(failure)?
+                    if linux_namespace::available() {
+                        linux_namespace::apply(&self.settings, false)
+                            .await
+                            .map_err(failure)?
+                    } else {
+                        linux::install_stub(&self.settings, false)
+                            .await
+                            .map_err(failure)?
+                    }
                 } else {
                     owned_namespace(&self.settings, &self.config, false).map_err(failure)?
                 };
@@ -1016,9 +1022,13 @@ impl Device for ResolverDevice {
             }
             "dns.resolver.system-remove" => {
                 let mut value = if cfg!(target_os = "linux") {
-                    linux_namespace::apply(&self.settings, true)
-                        .await
-                        .map_err(failure)?
+                    if linux_namespace::available() {
+                        linux_namespace::apply(&self.settings, true)
+                            .await
+                            .map_err(failure)?
+                    } else {
+                        linux::remove_stub(&self.settings).await.map_err(failure)?
+                    }
                 } else {
                     owned_namespace(&self.settings, &self.config, true).map_err(failure)?
                 };
@@ -1536,7 +1546,7 @@ pub async fn command(args: &[String]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    pub(super) fn settings() -> Settings {
+    pub(crate) fn settings() -> Settings {
         Settings {
             mesh_sites: true,
             additional_sites: vec![],
