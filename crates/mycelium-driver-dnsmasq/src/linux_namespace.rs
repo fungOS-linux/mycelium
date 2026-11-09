@@ -325,10 +325,22 @@ pub(super) async fn apply(settings: &Settings, remove: bool) -> Result<Value, St
             verify_delegate(&server, &suffix)?;
         }
         if let Some(first) = &first {
-            let answer = command("/usr/bin/getent", &["ahosts", &first.name])?;
-            if !answer.lines().any(|line| {
-                line.split_whitespace().next() == Some(first.address.to_string().as_str())
-            }) {
+            // systemd-resolved acknowledges the delegate before it serves it,
+            // so one immediate lookup can land on the old configuration.
+            let expected = first.address.to_string();
+            let mut answered = false;
+            for _ in 0..40 {
+                let answer = command("/usr/bin/getent", &["ahosts", &first.name])?;
+                if answer
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(expected.as_str()))
+                {
+                    answered = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if !answered {
                 return Err("OS DNS answer differs from fresh peer observation".into());
             }
             negative_probe(&suffix)?;
