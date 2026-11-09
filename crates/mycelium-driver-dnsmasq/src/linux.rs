@@ -104,7 +104,9 @@ pub(super) async fn apply(settings: &Settings) -> Result<Value, String> {
         )?;
         control(&["daemon-reload"])?;
         control(&["enable", "--now", UNIT])?;
-        for _ in 0..10 {
+        // The first observation can consume two ten-second CLI deadlines
+        // before dnsmasq even starts; five seconds guaranteed a false failure.
+        for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if verify(settings, first).is_ok() {
                 return Ok(());
