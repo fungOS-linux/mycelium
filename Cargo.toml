@@ -10,6 +10,7 @@ repository = "https://github.com/ajmwagar/mycelium"
 
 [workspace.dependencies]
 mycelium-dns-policy = { path = "crates/mycelium-dns-policy" }
+mycelium-doh = { path = "crates/mycelium-doh" }
 mycelium-driver-dnsmasq = { path = "crates/mycelium-driver-dnsmasq" }
 mycelium-core = { path = "crates/mycelium-core" }
 mycelium-network-types = { path = "crates/mycelium-network-types" }

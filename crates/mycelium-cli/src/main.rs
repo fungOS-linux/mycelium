@@ -222,7 +222,7 @@ usage:
   mycelium dns zone [--suffix DOMAIN] [--json]
   mycelium dns service-address --prefix CIDR [--json]
   mycelium dns plan --site SITE [--suffix DOMAIN] [--delegations FILE] [--json|--dnsmasq]
-  mycelium dns resolver init --config FILE --site SITE --suffix DOMAIN --reachable CIDR... --write [--service-address CIDR]
+  mycelium dns resolver init --config FILE --site SITE --suffix DOMAIN --reachable CIDR... --write [--service-address CIDR] [--doh URL [--doh-listen ADDR]]
   mycelium dns resolver plan|status --config FILE
   mycelium dns resolver apply|run|system-install|system-remove --config FILE --write [--dry-run]
   mycelium dns blocklist plan --source FILE... [--allow DOMAIN]... [--action sinkhole|nxdomain] [--json|--dnsmasq]

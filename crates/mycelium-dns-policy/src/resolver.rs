@@ -13,6 +13,52 @@ pub enum ResolverMode {
     LanServing,
 }
 
+/// A DoH endpoint the local resolver forwards non-`.myc` names to.
+///
+/// dnsmasq cannot speak DoH, so a bounded forwarder owns the encrypted hop
+/// and dnsmasq points at it. Plaintext `upstreams` are refused alongside it:
+/// fail-closed means there is no path that silently drops back to port 53.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DohUpstream {
+    pub endpoint: String,
+    pub listen: SocketAddr,
+    #[serde(default = "doh_timeout_default")]
+    pub timeout_seconds: u32,
+    #[serde(default = "doh_inflight_default")]
+    pub max_inflight: u16,
+}
+
+fn doh_timeout_default() -> u32 {
+    5
+}
+
+fn doh_inflight_default() -> u16 {
+    8
+}
+
+impl DohUpstream {
+    pub fn validate(&self) -> Result<(), String> {
+        let endpoint = self.endpoint.trim();
+        if !endpoint.starts_with("https://")
+            || endpoint.len() > 2048
+            || endpoint[8..].trim_end_matches('/').is_empty()
+            || endpoint
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err("DoH endpoint must be an https:// URL".into());
+        }
+        if !self.listen.ip().is_loopback() || self.listen.port() == 0 {
+            return Err("DoH forwarder must listen on a nonzero loopback address".into());
+        }
+        if !(1..=10).contains(&self.timeout_seconds) || !(1..=64).contains(&self.max_inflight) {
+            return Err("DoH timeout must be 1..=10s and in-flight limit 1..=64".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolverConfig {
@@ -41,6 +87,9 @@ pub struct ResolverConfig {
     /// Domains that must never be blocked, including their whole subtree.
     #[serde(default)]
     pub allowlist: Vec<String>,
+    /// Forward non-`.myc` names over DoH through a local bounded forwarder.
+    #[serde(default)]
+    pub doh: Option<DohUpstream>,
 }
 
 impl ResolverConfig {
@@ -124,6 +173,17 @@ impl ResolverConfig {
         if port == 0 || self.listen.iter().any(|s| s.port() != port) {
             return Err("listeners must use the same nonzero port".into());
         }
+        if self.doh.is_some() && !self.upstreams.is_empty() {
+            return Err(
+                "DoH and plaintext upstreams cannot coexist; the resolver fails closed".into(),
+            );
+        }
+        if let Some(doh) = &self.doh {
+            doh.validate()?;
+            if self.listen.contains(&doh.listen) {
+                return Err("DoH forwarder cannot share the resolver's own socket".into());
+            }
+        }
         for listener in &self.listen {
             let address = listener.ip();
             if address.is_unspecified() || address.is_multicast() {
@@ -200,6 +260,14 @@ impl ResolverConfig {
         }
         for server in &self.upstreams {
             config.push_str(&format!("server={}#{}\n", server.ip(), server.port()));
+        }
+        // The forwarder is the only default upstream when it is configured.
+        if let Some(doh) = &self.doh {
+            config.push_str(&format!(
+                "server={}#{}\n",
+                doh.listen.ip(),
+                doh.listen.port()
+            ));
         }
         // A localhost-only resolver is the bootstrap for local capability
         // gateways: unknown `.myc` names mean "use the local gateway", while
@@ -397,6 +465,7 @@ mod tests {
             blocklists: vec![],
             block_action: BlockAction::default(),
             allowlist: vec![],
+            doh: None,
         }
     }
     #[test]
@@ -433,6 +502,28 @@ mod tests {
         assert!(text.contains("address=/.myc/127.0.0.1\n"));
         assert!(text.contains("host-record=neo.lab.myc,192.0.2.20\n"));
     }
+    #[test]
+    fn doh_owns_the_default_upstream_and_refuses_plaintext() {
+        let mut c = config();
+        c.upstreams = vec![];
+        c.doh = Some(DohUpstream {
+            endpoint: "https://dns.example/dns-query".into(),
+            listen: "127.0.0.1:5353".parse().unwrap(),
+            timeout_seconds: 5,
+            max_inflight: 8,
+        });
+        let text = c.render(vec![]).unwrap();
+        assert!(text.contains("server=127.0.0.1#5353\n"));
+        assert!(text.contains("no-resolv\n"));
+        assert!(!text.contains("server=1.1.1.1"));
+        // No silent plaintext path beside it.
+        c.upstreams = vec!["1.1.1.1:53".parse().unwrap()];
+        assert!(c.render(vec![]).is_err());
+        c.upstreams = vec![];
+        c.doh.as_mut().unwrap().listen = "127.0.0.1:1053".parse().unwrap();
+        assert!(c.render(vec![]).is_err());
+    }
+
     #[test]
     fn localhost_guard_and_split_namespace() {
         let c = config();

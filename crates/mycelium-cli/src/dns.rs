@@ -286,6 +286,9 @@ pub(crate) async fn ensure(home: &Path) -> Result<Vec<String>, String> {
                 listen: vec![],
                 dnsmasq: None,
                 mycelium: Some(mycelium),
+                // Which encrypted endpoint to trust is a policy decision, so a
+                // repair never invents one; `dns resolver init --doh` sets it.
+                doh: None,
             },
             false,
         )?;

@@ -2610,6 +2610,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycelium-doh"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "mycelium-dns-policy",
+ "reqwest 0.12.28",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "mycelium-driver-darwin"
 version = "0.1.0"
 dependencies = [
@@ -2629,6 +2640,7 @@ dependencies = [
  "fpl-resource-observation",
  "mycelium-core",
  "mycelium-dns-policy",
+ "mycelium-doh",
  "mycelium-plugins-lua",
  "serde",
  "serde_json",

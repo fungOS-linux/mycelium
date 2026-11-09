@@ -1,0 +1,13 @@
+[package]
+name = "mycelium-doh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bounded DNS-over-HTTPS forwarder for the local resolver"
+
+[dependencies]
+async-trait.workspace = true
+mycelium-dns-policy.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+tokio.workspace = true

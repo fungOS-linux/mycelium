@@ -133,6 +133,9 @@ pub struct InitOptions {
     pub dnsmasq: Option<PathBuf>,
     #[serde(default)]
     pub mycelium: Option<PathBuf>,
+    /// Forward non-`.myc` names over DoH instead of plaintext upstreams.
+    #[serde(default)]
+    pub doh: Option<mycelium_dns_policy::resolver::DohUpstream>,
 }
 
 fn default_dnsmasq() -> Result<PathBuf, String> {
@@ -177,6 +180,7 @@ pub fn init(path: &Path, options: InitOptions, force: bool) -> Result<Value, Str
             blocklists: vec![],
             block_action: mycelium_dns_policy::BlockAction::default(),
             allowlist: vec![],
+            doh: options.doh,
         },
         dnsmasq: match options.dnsmasq {
             Some(path) => path,
@@ -1057,6 +1061,19 @@ async fn supervise(settings: &Settings) -> Result<(), String> {
             }
         }
     };
+    // Bind before dnsmasq starts asking. A forwarder that cannot bind must
+    // fail the supervisor rather than leave every non-.myc name unanswered.
+    let forwarder = match &settings.resolver.doh {
+        Some(doh) => {
+            let forwarder = mycelium_doh::Forwarder::bind(doh).await?;
+            Some(tokio::spawn(async move {
+                if let Err(error) = forwarder.serve().await {
+                    eprintln!("DNS DoH forwarder stopped: {error}");
+                }
+            }))
+        }
+        None => None,
+    };
     let mut active = settings.render(records.clone())?;
     let mut active_aliases = initial_settings.service_aliases.clone();
     atomic_write(&path, active.as_bytes())?;
@@ -1077,6 +1094,12 @@ async fn supervise(settings: &Settings) -> Result<(), String> {
         tokio::time::sleep(Duration::from_secs(settings.refresh_seconds)).await;
         if let Some(status) = running.0.try_wait().map_err(|e| e.to_string())? {
             return Err(format!("dnsmasq exited: {status}"));
+        }
+        if forwarder
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            return Err("DoH forwarder stopped; refusing to serve without an upstream".into());
         }
         // Re-evaluate reviewed local policy on each refresh. Invalid policy
         // fails closed; a changed policy cannot retain the previous DNS aliases.
@@ -1158,6 +1181,8 @@ pub async fn command(args: &[String]) -> Result<String, String> {
     let mut listen = Vec::new();
     let mut dnsmasq = None;
     let mut mycelium = None;
+    let mut doh_endpoint = None;
+    let mut doh_listen: Option<SocketAddr> = None;
     let mut rest = args[1..].iter();
     let mut seen = BTreeSet::new();
     while let Some(flag) = rest.next() {
@@ -1208,11 +1233,36 @@ pub async fn command(args: &[String]) -> Result<String, String> {
                     rest.next().ok_or("--mycelium requires a path")?,
                 ))
             }
+            "--doh" if action == "init" => {
+                doh_endpoint = Some(
+                    rest.next()
+                        .ok_or("--doh requires an https URL")?
+                        .to_string(),
+                )
+            }
+            "--doh-listen" if action == "init" => {
+                doh_listen = Some(
+                    rest.next()
+                        .ok_or("--doh-listen requires an address")?
+                        .parse()
+                        .map_err(|_| "invalid --doh-listen address".to_string())?,
+                )
+            }
             _ => return Err("unknown resolver option".into()),
         }
     }
     let config = config.ok_or("--config is required")?;
     if action == "init" {
+        let doh = match (doh_endpoint, doh_listen) {
+            (Some(endpoint), listen) => Some(mycelium_dns_policy::resolver::DohUpstream {
+                endpoint,
+                listen: listen.unwrap_or_else(|| "127.0.0.1:5353".parse().expect("static")),
+                timeout_seconds: 5,
+                max_inflight: 8,
+            }),
+            (None, Some(_)) => return Err("--doh-listen requires --doh".into()),
+            (None, None) => None,
+        };
         let options = InitOptions {
             site: site.ok_or("dns resolver init requires --site")?,
             suffix: suffix.ok_or("dns resolver init requires --suffix")?,
@@ -1221,6 +1271,7 @@ pub async fn command(args: &[String]) -> Result<String, String> {
             listen,
             dnsmasq,
             mycelium,
+            doh,
         };
         if dry_run {
             return Ok(json!({"dry_run": true, "config": config, "options": options}).to_string());
@@ -1279,6 +1330,7 @@ mod tests {
                 blocklists: vec![],
                 block_action: mycelium_dns_policy::BlockAction::default(),
                 allowlist: vec![],
+                doh: None,
             },
             dnsmasq: "/bin/dnsmasq".into(),
             mycelium: "/bin/mycelium".into(),
@@ -1553,6 +1605,7 @@ mod tests {
             listen: vec![],
             dnsmasq: Some("/bin/dnsmasq".into()),
             mycelium: Some("/bin/mycelium".into()),
+            doh: None,
         };
         let _ = fs::remove_file(&path);
         let created = init(&path, options(), false).unwrap();
