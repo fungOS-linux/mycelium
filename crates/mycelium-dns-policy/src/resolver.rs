@@ -87,7 +87,8 @@ pub struct ResolverConfig {
     /// Domains that must never be blocked, including their whole subtree.
     #[serde(default)]
     pub allowlist: Vec<String>,
-    /// Forward non-`.myc` names over DoH through a local bounded forwarder.
+    /// Forward non-`.myc` names over DoH through a local bounded forwarder
+    /// (dnsmasq points at `server=<listen ip>#<listen port>`).
     #[serde(default)]
     pub doh: Option<DohUpstream>,
 }

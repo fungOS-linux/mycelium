@@ -1259,7 +1259,8 @@ pub async fn command(args: &[String]) -> Result<String, String> {
         let doh = match (doh_endpoint, doh_listen) {
             (Some(endpoint), listen) => Some(mycelium_dns_policy::resolver::DohUpstream {
                 endpoint,
-                listen: listen.unwrap_or_else(|| "127.0.0.1:5353".parse().expect("static")),
+                // 5353 is mDNS and routinely held by browsers.
+                listen: listen.unwrap_or_else(|| "127.0.0.1:5336".parse().expect("static")),
                 timeout_seconds: 5,
                 max_inflight: 8,
             }),
