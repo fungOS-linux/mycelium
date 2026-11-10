@@ -59,6 +59,15 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     let store = crate::invite::store_path(args);
     let mut create_args = vec!["create".to_owned()];
     create_args.extend_from_slice(args);
+    // Relay rendezvous is the default: a claim is normally redeemed from a
+    // network that cannot reach the minting host's LAN or tailnet address.
+    // Without a relay the claim carries only direct addrs, and redemption
+    // times out with nothing to explain why. Opt out with --no-public-relays
+    // only when both ends are known to share a reachable network.
+    let public_relays = !args
+        .iter()
+        .any(|argument| argument == "--no-public-relays");
+    create_args.retain(|argument| argument != "--no-public-relays");
     if value(args, "--invite-store").is_none() {
         create_args.extend([
             "--invite-store".to_owned(),
@@ -73,7 +82,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     if use_iroh {
         crate::pair_iroh::serve(ca, enrollment_ca, store, created,
             value(args, "--name").expect("invitation requires name"),
-            args.iter().any(|argument| argument == "--public-relays"),
+            public_relays,
             args.iter().any(|argument| argument == "--qr")).await?;
         return Ok(vec!["peer enrollment complete; Iroh pairing endpoint closed".into()]);
     }

@@ -152,7 +152,12 @@ pub(crate) async fn serve(
     for ip in address.ip_addrs().take(4) {
         bounded = bounded.with_ip_addr(*ip);
     }
-    for relay in address.relay_urls().take(1) {
+    // A claim may advertise several relays. Taking only the first makes the
+    // whole redemption hinge on one hostname: if it is stale (the bare
+    // `relay.n0.iroh.link` no longer resolves) or unreachable from the
+    // redeeming network, every attempt times out and no other relay is tried.
+    // Four is the bound the discovery protocol already enforces.
+    for relay in address.relay_urls().take(4) {
         bounded = bounded.with_relay_url(relay.clone());
     }
     let rendezvous = Rendezvous {
