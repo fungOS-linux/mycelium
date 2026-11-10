@@ -159,8 +159,8 @@ entry; it never touches `/Library/LaunchDaemons` or unrelated units.
 
 The gateway does not manage DNS. Hosts that do not already resolve `.myc`
 wildcards locally need bootstrap entries (for example
-`127.0.0.1 ai.myc api.myc mcp.myc home.myc webhook.myc` in `/etc/hosts`) until
-the Mycelium DNS resolver owns the zone.
+`127.0.0.1 ai.myc api.myc mcp.myc home.myc webhook.myc store.myc` in
+`/etc/hosts`) until the Mycelium DNS resolver owns the zone.
 
 For a custom certificate or route table, use the installer flags directly:
 
