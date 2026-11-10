@@ -1,6 +1,7 @@
 //! Symmetric, transport-neutral messages exchanged by Mycelium peers.
 
 pub mod gateway_usage;
+pub mod profile;
 pub mod identity;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -132,6 +133,29 @@ pub struct ProcessHealth {
     pub memory_percent: f32,
 }
 
+/// Where a host draws power.
+///
+/// A battery-powered host is never a public ingress candidate: it leaves when
+/// the lid closes, no matter how healthy it looks right now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerSource {
+    #[default]
+    Unknown,
+    Mains,
+    Battery,
+}
+
+/// How a host reaches the network.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkKind {
+    #[default]
+    Unknown,
+    Wired,
+    Wireless,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostHealth {
     pub observed_at: u64,
@@ -146,6 +170,12 @@ pub struct HostHealth {
     pub process_leaders: Vec<ProcessHealth>,
     pub ssh_listening: bool,
     pub established_ssh_sessions: u32,
+    /// Defaults keep older peers decodable; an absent value means unknown, not
+    /// mains power.
+    #[serde(default)]
+    pub power: PowerSource,
+    #[serde(default)]
+    pub link: LinkKind,
     #[serde(default)]
     pub platform_metrics: BTreeMap<String, String>,
 }

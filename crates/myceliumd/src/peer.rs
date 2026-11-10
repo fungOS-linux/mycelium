@@ -220,6 +220,8 @@ impl Mesh {
             process_leaders: Vec::new(),
             ssh_listening,
             established_ssh_sessions: 0,
+            power: mycelium_peer_protocol::PowerSource::Unknown,
+            link: mycelium_peer_protocol::LinkKind::Unknown,
             platform_metrics: BTreeMap::new(),
         }))
         .await
@@ -2492,6 +2494,8 @@ fn collect_linux() -> Result<HostHealth, AnyError> {
         ssh_listening: ssh.lines().any(|line| local_port(line, 22)),
         established_ssh_sessions: sessions.lines().filter(|line| local_port(line, 22)).count()
             as u32,
+        power: linux_power(),
+        link: linux_link(),
         platform_metrics,
     })
 }
@@ -2541,8 +2545,120 @@ fn collect_darwin() -> Result<HostHealth, AnyError> {
             .lines()
             .filter(|line| line.contains("(ESTABLISHED)") && darwin_local_port(line, 22))
             .count() as u32,
+        power: darwin_power(),
+        link: darwin_link(),
         platform_metrics: BTreeMap::new(),
     })
+}
+
+/// Power source from sysfs.
+///
+/// A machine with no battery is mains by construction. With a battery, mains is
+/// only claimed when a supply reports itself online; anything ambiguous stays
+/// `Unknown`, because `Unknown` does not exclude a host while `Battery` does.
+#[cfg(target_os = "linux")]
+fn linux_power() -> mycelium_peer_protocol::PowerSource {
+    use mycelium_peer_protocol::PowerSource;
+    let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else {
+        return PowerSource::Unknown;
+    };
+    let mut seen = false;
+    let mut has_battery = false;
+    let mut on_mains = false;
+    for entry in entries.flatten() {
+        let kind = std::fs::read_to_string(entry.path().join("type")).unwrap_or_default();
+        match kind.trim() {
+            "Battery" => {
+                seen = true;
+                has_battery = true;
+            }
+            "Mains" | "USB" | "USB_C" => {
+                seen = true;
+                if let Ok(online) = std::fs::read_to_string(entry.path().join("online")) {
+                    on_mains |= online.trim() == "1";
+                }
+            }
+            _ => {}
+        }
+    }
+    match (seen, has_battery, on_mains) {
+        (false, _, _) => PowerSource::Unknown,
+        (true, false, _) => PowerSource::Mains,
+        (true, true, true) => PowerSource::Mains,
+        (true, true, false) => PowerSource::Battery,
+    }
+}
+
+/// Link kind of the interface carrying the default route.
+#[cfg(target_os = "linux")]
+fn linux_link() -> mycelium_peer_protocol::LinkKind {
+    use mycelium_peer_protocol::LinkKind;
+    let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let Some(interface) = route.lines().skip(1).find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let name = fields.next()?;
+        let destination = fields.next()?;
+        (destination == "00000000").then(|| name.to_owned())
+    }) else {
+        return LinkKind::Unknown;
+    };
+    let base = format!("/sys/class/net/{interface}");
+    if std::path::Path::new(&format!("{base}/wireless")).exists() {
+        LinkKind::Wireless
+    } else if std::path::Path::new(&base).exists() {
+        LinkKind::Wired
+    } else {
+        LinkKind::Unknown
+    }
+}
+
+/// Power source as reported by the power management daemon.
+#[cfg(target_os = "macos")]
+fn darwin_power() -> mycelium_peer_protocol::PowerSource {
+    use mycelium_peer_protocol::PowerSource;
+    let Ok(battery) = output("/usr/bin/pmset", &["-g", "batt"]) else {
+        return PowerSource::Unknown;
+    };
+    if battery.contains("AC Power") {
+        PowerSource::Mains
+    } else if battery.contains("Battery Power") {
+        PowerSource::Battery
+    } else {
+        PowerSource::Unknown
+    }
+}
+
+/// Link kind of the interface carrying the default route.
+#[cfg(target_os = "macos")]
+fn darwin_link() -> mycelium_peer_protocol::LinkKind {
+    use mycelium_peer_protocol::LinkKind;
+    let Ok(route) = output("/sbin/route", &["-n", "get", "default"]) else {
+        return LinkKind::Unknown;
+    };
+    let Some(interface) = route
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("interface:").map(str::trim))
+    else {
+        return LinkKind::Unknown;
+    };
+    // A Thunderbolt or USB adapter reports as "Ethernet" and is still wired.
+    let ports = output("/usr/sbin/networksetup", &["-listallhardwareports"]).unwrap_or_default();
+    let mut port = None;
+    let mut lines = ports.lines();
+    while let Some(line) = lines.next() {
+        if let Some(name) = line.trim().strip_prefix("Hardware Port:") {
+            let device = lines.next().unwrap_or_default().trim();
+            if device == format!("Device: {interface}") {
+                port = Some(name.trim().to_owned());
+                break;
+            }
+        }
+    }
+    match port.as_deref() {
+        Some("Wi-Fi") | Some("AirPort") => LinkKind::Wireless,
+        Some(_) => LinkKind::Wired,
+        None => LinkKind::Unknown,
+    }
 }
 
 fn output(command: &str, args: &[&str]) -> Result<String, AnyError> {
