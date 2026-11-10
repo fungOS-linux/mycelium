@@ -104,6 +104,7 @@ pub async fn run_with_options(
         config.default_route.clone(),
     )));
     let services = Arc::new(std::sync::RwLock::new(ServiceIndex::default()));
+    let services_for_reload = services.clone();
     let discovery = config
         .routes
         .iter()
@@ -126,6 +127,7 @@ pub async fn run_with_options(
                     index.len(),
                     bin.display()
                 );
+                table.write().unwrap().set_discovered(&index);
                 *services.write().unwrap() = index;
             }
             Err(error) => {
@@ -134,7 +136,7 @@ pub async fn run_with_options(
                 );
             }
         }
-        spawn_service_refresh(bin, refresh_secs, services.clone());
+        spawn_service_refresh(bin, refresh_secs, services.clone(), table.clone());
     }
 
     let usage = Arc::new(UsageStore::open(usage_path.clone()));
@@ -161,7 +163,7 @@ pub async fn run_with_options(
     };
 
     if let (Some(path), true) = (config_path, reload_secs > 0) {
-        spawn_reload(path, table, initial_mtime, reload_secs);
+        spawn_reload(path, table, initial_mtime, reload_secs, services_for_reload);
     }
 
     let listener = TcpListener::bind(listen).await?;
@@ -275,12 +277,17 @@ fn spawn_service_refresh(
     bin: PathBuf,
     refresh_secs: u64,
     services: Arc<std::sync::RwLock<ServiceIndex>>,
+    table: Arc<std::sync::RwLock<RouteTable>>,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
             match ServiceIndex::load(&bin).await {
                 Ok(index) => {
+                    // Take the locks one at a time, in this order: the reload
+                    // path reads the catalog before the table, and holding both
+                    // in opposite orders is how this would deadlock.
+                    table.write().unwrap().set_discovered(&index);
                     *services.write().unwrap() = index;
                 }
                 Err(error) => {
@@ -298,6 +305,7 @@ fn spawn_reload(
     table: Arc<std::sync::RwLock<RouteTable>>,
     mut last_mtime: Option<std::time::SystemTime>,
     reload_secs: u64,
+    services: Arc<std::sync::RwLock<ServiceIndex>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -311,7 +319,10 @@ fn spawn_reload(
             last_mtime = current;
             match GatewayConfig::load(&path) {
                 Ok(config) => {
-                    *table.write().unwrap() = RouteTable::new(config.routes, config.default_route);
+                    let index = services.read().unwrap().clone();
+                    let mut table = table.write().unwrap();
+                    *table = RouteTable::new(config.routes, config.default_route);
+                    table.set_discovered(&index);
                     eprintln!("mycelium-gateway: reloaded {}", path.display());
                 }
                 Err(error) => {
@@ -336,7 +347,8 @@ async fn healthz(State(state): State<GatewayState>) -> impl axum::response::Into
     let services = state.services.read().unwrap();
     axum::Json(json!({
         "ok": true,
-        "routes": table.routes().len(),
+        "routes": table.total_routes(),
+        "derived_routes": table.derived_routes(),
         "service_endpoints": services.len(),
         "local_node": services.local_node(),
         "auth_required": state.auth_token.is_some(),

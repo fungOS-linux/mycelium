@@ -19,6 +19,10 @@ pub struct Candidate {
 pub struct ServiceIndex {
     local_node: Option<String>,
     by_kind: BTreeMap<String, Vec<Candidate>>,
+    /// Names claimed by a fresh lease, mapped to the service kind that answers
+    /// them. This is the host table the gateway derives instead of asking every
+    /// node to keep a hand-edited route file.
+    hosts: BTreeMap<String, String>,
 }
 
 impl ServiceIndex {
@@ -28,6 +32,10 @@ impl ServiceIndex {
 
     pub fn candidates(&self, kind: &str) -> &[Candidate] {
         self.by_kind.get(kind).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn hosts(&self) -> &BTreeMap<String, String> {
+        &self.hosts
     }
 
     pub fn len(&self) -> usize {
@@ -59,6 +67,7 @@ impl ServiceIndex {
             .and_then(serde_json::Value::as_array)
             .ok_or("service catalog has no observations")?;
         let mut by_kind: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
+        let mut hosts: BTreeMap<String, String> = BTreeMap::new();
         let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
         for observation in observations {
             let Some(service) = observation.get("value") else {
@@ -76,6 +85,27 @@ impl ServiceIndex {
                 .unwrap_or(0);
             if expires_at <= now {
                 continue;
+            }
+            // A name exists only while a fresh lease claims it. Two owners may
+            // claim the same name; the kind is chosen deterministically so a
+            // catalog rebuild cannot shuffle which one the gateway picks.
+            if let Some(declared) = service
+                .pointer("/attributes/hosts")
+                .and_then(serde_json::Value::as_str)
+            {
+                for host in declared
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|host| !host.is_empty())
+                {
+                    let host = host.to_ascii_lowercase();
+                    match hosts.get(&host) {
+                        Some(existing) if existing.as_str() <= kind => {}
+                        _ => {
+                            hosts.insert(host, kind.to_owned());
+                        }
+                    }
+                }
             }
             let observer = observation
                 .pointer("/provenance/observer")
@@ -135,6 +165,7 @@ impl ServiceIndex {
         Ok(Self {
             local_node: Some(local_node.to_owned()),
             by_kind,
+            hosts,
         })
     }
 }
