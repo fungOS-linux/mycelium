@@ -49,7 +49,12 @@ pub trait VlanManagement: Device {
         self.invoke(ctx, ID_VLAN_LIST, Params::new()).await
     }
 
-    async fn create_vlan(&self, ctx: &ExecContext, id: u16, name: Option<&str>) -> Result<CapResult> {
+    async fn create_vlan(
+        &self,
+        ctx: &ExecContext,
+        id: u16,
+        name: Option<&str>,
+    ) -> Result<CapResult> {
         let mut params = params!("id" => Value::Int(id as i64));
         if let Some(name) = name {
             params.insert("name".into(), name.to_owned().into_value());
@@ -101,7 +106,12 @@ pub trait DnsFiltering: Device {
         self.invoke(ctx, ID_DNS_LIST_ENTRIES, Params::new()).await
     }
 
-    async fn block_domain(&self, ctx: &ExecContext, domain: &str, comment: Option<&str>) -> Result<CapResult> {
+    async fn block_domain(
+        &self,
+        ctx: &ExecContext,
+        domain: &str,
+        comment: Option<&str>,
+    ) -> Result<CapResult> {
         let mut params = params!("domain" => domain);
         if let Some(comment) = comment {
             params.insert("comment".into(), comment.to_owned().into_value());
@@ -116,7 +126,12 @@ pub trait Wireless: Device {
         self.invoke(ctx, ID_WLAN_LIST_SSID, Params::new()).await
     }
 
-    async fn set_guest_enabled(&self, ctx: &ExecContext, ssid: &str, enabled: bool) -> Result<CapResult> {
+    async fn set_guest_enabled(
+        &self,
+        ctx: &ExecContext,
+        ssid: &str,
+        enabled: bool,
+    ) -> Result<CapResult> {
         let params = params!("ssid" => ssid, "enabled" => enabled);
         self.invoke(ctx, ID_WLAN_GUEST_ENABLE, params).await
     }
@@ -129,7 +144,12 @@ pub trait Sensors: Device {
         self.invoke(ctx, ID_SENSOR_READ, Params::new()).await
     }
 
-    async fn sensor_history(&self, ctx: &ExecContext, sensor: &str, last: u32) -> Result<CapResult> {
+    async fn sensor_history(
+        &self,
+        ctx: &ExecContext,
+        sensor: &str,
+        last: u32,
+    ) -> Result<CapResult> {
         let params = params!("sensor" => sensor, "last" => Value::Int(last as i64));
         self.invoke(ctx, ID_SENSOR_HISTORY, params).await
     }
@@ -198,7 +218,10 @@ mod tests {
     async fn undeclared_slice_is_unsupported_not_panic() {
         let dev = OnlyVlans;
         let ctx = ExecContext::readonly(ID_DHCP_LIST_POOLS);
-        let err = dev.invoke(&ctx, ID_DHCP_LIST_POOLS, Params::new()).await.unwrap_err();
+        let err = dev
+            .invoke(&ctx, ID_DHCP_LIST_POOLS, Params::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, MyceliumError::UnknownCapability(_)));
     }
 }

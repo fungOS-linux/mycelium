@@ -185,8 +185,15 @@ fn expired_client_renews_through_relay_without_issuer_connection() {
             .unwrap();
             assert_eq!(cert.serial(), 42);
             assert_eq!(cert.public_key(), subject.public_key().key_data());
-            assert!(cert.valid_principals().contains(&"mycelium-role-home-operator".into()));
-            assert!(cert.valid_principals().contains(&mycelium_peer_protocol::ssh_role_principal("james","home-operator")));
+            assert!(cert
+                .valid_principals()
+                .contains(&"mycelium-role-home-operator".into()));
+            assert!(cert
+                .valid_principals()
+                .contains(&mycelium_peer_protocol::ssh_role_principal(
+                    "james",
+                    "home-operator"
+                )));
             assert!(cert.valid_before() > timestamp());
             let observations: Vec<SignedEnvelope> = serde_json::from_slice(
                 &fs::read(sandbox.directory.join("node1/peer-observations.json")).unwrap(),

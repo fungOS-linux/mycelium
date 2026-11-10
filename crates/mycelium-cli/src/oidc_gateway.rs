@@ -180,7 +180,11 @@ pub(crate) async fn serve_pairing(
     }
 }
 
-pub(crate) fn pairing_state(ca: PathBuf, enrollment_ca: PathBuf, invite_store: PathBuf) -> GatewayState {
+pub(crate) fn pairing_state(
+    ca: PathBuf,
+    enrollment_ca: PathBuf,
+    invite_store: PathBuf,
+) -> GatewayState {
     GatewayState {
         issuer: "pairing".into(),
         audience: "pairing".into(),
@@ -197,18 +201,31 @@ pub(crate) fn pairing_state(ca: PathBuf, enrollment_ca: PathBuf, invite_store: P
 
 pub(crate) fn pairing_finished(store: &Path, id: &str, expires_at: u64) -> Result<bool, String> {
     let store = crate::invite::load(store)?;
-    let consumed = store.invitations.iter().find(|invitation| invitation.id == id)
+    let consumed = store
+        .invitations
+        .iter()
+        .find(|invitation| invitation.id == id)
         .is_none_or(|invitation| invitation.remaining_uses == 0);
-    if consumed { return Ok(true); }
-    if crate::invite::now()? >= expires_at { return Err("pairing claim expired before redemption".into()); }
+    if consumed {
+        return Ok(true);
+    }
+    if crate::invite::now()? >= expires_at {
+        return Err("pairing claim expired before redemption".into());
+    }
     Ok(false)
 }
 
 #[cfg(feature = "iroh-sync")]
-pub(crate) async fn redeem_pair_request(state: GatewayState, request: crate::invite::RedeemRequest)
-    -> Result<crate::invite::RedeemResponse, String> {
-    redeem_invite(State(state), Json(request)).await.map(|Json(value)| value)
-        .map_err(|(status, Json(error))| format!("claim gateway returned {status}: {}", error.error))
+pub(crate) async fn redeem_pair_request(
+    state: GatewayState,
+    request: crate::invite::RedeemRequest,
+) -> Result<crate::invite::RedeemResponse, String> {
+    redeem_invite(State(state), Json(request))
+        .await
+        .map(|Json(value)| value)
+        .map_err(|(status, Json(error))| {
+            format!("claim gateway returned {status}: {}", error.error)
+        })
 }
 
 async fn redeem_invite(
@@ -684,14 +701,21 @@ pub async fn redeem(args: &[String]) -> Result<Vec<String>, String> {
     require_write(args)?;
     let packaged = crate::packaged::current()?;
     if value(args, "--peer-csr").is_some() && packaged {
-        let home = value(args, "--home").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(crate::packaged::HOME));
-        crate::packaged::validate(&home, args.iter().any(|argument| argument == "--system-service"))?;
+        let home = value(args, "--home")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(crate::packaged::HOME));
+        crate::packaged::validate(
+            &home,
+            args.iter().any(|argument| argument == "--system-service"),
+        )?;
         if home.join("pki/node-key.pem").exists() || home.join("node.env").exists() {
             return Err("refusing a new packaged peer claim over an existing identity; use setup --packaged --repair".into());
         }
     }
     let gateway = required(args, "--gateway")?.trim_end_matches('/');
-    if !gateway.starts_with("iroh-pair:") { validate_gateway_url(gateway)?; }
+    if !gateway.starts_with("iroh-pair:") {
+        validate_gateway_url(gateway)?;
+    }
     let claim = required(args, "--claim")?;
     let public_key = value(args, "--public-key")
         .map(fs::read_to_string)
@@ -712,11 +736,20 @@ pub async fn redeem(args: &[String]) -> Result<Vec<String>, String> {
             certificate_path.expect("checked above").display()
         ));
     }
-    let request = crate::invite::RedeemRequest { claim: claim.to_owned(), public_key, peer_csr };
+    let request = crate::invite::RedeemRequest {
+        claim: claim.to_owned(),
+        public_key,
+        peer_csr,
+    };
     if gateway.starts_with("iroh-pair:") {
-        let home = value(args, "--home").map(PathBuf::from).unwrap_or_else(myceliumd::home_dir);
+        let home = value(args, "--home")
+            .map(PathBuf::from)
+            .unwrap_or_else(myceliumd::home_dir);
         if home.join("iroh-sync.json").exists() || home.join("pki/node-key.pem").exists() {
-            return Err("refusing to redeem a new-peer claim over an existing peer identity/configuration".into());
+            return Err(
+                "refusing to redeem a new-peer claim over an existing peer identity/configuration"
+                    .into(),
+            );
         }
     }
     #[cfg(feature = "iroh-sync")]
@@ -729,7 +762,9 @@ pub async fn redeem(args: &[String]) -> Result<Vec<String>, String> {
             response
         }
         #[cfg(not(feature = "iroh-sync"))]
-        { return Err("Iroh enrollment requires --features iroh-sync".into()); }
+        {
+            return Err("Iroh enrollment requires --features iroh-sync".into());
+        }
     } else {
         let response = reqwest::Client::new()
             .post(format!("{gateway}/v1/invite/redeem"))
@@ -752,17 +787,21 @@ pub async fn redeem(args: &[String]) -> Result<Vec<String>, String> {
             .map_err(|error| format!("decode claim response: {error}"))?
     };
     if let Some(peer) = redeemed.peer {
-        let home = value(args, "--home")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                if packaged { PathBuf::from(crate::packaged::HOME) } else { myceliumd::home_dir() }
-            });
+        let home = value(args, "--home").map(PathBuf::from).unwrap_or_else(|| {
+            if packaged {
+                PathBuf::from(crate::packaged::HOME)
+            } else {
+                myceliumd::home_dir()
+            }
+        });
         let key = Path::new(required(args, "--peer-key")?);
         #[cfg(feature = "iroh-sync")]
         let iroh_server_name = if let Some((seed, relays)) = sync_seed {
             crate::pair_iroh::install_seed(&home, seed, relays)?;
             Some(redeemed.principal.as_str())
-        } else { None };
+        } else {
+            None
+        };
         #[cfg(not(feature = "iroh-sync"))]
         let iroh_server_name = None;
         let mut lines = crate::enroll::install_peer_material(

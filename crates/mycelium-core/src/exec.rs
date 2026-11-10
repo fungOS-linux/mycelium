@@ -18,7 +18,11 @@ pub struct ExecContext {
 
 impl ExecContext {
     pub fn readonly(capability: impl Into<String>) -> Self {
-        Self { capability: capability.into(), allow_writes: false, dry_run: false }
+        Self {
+            capability: capability.into(),
+            allow_writes: false,
+            dry_run: false,
+        }
     }
 
     /// Refuse to proceed when this capability mutates state but writes are
@@ -73,7 +77,11 @@ impl RecordingTransport {
         let mut guard = self.answers.lock().expect("recorder poisoned");
         guard.insert(
             command.into(),
-            ExecOutcome { exit_code: 0, stdout: stdout.into(), stderr: String::new() },
+            ExecOutcome {
+                exit_code: 0,
+                stdout: stdout.into(),
+                stderr: String::new(),
+            },
         );
     }
 }
@@ -81,7 +89,10 @@ impl RecordingTransport {
 #[async_trait::async_trait]
 impl Transport for RecordingTransport {
     async fn exec(&self, command: &str) -> crate::Result<ExecOutcome> {
-        self.calls.lock().expect("recorder poisoned").push(command.to_owned());
+        self.calls
+            .lock()
+            .expect("recorder poisoned")
+            .push(command.to_owned());
         let guard = self.answers.lock().expect("recorder poisoned");
         Ok(guard.get(command).cloned().unwrap_or(ExecOutcome {
             exit_code: 127,

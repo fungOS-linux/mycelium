@@ -24,11 +24,21 @@ pub struct CapResult {
 
 impl CapResult {
     pub fn ok(output: Value) -> Self {
-        Self { ok: true, output, message: None, dry_run: false }
+        Self {
+            ok: true,
+            output,
+            message: None,
+            dry_run: false,
+        }
     }
 
     pub fn dry_run(output: Value) -> Self {
-        Self { ok: true, output, message: None, dry_run: true }
+        Self {
+            ok: true,
+            output,
+            message: None,
+            dry_run: true,
+        }
     }
 
     pub fn with_message(mut self, msg: impl Into<String>) -> Self {
@@ -79,7 +89,10 @@ impl CapSpec {
     }
 
     pub fn mutation(description: impl Into<String>) -> Self {
-        Self { mutation: true, ..Self::readonly(description) }
+        Self {
+            mutation: true,
+            ..Self::readonly(description)
+        }
     }
 
     pub fn verified_by(mut self, risk: ActionRisk, capability: impl Into<String>) -> Self {
@@ -91,8 +104,17 @@ impl CapSpec {
         self
     }
 
-    pub fn param(mut self, name: impl Into<String>, ty: ParamType, docs: impl Into<String>) -> Self {
-        self.params.push(ParamSpec { name: name.into(), ty, docs: docs.into() });
+    pub fn param(
+        mut self,
+        name: impl Into<String>,
+        ty: ParamType,
+        docs: impl Into<String>,
+    ) -> Self {
+        self.params.push(ParamSpec {
+            name: name.into(),
+            ty,
+            docs: docs.into(),
+        });
         self
     }
 
@@ -102,7 +124,11 @@ impl CapSpec {
         ty: ParamType,
         docs: impl Into<String>,
     ) -> Self {
-        self.optional.push(ParamSpec { name: name.into(), ty, docs: docs.into() });
+        self.optional.push(ParamSpec {
+            name: name.into(),
+            ty,
+            docs: docs.into(),
+        });
         self
     }
 
@@ -122,8 +148,11 @@ impl CapSpec {
             }
         }
         for (name, _v) in params {
-            let known =
-                self.params.iter().chain(&self.optional).any(|p| &p.name == name);
+            let known = self
+                .params
+                .iter()
+                .chain(&self.optional)
+                .any(|p| &p.name == name);
             if !known {
                 return Err(format!("unknown param `{name}`"));
             }
@@ -196,13 +225,19 @@ mod tests {
 
     #[test]
     fn rejects_missing_typed_and_unknown() {
-        assert!(spec().validate(&Params::new()).unwrap_err().contains("missing required"));
+        assert!(spec()
+            .validate(&Params::new())
+            .unwrap_err()
+            .contains("missing required"));
         let mut wrong = Params::new();
         wrong.insert("id".into(), Value::Str("x".into()));
         assert!(spec().validate(&wrong).unwrap_err().contains("expects int"));
         let mut extra = Params::new();
         extra.insert("id".into(), Value::Int(2));
         extra.insert("bogus".into(), Value::Bool(true));
-        assert!(spec().validate(&extra).unwrap_err().contains("unknown param"));
+        assert!(spec()
+            .validate(&extra)
+            .unwrap_err()
+            .contains("unknown param"));
     }
 }

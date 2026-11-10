@@ -301,7 +301,10 @@ impl Mesh {
         self.refresh_local_hello().await?;
         let renewal_mesh = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(renewal_mesh.key.to_bytes()[0] as u64 % 30)).await;
+            tokio::time::sleep(Duration::from_secs(
+                renewal_mesh.key.to_bytes()[0] as u64 % 30,
+            ))
+            .await;
             loop {
                 if let Err(error) = renewal_mesh.renew_ssh_credentials().await {
                     eprintln!("myceliumd: gossiped SSH renewal: {error}");
@@ -661,49 +664,112 @@ impl Mesh {
     pub async fn renew_ssh_credentials(&self) -> Result<(), AnyError> {
         let at = now();
         let key = self.key.clone();
-        let pending = tokio::task::spawn_blocking(move || crate::ssh_renewal::renewal_request(&key,at)).await??;
+        let pending =
+            tokio::task::spawn_blocking(move || crate::ssh_renewal::renewal_request(&key, at))
+                .await??;
         if let Some(request) = &pending {
             let already_published = self.observations.lock().await.values().any(|e| matches!(&e.event,PeerEvent::SshCredentialRequest(old) if e.origin == self.hello.node_id && old == request));
-            if !already_published {self.publish(PeerEvent::SshCredentialRequest(request.clone())).await?;}
+            if !already_published {
+                self.publish(PeerEvent::SshCredentialRequest(request.clone()))
+                    .await?;
+            }
         }
-        let snapshot: Vec<_> = self.observations.lock().await.values()
-            .filter(|e| matches!(e.event,PeerEvent::SshCredentialRequest(_) | PeerEvent::SshCredentialResponses(_)))
-            .cloned().collect();
+        let snapshot: Vec<_> = self
+            .observations
+            .lock()
+            .await
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.event,
+                    PeerEvent::SshCredentialRequest(_) | PeerEvent::SshCredentialResponses(_)
+                )
+            })
+            .cloned()
+            .collect();
         if let Some(request) = &pending {
             for envelope in &snapshot {
-                let PeerEvent::SshCredentialResponses(deliveries) = &envelope.event else {continue;};
-                for delivery in deliveries.iter().filter(|d| d.node_id == self.hello.node_id && d.response.request_id == request.request_id && d.response.certificate.is_some()) {
+                let PeerEvent::SshCredentialResponses(deliveries) = &envelope.event else {
+                    continue;
+                };
+                for delivery in deliveries.iter().filter(|d| {
+                    d.node_id == self.hello.node_id
+                        && d.response.request_id == request.request_id
+                        && d.response.certificate.is_some()
+                }) {
                     let response = delivery.response.clone();
-                    match tokio::task::spawn_blocking(move || crate::ssh_renewal::install(&response,at)).await? {
-                        Ok(()) => {eprintln!("myceliumd: installed CA-verified renewed SSH certificate from {}",envelope.origin); break;}
-                        Err(error) => eprintln!("myceliumd: reject gossiped SSH credential: {error}"),
+                    match tokio::task::spawn_blocking(move || {
+                        crate::ssh_renewal::install(&response, at)
+                    })
+                    .await?
+                    {
+                        Ok(()) => {
+                            eprintln!(
+                                "myceliumd: installed CA-verified renewed SSH certificate from {}",
+                                envelope.origin
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("myceliumd: reject gossiped SSH credential: {error}")
+                        }
                     }
                 }
             }
         }
-        if !crate::home_dir().join("ssh/user_ca").is_file() {return Ok(());}
-        let mut requests: Vec<_> = snapshot.iter().filter_map(|e| match &e.event {
-            PeerEvent::SshCredentialRequest(r) if r.requested_at.abs_diff(at) <= 300 => Some(r.clone()),_=>None
-        }).collect();
-        requests.sort_by_key(|r| (r.requested_at,r.node_id.clone()));
-        let old = snapshot.iter().find_map(|e| match &e.event {
-            PeerEvent::SshCredentialResponses(d) if e.origin == self.hello.node_id => Some(d.clone()),_=>None
-        }).unwrap_or_default();
+        if !crate::home_dir().join("ssh/user_ca").is_file() {
+            return Ok(());
+        }
+        let mut requests: Vec<_> = snapshot
+            .iter()
+            .filter_map(|e| match &e.event {
+                PeerEvent::SshCredentialRequest(r) if r.requested_at.abs_diff(at) <= 300 => {
+                    Some(r.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        requests.sort_by_key(|r| (r.requested_at, r.node_id.clone()));
+        let old = snapshot
+            .iter()
+            .find_map(|e| match &e.event {
+                PeerEvent::SshCredentialResponses(d) if e.origin == self.hello.node_id => {
+                    Some(d.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
         let mut deliveries = Vec::new();
         let access = self.access_view(at).await;
-        for request in requests.into_iter().take(mycelium_peer_protocol::MAX_SSH_RENEWAL_DELIVERIES) {
-            if let Some(existing) = old.iter().find(|d| d.node_id == request.node_id && d.response.request_id == request.request_id && d.response.certificate.is_some() && d.response.expires_at.is_some_and(|expiry| expiry > at)) {
-                deliveries.push(existing.clone()); continue;
+        for request in requests
+            .into_iter()
+            .take(mycelium_peer_protocol::MAX_SSH_RENEWAL_DELIVERIES)
+        {
+            if let Some(existing) = old.iter().find(|d| {
+                d.node_id == request.node_id
+                    && d.response.request_id == request.request_id
+                    && d.response.certificate.is_some()
+                    && d.response.expires_at.is_some_and(|expiry| expiry > at)
+            }) {
+                deliveries.push(existing.clone());
+                continue;
             }
             let state = access.clone();
             let node_id = request.node_id.clone();
-            if let Some(response) = tokio::task::spawn_blocking(move || crate::ssh_renewal::issue(&request,at,&state)).await? {
-                deliveries.push(mycelium_peer_protocol::SshRenewalDelivery {node_id,response});
+            if let Some(response) =
+                tokio::task::spawn_blocking(move || crate::ssh_renewal::issue(&request, at, &state))
+                    .await?
+            {
+                deliveries.push(mycelium_peer_protocol::SshRenewalDelivery { node_id, response });
             }
         }
-        deliveries.sort_by(|a,b| a.node_id.cmp(&b.node_id));
-        let mut sorted_old = old; sorted_old.sort_by(|a,b| a.node_id.cmp(&b.node_id));
-        if deliveries != sorted_old {self.publish(PeerEvent::SshCredentialResponses(deliveries)).await?;}
+        deliveries.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        let mut sorted_old = old;
+        sorted_old.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        if deliveries != sorted_old {
+            self.publish(PeerEvent::SshCredentialResponses(deliveries))
+                .await?;
+        }
         Ok(())
     }
 
@@ -1511,7 +1577,11 @@ struct TcpRegistration<'a> {
 }
 impl<'a> TcpRegistration<'a> {
     fn new(peers: &'a std::sync::Mutex<BTreeMap<String, usize>>, peer: String) -> Self {
-        *peers.lock().expect("TCP path lock poisoned").entry(peer.clone()).or_default() += 1;
+        *peers
+            .lock()
+            .expect("TCP path lock poisoned")
+            .entry(peer.clone())
+            .or_default() += 1;
         Self { peers, peer }
     }
 }
@@ -1520,7 +1590,9 @@ impl Drop for TcpRegistration<'_> {
         let mut peers = self.peers.lock().expect("TCP path lock poisoned");
         if let Some(count) = peers.get_mut(&self.peer) {
             *count -= 1;
-            if *count == 0 { peers.remove(&self.peer); }
+            if *count == 0 {
+                peers.remove(&self.peer);
+            }
         }
     }
 }
@@ -1649,7 +1721,9 @@ async fn send_with_timeout<W: tokio::io::AsyncWrite + Unpin>(
         writer.write_all(&bytes).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await
-    }).await.map_err(|_| "peer sync write timed out")??;
+    })
+    .await
+    .map_err(|_| "peer sync write timed out")??;
     Ok(())
 }
 
@@ -1744,9 +1818,14 @@ fn event_is_authorized(
     match &envelope.event {
         PeerEvent::SyncHints(hints) => {
             #[cfg(feature = "iroh-sync")]
-            { iroh_sync::validate_hints(hints, &envelope.origin).is_ok() }
+            {
+                iroh_sync::validate_hints(hints, &envelope.origin).is_ok()
+            }
             #[cfg(not(feature = "iroh-sync"))]
-            { let _ = hints; false }
+            {
+                let _ = hints;
+                false
+            }
         }
         PeerEvent::Hello(hello) => {
             hello.interfaces.len() <= 64
@@ -1778,16 +1857,26 @@ fn event_is_authorized(
         PeerEvent::Access(record) => {
             record.verify().is_ok() && resolver.access(&record.signer).authorized
         }
-        PeerEvent::SshCredentialRequest(request) => request.node_id == envelope.origin
-            && request.request_id.len() <= 64 && request.public_key.len() <= 16384
-            && request.requested_at.abs_diff(envelope.emitted_at) <= 300
-            && request.verify().is_ok(),
-        PeerEvent::SshCredentialResponses(deliveries) => deliveries.len() <= mycelium_peer_protocol::MAX_SSH_RENEWAL_DELIVERIES && deliveries.iter().all(|d| {
-            d.node_id.len() == 64 && d.node_id.bytes().all(|b| b.is_ascii_hexdigit())
-                && d.response.request_id.len() <= 64
-                && d.response.certificate.as_ref().is_none_or(|c| c.len() <= 16384)
-                && d.response.error.as_ref().is_none_or(|e| e.len() <= 512)
-        }),
+        PeerEvent::SshCredentialRequest(request) => {
+            request.node_id == envelope.origin
+                && request.request_id.len() <= 64
+                && request.public_key.len() <= 16384
+                && request.requested_at.abs_diff(envelope.emitted_at) <= 300
+                && request.verify().is_ok()
+        }
+        PeerEvent::SshCredentialResponses(deliveries) => {
+            deliveries.len() <= mycelium_peer_protocol::MAX_SSH_RENEWAL_DELIVERIES
+                && deliveries.iter().all(|d| {
+                    d.node_id.len() == 64
+                        && d.node_id.bytes().all(|b| b.is_ascii_hexdigit())
+                        && d.response.request_id.len() <= 64
+                        && d.response
+                            .certificate
+                            .as_ref()
+                            .is_none_or(|c| c.len() <= 16384)
+                        && d.response.error.as_ref().is_none_or(|e| e.len() <= 512)
+                })
+        }
         PeerEvent::Transport(binding) => binding.validate_for(&envelope.origin).is_ok(),
         PeerEvent::WireGuard(binding) => binding.validate_for(&envelope.origin).is_ok(),
         PeerEvent::Hardware(snapshot) => snapshot.validate_for(&envelope.origin).is_ok(),
@@ -1836,8 +1925,10 @@ fn event_key(envelope: &SignedEnvelope) -> String {
                 format!("access:{}:revoke:{revocation_id}", record.signer)
             }
         },
-        PeerEvent::SshCredentialRequest(_) => format!("{}:ssh-credential-request",envelope.origin),
-        PeerEvent::SshCredentialResponses(_) => format!("{}:ssh-credential-responses",envelope.origin),
+        PeerEvent::SshCredentialRequest(_) => format!("{}:ssh-credential-request", envelope.origin),
+        PeerEvent::SshCredentialResponses(_) => {
+            format!("{}:ssh-credential-responses", envelope.origin)
+        }
         PeerEvent::Transport(binding) => {
             format!("{}:transport:{:?}", envelope.origin, binding.kind)
         }
@@ -2404,10 +2495,7 @@ fn add_gateway_usage(health: &mut HostHealth) {
     }
 }
 
-fn gateway_usage_metrics(
-    bytes: &[u8],
-    now: u64,
-) -> Result<BTreeMap<String, String>, String> {
+fn gateway_usage_metrics(bytes: &[u8], now: u64) -> Result<BTreeMap<String, String>, String> {
     use mycelium_peer_protocol::gateway_usage::{
         GatewayUsageMetrics, GatewayUsageSnapshot, GATEWAY_USAGE_SCHEMA_VERSION,
     };
@@ -2670,9 +2758,22 @@ mod tests {
     #[test]
     fn container_and_tunnel_bridges_are_not_advertised() {
         for name in ["en0", "enp87s0", "eth0", "tailscale0", "wlan0"] {
-            assert!(is_advertisable_interface(name), "{name} should be advertised");
+            assert!(
+                is_advertisable_interface(name),
+                "{name} should be advertised"
+            );
         }
-        for name in ["lo", "lo0", "veth1234", "docker0", "br-2f4a", "bridge100", "vmenet0", "sh-mg0", "tap0"] {
+        for name in [
+            "lo",
+            "lo0",
+            "veth1234",
+            "docker0",
+            "br-2f4a",
+            "bridge100",
+            "vmenet0",
+            "sh-mg0",
+            "tap0",
+        ] {
             assert!(!is_advertisable_interface(name), "{name} should be skipped");
         }
     }
@@ -2707,11 +2808,15 @@ mod tests {
     fn fresh_gateway_usage_is_gossiped_and_stale_usage_is_dropped() {
         let metrics = gateway_usage_metrics(&usage_document(1_000, 1), 1_060).unwrap();
         assert_eq!(
-            metrics.get("mycelium_ai.completion_tokens").map(String::as_str),
+            metrics
+                .get("mycelium_ai.completion_tokens")
+                .map(String::as_str),
             Some("12")
         );
         assert_eq!(
-            metrics.get("mycelium_ai.window_completion_tokens").map(String::as_str),
+            metrics
+                .get("mycelium_ai.window_completion_tokens")
+                .map(String::as_str),
             Some("4")
         );
         // A stopped gateway must not report yesterday's traffic as current.
@@ -2730,19 +2835,60 @@ mod tests {
 
     #[test]
     fn renewal_gossip_is_origin_bound_and_slot_bounded() {
-        let key = SigningKey::from_bytes(&[9;32]);
-        let request = mycelium_peer_protocol::SshRenewalRequest::sign("request-1".into(),100,"ssh-ed25519 AAAA".into(),&key).unwrap();
-        let first = SignedEnvelope::sign(&key,1,100,PeerEvent::SshCredentialRequest(request.clone())).unwrap();
-        let second = SignedEnvelope::sign(&key,2,101,PeerEvent::SshCredentialRequest(request.clone())).unwrap();
-        assert_eq!(event_key(&first),event_key(&second)); assert!(event_origin_matches(&first));
-        let forged = SignedEnvelope::sign(&SigningKey::from_bytes(&[8;32]),1,100,PeerEvent::SshCredentialRequest(request)).unwrap();
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let request = mycelium_peer_protocol::SshRenewalRequest::sign(
+            "request-1".into(),
+            100,
+            "ssh-ed25519 AAAA".into(),
+            &key,
+        )
+        .unwrap();
+        let first = SignedEnvelope::sign(
+            &key,
+            1,
+            100,
+            PeerEvent::SshCredentialRequest(request.clone()),
+        )
+        .unwrap();
+        let second = SignedEnvelope::sign(
+            &key,
+            2,
+            101,
+            PeerEvent::SshCredentialRequest(request.clone()),
+        )
+        .unwrap();
+        assert_eq!(event_key(&first), event_key(&second));
+        assert!(event_origin_matches(&first));
+        let forged = SignedEnvelope::sign(
+            &SigningKey::from_bytes(&[8; 32]),
+            1,
+            100,
+            PeerEvent::SshCredentialRequest(request),
+        )
+        .unwrap();
         assert!(!event_origin_matches(&forged));
-        let empty = BTreeSet::new(); let resolver = crate::authority::AuthorityResolver::new(&empty,&empty,&empty,[],100);
-        assert!(event_is_authorized(&first,&empty,&resolver)); assert!(!event_is_authorized(&forged,&empty,&resolver));
-        let delivery = mycelium_peer_protocol::SshRenewalDelivery {node_id:first.origin.clone(),response:mycelium_peer_protocol::SshRenewalResponse {request_id:"request-1".into(),certificate:None,expires_at:None,error:Some("denied".into())}};
-        for (count,allowed) in [(32,true),(33,false)] {
-            let envelope = SignedEnvelope::sign(&key,1,100,PeerEvent::SshCredentialResponses(vec![delivery.clone();count])).unwrap();
-            assert_eq!(event_is_authorized(&envelope,&empty,&resolver),allowed);
+        let empty = BTreeSet::new();
+        let resolver = crate::authority::AuthorityResolver::new(&empty, &empty, &empty, [], 100);
+        assert!(event_is_authorized(&first, &empty, &resolver));
+        assert!(!event_is_authorized(&forged, &empty, &resolver));
+        let delivery = mycelium_peer_protocol::SshRenewalDelivery {
+            node_id: first.origin.clone(),
+            response: mycelium_peer_protocol::SshRenewalResponse {
+                request_id: "request-1".into(),
+                certificate: None,
+                expires_at: None,
+                error: Some("denied".into()),
+            },
+        };
+        for (count, allowed) in [(32, true), (33, false)] {
+            let envelope = SignedEnvelope::sign(
+                &key,
+                1,
+                100,
+                PeerEvent::SshCredentialResponses(vec![delivery.clone(); count]),
+            )
+            .unwrap();
+            assert_eq!(event_is_authorized(&envelope, &empty, &resolver), allowed);
         }
     }
 

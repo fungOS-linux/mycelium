@@ -318,7 +318,9 @@ pub fn install(bundle: &Path, home: &Path) -> Result<Vec<String>, ClientError> {
         )?,
     )
     .map_err(ClientError::Io)?;
-    if packaged { owner_only(&home.join("node.env"))?; }
+    if packaged {
+        owner_only(&home.join("node.env"))?;
+    }
     let service = if packaged {
         crate::packaged::service_path()
     } else if cfg!(target_os = "macos") {
@@ -348,7 +350,15 @@ pub fn install(bundle: &Path, home: &Path) -> Result<Vec<String>, ClientError> {
     };
     Ok(vec![
         format!("installed enrolled peer under {}", home.display()),
-        format!("{} {}; service was not started", if packaged { "retained package-owned" } else { "wrote" }, service.display()),
+        format!(
+            "{} {}; service was not started",
+            if packaged {
+                "retained package-owned"
+            } else {
+                "wrote"
+            },
+            service.display()
+        ),
     ])
 }
 
@@ -385,7 +395,8 @@ pub(crate) fn install_peer_material(
             &std::env::current_exe().map_err(|error| format!("locate current binary: {error}"))?,
             &bin,
             0o755,
-        ).map_err(|error| error.to_string())?;
+        )
+        .map_err(|error| error.to_string())?;
     }
     copy_mode(key, &pki.join("node-key.pem"), 0o600).map_err(|error| error.to_string())?;
     std::fs::write(pki.join("node.pem"), certificate_pem)
@@ -410,7 +421,9 @@ pub(crate) fn install_peer_material(
         .map_err(|error| error.to_string())?,
     )
     .map_err(|error| format!("write node environment: {error}"))?;
-    if packaged { owner_only(&home.join("node.env")).map_err(|error| error.to_string())?; }
+    if packaged {
+        owner_only(&home.join("node.env")).map_err(|error| error.to_string())?;
+    }
     let service = write_peer_service(
         home,
         site,
@@ -582,8 +595,16 @@ fn write_peer_service(
             .map_err(|error| format!("create launch agent directory: {error}"))?;
         std::fs::write(
             &path,
-            resolved_launchd(home, site, peers, authority_keys, release_keys, access_keys, iroh_server_name)
-                .map_err(|error| error.to_string())?,
+            resolved_launchd(
+                home,
+                site,
+                peers,
+                authority_keys,
+                release_keys,
+                access_keys,
+                iroh_server_name,
+            )
+            .map_err(|error| error.to_string())?,
         )
         .map_err(|error| format!("write launch agent: {error}"))?;
         Ok(path)
@@ -875,7 +896,9 @@ pub(crate) fn certificate_dns_names(path: &Path) -> Result<Vec<String>, String> 
 
 /// The stable name a certificate carries, if it carries one.
 fn fleet_name_from_names(names: impl IntoIterator<Item = String>) -> Option<String> {
-    names.into_iter().find(|name| mycelium_core::is_myc_name(name))
+    names
+        .into_iter()
+        .find(|name| mycelium_core::is_myc_name(name))
 }
 
 /// The node's own site and namespace suffix, from the canonical environment
@@ -884,7 +907,10 @@ fn fleet_name_from_names(names: impl IntoIterator<Item = String>) -> Option<Stri
 pub(crate) fn identity(home: &Path) -> Result<(String, String), String> {
     let environment = std::fs::read_to_string(home.join("node.env"))
         .map_err(|error| format!("read node environment: {error}"))?;
-    identity_from(&environment, certificate_dns_names(&home.join("pki/node.pem"))?)
+    identity_from(
+        &environment,
+        certificate_dns_names(&home.join("pki/node.pem"))?,
+    )
 }
 
 fn identity_from(
@@ -1071,8 +1097,14 @@ mod tests {
     fn system_service_uses_the_system_manager() {
         assert_eq!(
             systemd_start_commands(true),
-            &[&["daemon-reload"][..], &["enable", "--now", "mycelium.service"]]
+            &[
+                &["daemon-reload"][..],
+                &["enable", "--now", "mycelium.service"]
+            ]
         );
-        assert_eq!(systemd_start_commands(false)[0], &["--user", "daemon-reload"]);
+        assert_eq!(
+            systemd_start_commands(false)[0],
+            &["--user", "daemon-reload"]
+        );
     }
 }

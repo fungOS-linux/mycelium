@@ -123,7 +123,10 @@ impl JsonBridge {
 }
 
 fn err(plugin: &str, e: &mlua::Error) -> MyceliumError {
-    MyceliumError::Plugin { plugin: plugin.to_owned(), message: e.to_string() }
+    MyceliumError::Plugin {
+        plugin: plugin.to_owned(),
+        message: e.to_string(),
+    }
 }
 
 /// Fresh sandboxed instance with the plugin chunk executed. One per open
@@ -154,8 +157,9 @@ fn instantiate_inner(source: &str, name: &str, bounded: bool) -> Result<Lua> {
     }
     {
         // Remove dangerous stdlib entries before loading user code.
-        const DANGEROUS: &[&str] =
-            &["os", "io", "debug", "load", "dofile", "loadfile", "require", "package"];
+        const DANGEROUS: &[&str] = &[
+            "os", "io", "debug", "load", "dofile", "loadfile", "require", "package",
+        ];
         let keys: Vec<LuaValue> = lua
             .globals()
             .pairs::<LuaValue, LuaValue>()
@@ -170,13 +174,19 @@ fn instantiate_inner(source: &str, name: &str, bounded: bool) -> Result<Lua> {
             }
         }
     }
-    let chunk = lua.load(source).set_name(name).into_function().map_err(|e| err(name, &e))?;
+    let chunk = lua
+        .load(source)
+        .set_name(name)
+        .into_function()
+        .map_err(|e| err(name, &e))?;
     chunk.call::<()>(()).map_err(|e| err(name, &e))?;
     Ok(lua)
 }
 
 fn plugin_table(lua: &Lua, name: &str) -> Result<Table> {
-    lua.globals().get::<Table>("plugin").map_err(|e| err(name, &e))
+    lua.globals()
+        .get::<Table>("plugin")
+        .map_err(|e| err(name, &e))
 }
 
 /// A validated plugin, ready to open devices. Validation happens at load
@@ -195,10 +205,12 @@ impl Plugin {
         let lua = instantiate(&source, "<new>")?;
         let plugin = plugin_table(&lua, "<new>")?;
         let get_str = |key: &str| -> Result<String> {
-            plugin.get::<String>(key).map_err(|_| MyceliumError::Plugin {
-                plugin: "<new>".into(),
-                message: format!("`plugin.{key}` must be a string"),
-            })
+            plugin
+                .get::<String>(key)
+                .map_err(|_| MyceliumError::Plugin {
+                    plugin: "<new>".into(),
+                    message: format!("`plugin.{key}` must be a string"),
+                })
         };
         let name = get_str("name")?;
         let kind_s = get_str("kind")?;
@@ -251,14 +263,12 @@ impl Plugin {
         let plugin = plugin_table(lua, &self.name)?;
         let f: mlua::Function = plugin.get("capabilities").expect("validated at load");
         let out: LuaValue = f.call(()).map_err(|e| err(&self.name, &e))?;
-        let json: serde_json::Value =
-            lua.from_value(out).map_err(|e| err(&self.name, &e))?;
-        let specs: Vec<CapSpec> = serde_json::from_value(json).map_err(|e| {
-            MyceliumError::Plugin {
+        let json: serde_json::Value = lua.from_value(out).map_err(|e| err(&self.name, &e))?;
+        let specs: Vec<CapSpec> =
+            serde_json::from_value(json).map_err(|e| MyceliumError::Plugin {
                 plugin: self.name.clone(),
                 message: format!("capabilities() must return declared CapSpec rows: {e}"),
-            }
-        })?;
+            })?;
         let mut map = BTreeMap::new();
         for mut spec in specs {
             if spec.id.is_empty() {
@@ -764,7 +774,9 @@ impl Driver for LuaDriver {
         if !caps.contains_key(ID_IDENTIFY) {
             return Err(MyceliumError::Plugin {
                 plugin: self.plugin.name.clone(),
-                message: format!("plugins must declare `{ID_IDENTIFY}` so attach() can name the device"),
+                message: format!(
+                    "plugins must declare `{ID_IDENTIFY}` so attach() can name the device"
+                ),
             });
         }
 
@@ -811,9 +823,15 @@ impl Driver for LuaDriver {
             id: id.clone(),
             kind: self.plugin.kind,
             driver: self.plugin.name.clone(),
-            vendor: map.get("vendor").and_then(|v| v.as_str()).map(str::to_owned),
+            vendor: map
+                .get("vendor")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
             model: map.get("model").and_then(|v| v.as_str()).map(str::to_owned),
-            firmware: map.get("firmware").and_then(|v| v.as_str()).map(str::to_owned),
+            firmware: map
+                .get("firmware")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
             address,
         };
         let _ = device.meta.set(meta);
@@ -898,9 +916,14 @@ impl Device for LuaDevice {
                 },
             });
             let out: LuaValue = exec
-                .call((cap.to_owned(), JsonBridge(Value::Map(params.clone()).to_json()), JsonBridge(c)))
+                .call((
+                    cap.to_owned(),
+                    JsonBridge(Value::Map(params.clone()).to_json()),
+                    JsonBridge(c),
+                ))
                 .map_err(|e| err(&self.plugin.name, &e))?;
-            lua.from_value(out).map_err(|e| err(&self.plugin.name, &e))?
+            lua.from_value(out)
+                .map_err(|e| err(&self.plugin.name, &e))?
         };
 
         let commands = commands_from_plan(&self.plugin.name, &plan)?;
@@ -926,7 +949,10 @@ impl Device for LuaDevice {
         .await?;
 
         // 4. Pure result, or hand outputs to the named parse function.
-        let parse_name = plan.get("parse").and_then(|p| p.as_str()).map(str::to_owned);
+        let parse_name = plan
+            .get("parse")
+            .and_then(|p| p.as_str())
+            .map(str::to_owned);
         match (commands.is_empty(), parse_name) {
             (true, _) => result_from_plan(&self.plugin, &plan),
             (false, None) => Ok(CapResult::ok(Value::List(
@@ -936,17 +962,22 @@ impl Device for LuaDevice {
                 let params_json = Value::Map(params.clone()).to_json();
                 let guard = self.lua.lock().await;
                 let plugin = plugin_table(&guard, &self.plugin.name)?;
-                let parse: mlua::Function = plugin.get(name.as_str()).map_err(|e| {
-                    MyceliumError::Plugin {
-                        plugin: self.plugin.name.clone(),
-                        message: format!("parse function `{name}` missing: {e}"),
-                    }
-                })?;
+                let parse: mlua::Function =
+                    plugin
+                        .get(name.as_str())
+                        .map_err(|e| MyceliumError::Plugin {
+                            plugin: self.plugin.name.clone(),
+                            message: format!("parse function `{name}` missing: {e}"),
+                        })?;
                 let out: LuaValue = parse
-                    .call((JsonBridge(serde_json::Value::Array(outputs)), JsonBridge(params_json)))
+                    .call((
+                        JsonBridge(serde_json::Value::Array(outputs)),
+                        JsonBridge(params_json),
+                    ))
                     .map_err(|e| err(&self.plugin.name, &e))?;
-                let json: serde_json::Value =
-                    guard.from_value(out).map_err(|e| err(&self.plugin.name, &e))?;
+                let json: serde_json::Value = guard
+                    .from_value(out)
+                    .map_err(|e| err(&self.plugin.name, &e))?;
                 result_from_plan(&self.plugin, &json)
             }
         }
@@ -964,11 +995,17 @@ fn result_from_plan(plugin: &Plugin, plan: &serde_json::Value) -> Result<CapResu
                 .to_owned(),
         });
     }
-    let output = plan.get("result").cloned().unwrap_or(serde_json::Value::Null);
+    let output = plan
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     Ok(CapResult {
         ok: true,
         output: JsonBridge::to_core(&output),
-        message: plan.get("message").and_then(|m| m.as_str()).map(str::to_owned),
+        message: plan
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_owned),
         dry_run: false,
     })
 }
@@ -1287,10 +1324,12 @@ mod tests {
     async fn attaches_and_identifies_through_lua() {
         let (plugin, transport) = fixture();
         let t: Arc<dyn Transport> = transport.clone();
-        let driver = plugin.clone().driver(Arc::new(move |_target: Target, _creds| {
-            let t = t.clone();
-            async move { Ok(t.clone()) }
-        }));
+        let driver = plugin
+            .clone()
+            .driver(Arc::new(move |_target: Target, _creds| {
+                let t = t.clone();
+                async move { Ok(t.clone()) }
+            }));
         let inv = Inventory::new();
         let creds = CredentialSet::default().with_user("u");
         let id = driver
@@ -1309,9 +1348,24 @@ mod tests {
     #[tokio::test]
     async fn match_is_pure_lua_on_target_desc() {
         let (plugin, _transport) = fixture();
-        let driver = plugin.driver(Arc::new(|_: Target, _| async { panic!("no connect for match") }));
-        assert!(driver.recognizes(&Target::Host { host: "x".into(), port: Some(8053), jump: None }, &CredentialSet::default()).await.unwrap());
-        assert!(!driver.recognizes(&Target::host("x"), &CredentialSet::default()).await.unwrap());
+        let driver = plugin.driver(Arc::new(|_: Target, _| async {
+            panic!("no connect for match")
+        }));
+        assert!(driver
+            .recognizes(
+                &Target::Host {
+                    host: "x".into(),
+                    port: Some(8053),
+                    jump: None
+                },
+                &CredentialSet::default()
+            )
+            .await
+            .unwrap());
+        assert!(!driver
+            .recognizes(&Target::host("x"), &CredentialSet::default())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1325,7 +1379,10 @@ mod tests {
             async move { Ok(t.clone()) }
         }));
         let inv = Inventory::new();
-        let id = driver.attach(&Target::host("h"), &CredentialSet::default(), &inv).await.unwrap();
+        let id = driver
+            .attach(&Target::host("h"), &CredentialSet::default(), &inv)
+            .await
+            .unwrap();
         let dev = inv.get(&id.to_string()).unwrap();
 
         let ctx = ExecContext::readonly("dns.list");
@@ -1336,15 +1393,46 @@ mod tests {
         );
 
         // write gate: mutation without allow_writes never reaches Lua
-        let gated = ExecContext { capability: "dns.block".into(), allow_writes: false, dry_run: false };
-        let err = dev.invoke(&gated, "dns.block", params_internal("domain", "ads.example")).await.unwrap_err();
+        let gated = ExecContext {
+            capability: "dns.block".into(),
+            allow_writes: false,
+            dry_run: false,
+        };
+        let err = dev
+            .invoke(
+                &gated,
+                "dns.block",
+                params_internal("domain", "ads.example"),
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, MyceliumError::WritesNotPermitted(_)));
-        assert!(!transport.calls.lock().unwrap().iter().any(|c| c.starts_with("block ")));
+        assert!(!transport
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("block ")));
 
         // ...and opt-in runs the declared command
-        let opted = ExecContext { capability: "dns.block".into(), allow_writes: true, dry_run: false };
-        dev.invoke(&opted, "dns.block", params_internal("domain", "ads.example")).await.unwrap();
-        assert!(transport.calls.lock().unwrap().iter().any(|c| c == "block ads.example"));
+        let opted = ExecContext {
+            capability: "dns.block".into(),
+            allow_writes: true,
+            dry_run: false,
+        };
+        dev.invoke(
+            &opted,
+            "dns.block",
+            params_internal("domain", "ads.example"),
+        )
+        .await
+        .unwrap();
+        assert!(transport
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "block ads.example"));
     }
 
     #[tokio::test]
@@ -1356,12 +1444,25 @@ mod tests {
             async move { Ok(t.clone()) }
         }));
         let inv = Inventory::new();
-        let id = driver.attach(&Target::host("h"), &CredentialSet::default(), &inv).await.unwrap();
+        let id = driver
+            .attach(&Target::host("h"), &CredentialSet::default(), &inv)
+            .await
+            .unwrap();
         let dev = inv.get(&id.to_string()).unwrap();
-        let ctx = ExecContext { capability: "dns.block".into(), allow_writes: true, dry_run: true };
-        let res = dev.invoke(&ctx, "dns.block", params_internal("domain", "ads.example")).await.unwrap();
+        let ctx = ExecContext {
+            capability: "dns.block".into(),
+            allow_writes: true,
+            dry_run: true,
+        };
+        let res = dev
+            .invoke(&ctx, "dns.block", params_internal("domain", "ads.example"))
+            .await
+            .unwrap();
         assert!(res.dry_run);
-        assert_eq!(res.output, Value::List(vec![Value::Str("block ads.example".into())]));
+        assert_eq!(
+            res.output,
+            Value::List(vec![Value::Str("block ads.example".into())])
+        );
         assert!(transport.calls.lock().unwrap().is_empty());
     }
 

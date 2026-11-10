@@ -16,8 +16,8 @@ mod invite;
 mod node;
 mod oidc;
 mod oidc_gateway;
-mod pair;
 mod packaged;
+mod pair;
 #[cfg(feature = "iroh-sync")]
 mod pair_iroh;
 mod setup;
@@ -42,8 +42,14 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // PAM account checks are synchronous, offline and do not need Tokio's
     // per-core thread pool or package/daemon startup configuration.
-    if args.get(0).is_some_and(|v|v=="access") && args.get(1).is_some_and(|v|v=="host") && args.get(2).is_some_and(|v|v=="pam-check") {
-        if let Err(error)=host_access::pam_check(&args[2..]) {eprintln!("mycelium: PAM account denied: {error}");std::process::exit(2);}
+    if args.get(0).is_some_and(|v| v == "access")
+        && args.get(1).is_some_and(|v| v == "host")
+        && args.get(2).is_some_and(|v| v == "pam-check")
+    {
+        if let Err(error) = host_access::pam_check(&args[2..]) {
+            eprintln!("mycelium: PAM account denied: {error}");
+            std::process::exit(2);
+        }
         return;
     }
     if let Err(error) = packaged::configure_cli() {
@@ -81,8 +87,12 @@ fn main() {
 }
 
 fn self_check() -> String {
-    format!("mycelium {} protocol {} iroh-sync={}", env!("CARGO_PKG_VERSION"),
-        mycelium_peer_protocol::PROTOCOL_VERSION, cfg!(feature = "iroh-sync"))
+    format!(
+        "mycelium {} protocol {} iroh-sync={}",
+        env!("CARGO_PKG_VERSION"),
+        mycelium_peer_protocol::PROTOCOL_VERSION,
+        cfg!(feature = "iroh-sync")
+    )
 }
 
 fn rt_block<'a, F>(fut: F) -> Result<Vec<String>, ClientError>
@@ -914,14 +924,28 @@ async fn fleet(args: &[String]) -> Result<Vec<String>, ClientError> {
 
 async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
     if args.first().is_some_and(|value| value == "host") {
-        if args.get(1).is_some_and(|v|v=="pam-check") {return host_access::pam_check(&args[1..]).map_err(access_error);}
-        if args.get(1).is_some_and(|v|v=="install-timer") && args.iter().any(|a|a=="--updates") {
-            if args.iter().any(|a|a=="--dry-run") {return Err(access_error("timer installation does not support --dry-run; inspect access host plan instead".into()));}
-            if !args.iter().any(|a|a=="--write") {return Err(access_error("timer installation requires --write".into()));}
+        if args.get(1).is_some_and(|v| v == "pam-check") {
+            return host_access::pam_check(&args[1..]).map_err(access_error);
+        }
+        if args.get(1).is_some_and(|v| v == "install-timer")
+            && args.iter().any(|a| a == "--updates")
+        {
+            if args.iter().any(|a| a == "--dry-run") {
+                return Err(access_error("timer installation does not support --dry-run; inspect access host plan instead".into()));
+            }
+            if !args.iter().any(|a| a == "--write") {
+                return Err(access_error("timer installation requires --write".into()));
+            }
             ssh_access::require_root("root host cache subscription").map_err(access_error)?;
-            let source=host_supervisor::placement_hint(&args[1..]).map_err(access_error)?;
-            let mut client=connect().await?;
-            client.call(&Request::SoftwarePolicySet {policy:source.to_string_lossy().into_owned(),write:true,dry_run:false}).await?;
+            let source = host_supervisor::placement_hint(&args[1..]).map_err(access_error)?;
+            let mut client = connect().await?;
+            client
+                .call(&Request::SoftwarePolicySet {
+                    policy: source.to_string_lossy().into_owned(),
+                    write: true,
+                    dry_run: false,
+                })
+                .await?;
         }
         if args.get(1).is_some_and(|value| value == "supervise") {
             let snapshot = async {
@@ -929,20 +953,30 @@ async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
                 let access = client.call(&Request::AccessList).await?;
                 let authority = client.call(&Request::AuthorityList).await?;
                 let packages = client.call(&Request::PackageList).await?;
-                Ok::<_,ClientError>((access,authority,packages))
-            }.await;
-            let (access,authority,packages) = match snapshot {
+                Ok::<_, ClientError>((access, authority, packages))
+            }
+            .await;
+            let (access, authority, packages) = match snapshot {
                 Ok(values) => values,
-                Err(error) => {eprintln!("mycelium: package carrier unavailable ({error}); enforcing cached access without updating binaries");(serde_json::Value::Null,serde_json::Value::Null,serde_json::Value::Null)}
+                Err(error) => {
+                    eprintln!("mycelium: package carrier unavailable ({error}); enforcing cached access without updating binaries");
+                    (
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                    )
+                }
             };
-            return host_supervisor::run(&args[1..],&access,&authority,&packages).map_err(access_error);
+            return host_supervisor::run(&args[1..], &access, &authority, &packages)
+                .map_err(access_error);
         }
         let snapshot = async {
             let mut client = connect().await?;
             let access = client.call(&Request::AccessList).await?;
             let authority = client.call(&Request::AuthorityList).await?;
             Ok::<_, ClientError>((access, authority))
-        }.await;
+        }
+        .await;
         return match snapshot {
             Ok((access, authority)) => host_access::run(&args[1..], &access, &authority),
             Err(error) => {
@@ -952,15 +986,30 @@ async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
         }.map_err(access_error);
     }
     if args.first().is_some_and(|value| value == "ssh") {
-        if args.get(1).is_some_and(|value| value == "renewal-authorize") {
+        if args
+            .get(1)
+            .is_some_and(|value| value == "renewal-authorize")
+        {
             let mut client = connect().await?;
             let state = client.call(&Request::AccessList).await?;
-            let (statement, key) = ssh_access::renewal_statement(&args[1..],&state).map_err(access_error)?;
+            let (statement, key) =
+                ssh_access::renewal_statement(&args[1..], &state).map_err(access_error)?;
             let directory = myceliumd::home_dir().join("ssh");
             std::fs::create_dir_all(&directory).map_err(|e| access_error(e.to_string()))?;
-            let path = directory.join(format!("renewal-authorization-{}.json",std::process::id()));
-            std::fs::write(&path,serde_json::to_vec(&statement).map_err(|e| access_error(e.to_string()))?).map_err(|e| access_error(e.to_string()))?;
-            let result = client.call(&Request::AccessPublish {statement:path.to_string_lossy().into_owned(),signing_key:key.to_string_lossy().into_owned(),write:true,dry_run:false}).await;
+            let path = directory.join(format!("renewal-authorization-{}.json", std::process::id()));
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&statement).map_err(|e| access_error(e.to_string()))?,
+            )
+            .map_err(|e| access_error(e.to_string()))?;
+            let result = client
+                .call(&Request::AccessPublish {
+                    statement: path.to_string_lossy().into_owned(),
+                    signing_key: key.to_string_lossy().into_owned(),
+                    write: true,
+                    dry_run: false,
+                })
+                .await;
             let _ = std::fs::remove_file(path);
             return result.map(|value| vec![value.to_string()]);
         }
@@ -1162,7 +1211,9 @@ async fn enroll_command(args: &[String]) -> Result<Vec<String>, ClientError> {
                 .ok_or(err_usage("enroll install needs --bundle DIR"))?;
             let home = match flags.path {
                 Some(path) => std::path::PathBuf::from(path),
-                None if packaged::current().map_err(|error| err_usage(&error))? => std::path::PathBuf::from(packaged::HOME),
+                None if packaged::current().map_err(|error| err_usage(&error))? => {
+                    std::path::PathBuf::from(packaged::HOME)
+                }
                 None => myceliumd::home_dir(),
             };
             let mut lines = enroll::install(std::path::Path::new(bundle), &home)?;
@@ -1584,13 +1635,11 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
         )
         .map_err(|error| err_usage(&error))?;
         if json {
-            return Ok(vec![
-                serde_json::to_string(&serde_json::json!({
-                    "prefix": service.to_string(),
-                    "address": service.address().to_string(),
-                }))
-                .map_err(|error| err_usage(&error.to_string()))?,
-            ]);
+            return Ok(vec![serde_json::to_string(&serde_json::json!({
+                "prefix": service.to_string(),
+                "address": service.address().to_string(),
+            }))
+            .map_err(|error| err_usage(&error.to_string()))?]);
         }
         return Ok(vec![
             service.address().to_string(),
@@ -2252,9 +2301,11 @@ async fn update(args: &[String]) -> Result<Vec<String>, ClientError> {
     let fail_on_updates = args.iter().any(|arg| arg == "--fail-on-updates");
     if action == "apply" {
         let executable = std::env::current_exe().map_err(ClientError::Io)?;
-        myceliumd::software_apt::require_native_executable(&executable).map_err(|error| err_usage(&error.to_string()))?;
+        myceliumd::software_apt::require_native_executable(&executable)
+            .map_err(|error| err_usage(&error.to_string()))?;
         if let Some(path) = flags.path.as_deref() {
-            myceliumd::software_apt::require_native_executable(std::path::Path::new(path)).map_err(|error| err_usage(&error.to_string()))?;
+            myceliumd::software_apt::require_native_executable(std::path::Path::new(path))
+                .map_err(|error| err_usage(&error.to_string()))?;
         }
     }
     let channel = flags.channel.unwrap_or_else(myceliumd::updates::channel);
@@ -2415,7 +2466,10 @@ fn update_policy_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     let mut policy = myceliumd::read_update_policy();
     match action {
         "enable" => {
-            myceliumd::software_apt::require_native_executable(&std::env::current_exe().map_err(ClientError::Io)?).map_err(|error| err_usage(&error.to_string()))?;
+            myceliumd::software_apt::require_native_executable(
+                &std::env::current_exe().map_err(ClientError::Io)?,
+            )
+            .map_err(|error| err_usage(&error.to_string()))?;
             policy.enabled = true;
             if let Some(channel) = update_arg(args, "--channel") {
                 policy.channel = channel.to_owned();
@@ -2463,7 +2517,10 @@ fn update_policy_command(args: &[String]) -> Result<Vec<String>, ClientError> {
 }
 
 async fn update_auto_run() -> Result<Vec<String>, ClientError> {
-    myceliumd::software_apt::require_native_executable(&std::env::current_exe().map_err(ClientError::Io)?).map_err(|error| err_usage(&error.to_string()))?;
+    myceliumd::software_apt::require_native_executable(
+        &std::env::current_exe().map_err(ClientError::Io)?,
+    )
+    .map_err(|error| err_usage(&error.to_string()))?;
     let policy = myceliumd::read_update_policy();
     policy.validate().map_err(|error| err_usage(&error))?;
     if !policy.enabled {
@@ -2740,7 +2797,6 @@ fn xml_update(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-
 struct UpdateReport {
     lines: Vec<String>,
     update_available: usize,
@@ -2768,9 +2824,8 @@ fn fleet_update_rows(
             let installed = metrics["mycelium_update.release_version"]
                 .as_str()
                 .filter(|value| !value.is_empty());
-            let verdict = latest.map(|release| {
-                myceliumd::updates::version_verdict(installed, &release.version)
-            });
+            let verdict = latest
+                .map(|release| myceliumd::updates::version_verdict(installed, &release.version));
             let (verdict, needs_update) = match verdict {
                 Some(myceliumd::updates::VersionVerdict::Current) => ("current", Some(false)),
                 Some(myceliumd::updates::VersionVerdict::UpdateAvailable) => {
@@ -2846,11 +2901,7 @@ fn build_update_report(
 ) -> UpdateReport {
     let releases = myceliumd::updates::parse_releases(releases_value);
     let rows = fleet_update_rows(peers, &releases, channel);
-    let count = |verdict: &str| {
-        rows.iter()
-            .filter(|row| row["verdict"] == verdict)
-            .count()
-    };
+    let count = |verdict: &str| rows.iter().filter(|row| row["verdict"] == verdict).count();
     let current = count("current");
     let update_available = count("update-available");
     let ahead = count("ahead");
@@ -2861,10 +2912,7 @@ fn build_update_report(
     let latest = myceliumd::updates::select_release(&releases, channel, targets);
     let local_verdict = match latest {
         Some(latest) if running.digest_matches => {
-            match myceliumd::updates::version_verdict(
-                running.version.as_deref(),
-                &latest.version,
-            ) {
+            match myceliumd::updates::version_verdict(running.version.as_deref(), &latest.version) {
                 myceliumd::updates::VersionVerdict::Current => "current",
                 myceliumd::updates::VersionVerdict::UpdateAvailable => "update-available",
                 myceliumd::updates::VersionVerdict::Ahead => "ahead",
@@ -2960,7 +3008,8 @@ async fn activate_update(
     artifact: &std::path::Path,
     destination: &std::path::Path,
 ) -> Result<(), ClientError> {
-    myceliumd::software_apt::require_native_executable(destination).map_err(|error| err_usage(&error.to_string()))?;
+    myceliumd::software_apt::require_native_executable(destination)
+        .map_err(|error| err_usage(&error.to_string()))?;
     use std::os::unix::fs::PermissionsExt;
     let parent = destination
         .parent()
@@ -5422,8 +5471,16 @@ mod ssh_command_tests {
     #[test]
     fn self_check_reports_compiled_transport_capability() {
         let value = super::self_check();
-        assert!(value.starts_with(concat!("mycelium ", env!("CARGO_PKG_VERSION"), " protocol ")));
-        assert!(value.ends_with(if cfg!(feature = "iroh-sync") { "iroh-sync=true" } else { "iroh-sync=false" }));
+        assert!(value.starts_with(concat!(
+            "mycelium ",
+            env!("CARGO_PKG_VERSION"),
+            " protocol "
+        )));
+        assert!(value.ends_with(if cfg!(feature = "iroh-sync") {
+            "iroh-sync=true"
+        } else {
+            "iroh-sync=false"
+        }));
     }
     use super::*;
 
@@ -5602,7 +5659,10 @@ mod ssh_command_tests {
         );
     }
 
-    fn running_release(version: Option<&str>, digest_matches: bool) -> myceliumd::updates::RunningRelease {
+    fn running_release(
+        version: Option<&str>,
+        digest_matches: bool,
+    ) -> myceliumd::updates::RunningRelease {
         myceliumd::updates::RunningRelease {
             version: version.map(str::to_owned),
             source: "update state",

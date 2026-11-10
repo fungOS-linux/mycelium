@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     Hello,
     NodeObserve,
-    NodeRefresh { write: bool },
+    NodeRefresh {
+        write: bool,
+    },
     /// Registered drivers (builtin + Lua plugins).
     Drivers,
     /// Recognize + open a device. `driver` pins the class; otherwise each

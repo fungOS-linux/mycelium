@@ -16,7 +16,10 @@ pub const MAX_SSH_RENEWAL_DELIVERIES: usize = 32;
 /// Stable, presentation-independent SSH principal. Roles alone are not human
 /// identity: two operators must not impersonate each other's Unix accounts.
 pub fn ssh_role_principal(principal: &str, role: &str) -> String {
-    format!("mycelium-principal-{}-{role}",sha256_hex(principal.as_bytes()))
+    format!(
+        "mycelium-principal-{}-{role}",
+        sha256_hex(principal.as_bytes())
+    )
 }
 
 /// The Rust target of the currently running binary. Publication uses this
