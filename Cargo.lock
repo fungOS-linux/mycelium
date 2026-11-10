@@ -2598,6 +2598,7 @@ dependencies = [
 name = "mycelium-dns-policy"
 version = "0.1.0"
 dependencies = [
+ "fpl-resource-observation",
  "serde",
  "serde_json",
 ]

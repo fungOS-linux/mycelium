@@ -1,4 +1,6 @@
 //! Site DNS records and delegated namespace intent, independent of discovery providers.
+pub mod service_names;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
