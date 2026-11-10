@@ -101,20 +101,25 @@ Both compare against the skew-corrected clock. A 15-second deadline on a fleet
 with second-scale skew is a coin flip, and that is the reason the clock work
 matters here rather than being a side quest.
 
+## Settled
+
+- **Transport.** Cloudflare Tunnel, for now: a connector per profile-qualified
+  node, no inbound ports. The signed iroh endpoint map explored elsewhere stays
+  on the table, but it is not the first move.
+- **L4 with anycast, mTLS terminated at the edge, routing after.** The edge sees
+  the client certificate, decides, and only then routes to a node. That keeps
+  mTLS a real gate on the public path, and it means the client identity travels
+  as a signed assertion rather than as a re-verified chain downstream. The node
+  side must verify that signature and must not accept an unsigned actor header
+  from any other source.
+
 ## Open questions
 
-- **Transport.** Cloudflare Tunnel is the current assumption: a connector per
-  node, no inbound ports. The alternative explored elsewhere was a signed iroh
-  endpoint map published by Mycelium that an edge reads to route directly. That
-  keeps certificates on the nodes and avoids the tunnel, at the cost of owning
-  the routing consistency problem ourselves. Not decided.
-- **L4 vs L7.** Terminating at the edge lets us apply per-location policy and
-  rewrite headers, but discards client certificates. Passing through at L4 keeps
-  mTLS end to end but gives up host-based routing. The local `.myc` path can keep
-  mTLS either way; the public path cannot without Cloudflare client-certificate
-  auth.
 - **Which names may be sticky at all.** A node that dies mid-stream costs a
   reconnect. For a terminal that is acceptable; for a long upload it may not be.
+- **Where the assertion key lives.** One shared edge key is simple and means any
+  compromised edge can mint any actor. Per-node keys are more work and a smaller
+  blast radius.
 
 ## Related threads
 
