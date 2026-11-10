@@ -283,7 +283,8 @@ async fn usage(args: &[String]) -> Result<Vec<String>, String> {
     let snapshot: mycelium_peer_protocol::gateway_usage::GatewayUsageSnapshot =
         serde_json::from_slice(&bytes)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
-    if snapshot.schema_version != mycelium_peer_protocol::gateway_usage::GATEWAY_USAGE_SCHEMA_VERSION
+    if snapshot.schema_version
+        != mycelium_peer_protocol::gateway_usage::GATEWAY_USAGE_SCHEMA_VERSION
     {
         return Err(format!(
             "{} was written by a different gateway (schema {})",
@@ -292,13 +293,16 @@ async fn usage(args: &[String]) -> Result<Vec<String>, String> {
         ));
     }
     if json_output {
-        return Ok(vec![serde_json::to_string(&snapshot)
-            .map_err(|error| format!("encode usage: {error}"))?]);
+        return Ok(vec![
+            serde_json::to_string(&snapshot).map_err(|error| format!("encode usage: {error}"))?
+        ]);
     }
     Ok(render_usage(&snapshot))
 }
 
-fn render_usage(snapshot: &mycelium_peer_protocol::gateway_usage::GatewayUsageSnapshot) -> Vec<String> {
+fn render_usage(
+    snapshot: &mycelium_peer_protocol::gateway_usage::GatewayUsageSnapshot,
+) -> Vec<String> {
     let totals = &snapshot.totals;
     let mut lines = vec![format!(
         "gateway ai usage (recorded {}, window {}s):",
@@ -320,9 +324,7 @@ fn render_usage(snapshot: &mycelium_peer_protocol::gateway_usage::GatewayUsageSn
         snapshot.window.generation_tokens_per_second()
     ));
     if totals.metered_requests < totals.requests {
-        lines.push(
-            "  note: unmetered requests are ones whose upstream reported no usage".into(),
-        );
+        lines.push("  note: unmetered requests are ones whose upstream reported no usage".into());
     }
     for (label, counts) in [("route", &snapshot.routes), ("model", &snapshot.models)] {
         if counts.is_empty() {
@@ -1577,7 +1579,9 @@ fn default_routes(home: &Path) -> Value {
     // from this machine first, then an `ai` lease discovered on the mesh, and
     // finally the public Bifrost edge. The file only becomes a credential
     // override when it exists; without it the caller's own key reaches the edge.
-    let cloud_key = user_home().ok().map(|home| home.join(".fpl/bifrost-api-key"));
+    let cloud_key = user_home()
+        .ok()
+        .map(|home| home.join(".fpl/bifrost-api-key"));
     let mut ai_route = json!({
         "name": "ai",
         "hosts": ["ai.myc", "api.myc"],
@@ -1894,7 +1898,10 @@ mod tests {
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
-        assert_eq!(upstreams, vec!["http://127.0.0.1:4000", "https://ai.fpl.dev"]);
+        assert_eq!(
+            upstreams,
+            vec!["http://127.0.0.1:4000", "https://ai.fpl.dev"]
+        );
         assert_eq!(ai["service_kind"], "ai");
     }
 
@@ -1936,14 +1943,17 @@ mod tests {
         ]);
         let rendered = render_fleet_usage(&peers, now, false).join("\n");
         assert!(
-            rendered.contains("fleet ai usage (2 machines): 4 requests, 20 prompt tokens, 40 completion tokens"),
+            rendered.contains(
+                "fleet ai usage (2 machines): 4 requests, 20 prompt tokens, 40 completion tokens"
+            ),
             "{rendered}"
         );
         assert!(rendered.contains("agora-one requests=2 prompt=10 completion=30 tok/s=1.00"));
         assert!(!rendered.contains("gone"), "{rendered}");
         assert!(!rendered.contains("no-gateway"), "{rendered}");
 
-        let collected: Value = serde_json::from_str(&render_fleet_usage(&peers, now, true)[0]).unwrap();
+        let collected: Value =
+            serde_json::from_str(&render_fleet_usage(&peers, now, true)[0]).unwrap();
         assert_eq!(collected["hosts"], json!(2));
         assert_eq!(collected["totals"]["completion_tokens"], json!(40));
         assert_eq!(collected["rows"][0]["hostname"], json!("agora-one"));
@@ -1974,9 +1984,18 @@ mod tests {
             ..GatewayUsageSnapshot::default()
         };
         let rendered = render_usage(&snapshot).join("\n");
-        assert!(rendered.contains("requests: 3 (metered 2, unmetered 1)"), "{rendered}");
-        assert!(rendered.contains("throughput: 1.00 tok/s now"), "{rendered}");
-        assert!(rendered.contains("60.00 tok/s while generating"), "{rendered}");
+        assert!(
+            rendered.contains("requests: 3 (metered 2, unmetered 1)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("throughput: 1.00 tok/s now"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("60.00 tok/s while generating"),
+            "{rendered}"
+        );
         assert!(rendered.contains("unmetered requests"), "{rendered}");
     }
 

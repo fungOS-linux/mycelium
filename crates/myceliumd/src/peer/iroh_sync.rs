@@ -27,54 +27,103 @@ fn rendezvous_from_hints(hints: &mycelium_peer_protocol::SyncHints) -> SyncRende
 }
 
 fn fallback_needed(mesh: &Mesh, owner: Option<&str>) -> bool {
-    !owner.is_some_and(|peer| mesh.active_tcp.lock().expect("TCP path lock poisoned").contains_key(peer))
+    !owner.is_some_and(|peer| {
+        mesh.active_tcp
+            .lock()
+            .expect("TCP path lock poisoned")
+            .contains_key(peer)
+    })
 }
 
-pub(super) fn validate_hints(hints: &mycelium_peer_protocol::SyncHints, origin: &str) -> Result<(), String> {
-    if hints.node_id != origin { return Err("sync hints owner mismatch".into()); }
+pub(super) fn validate_hints(
+    hints: &mycelium_peer_protocol::SyncHints,
+    origin: &str,
+) -> Result<(), String> {
+    if hints.node_id != origin {
+        return Err("sync hints owner mismatch".into());
+    }
     // Freshness is checked at selection, not merge: expired observations may
     // transit retained gossip without acquiring a new lease.
     rendezvous_from_hints(hints).validate(None)
 }
 
-async fn candidates(mesh: &Mesh, seeds: &[SyncRendezvous], at: u64) -> BTreeMap<String, (Option<String>, SyncRendezvous)> {
+async fn candidates(
+    mesh: &Mesh,
+    seeds: &[SyncRendezvous],
+    at: u64,
+) -> BTreeMap<String, (Option<String>, SyncRendezvous)> {
     let observations = mesh.observations.lock().await;
-    let mut result: BTreeMap<_, _> = seeds.iter().map(|seed| {
-        let owner = observations.values().find_map(|envelope| match &envelope.event {
-            PeerEvent::Transport(binding) if binding.kind == TransportKind::Iroh
-                && binding.public_key == seed.endpoint.endpoint_id
-                && binding.valid_until.is_none_or(|expiry| expiry > at) => Some(envelope.origin.clone()),
-            _ => None,
-        });
-        (seed.endpoint.endpoint_id.clone(), (owner, seed.clone()))
-    }).collect();
+    let mut result: BTreeMap<_, _> = seeds
+        .iter()
+        .map(|seed| {
+            let owner = observations
+                .values()
+                .find_map(|envelope| match &envelope.event {
+                    PeerEvent::Transport(binding)
+                        if binding.kind == TransportKind::Iroh
+                            && binding.public_key == seed.endpoint.endpoint_id
+                            && binding.valid_until.is_none_or(|expiry| expiry > at) =>
+                    {
+                        Some(envelope.origin.clone())
+                    }
+                    _ => None,
+                });
+            (seed.endpoint.endpoint_id.clone(), (owner, seed.clone()))
+        })
+        .collect();
     for envelope in observations.values() {
-        let PeerEvent::SyncHints(hints) = &envelope.event else { continue; };
+        let PeerEvent::SyncHints(hints) = &envelope.event else {
+            continue;
+        };
         if envelope.origin == mesh.node_id() || validate_hints(hints, &envelope.origin).is_err() {
             continue;
         }
         let rendezvous = rendezvous_from_hints(hints);
-        if rendezvous.validate(Some(at)).is_err() { continue; }
+        if rendezvous.validate(Some(at)).is_err() {
+            continue;
+        }
         // A signed hint alone is not an endpoint-key binding.
-        let bound = observations.values().any(|binding| binding.origin == envelope.origin
-            && matches!(&binding.event, PeerEvent::Transport(value)
+        let bound = observations.values().any(|binding| {
+            binding.origin == envelope.origin
+                && matches!(&binding.event, PeerEvent::Transport(value)
                 if value.kind == TransportKind::Iroh && value.public_key == hints.endpoint_id
-                    && value.valid_until.is_none_or(|expiry| expiry > at)));
+                    && value.valid_until.is_none_or(|expiry| expiry > at))
+        });
         if bound {
-            result.insert(hints.endpoint_id.clone(), (Some(envelope.origin.clone()), rendezvous));
+            result.insert(
+                hints.endpoint_id.clone(),
+                (Some(envelope.origin.clone()), rendezvous),
+            );
         }
     }
     result
 }
 
-async fn dial_once(mesh: Arc<Mesh>, endpoint: Endpoint, connector: TlsConnector, seed: SyncRendezvous) -> Result<(), AnyError> {
-    let connection = tokio::time::timeout(HANDSHAKE, endpoint.connect(seed.address()?, ALPN)).await??;
+async fn dial_once(
+    mesh: Arc<Mesh>,
+    endpoint: Endpoint,
+    connector: TlsConnector,
+    seed: SyncRendezvous,
+) -> Result<(), AnyError> {
+    let connection =
+        tokio::time::timeout(HANDSHAKE, endpoint.connect(seed.address()?, ALPN)).await??;
     let (send, recv) = tokio::time::timeout(HANDSHAKE, connection.open_bi()).await??;
-    let stream = tokio::time::timeout(HANDSHAKE, connector.connect(
-        ServerName::try_from(seed.server_name)?, tokio::io::join(recv, send),
-    )).await??;
+    let stream = tokio::time::timeout(
+        HANDSHAKE,
+        connector.connect(
+            ServerName::try_from(seed.server_name)?,
+            tokio::io::join(recv, send),
+        ),
+    )
+    .await??;
     let fingerprint = tls_peer_fingerprint(stream.get_ref().1.peer_certificates());
-    mesh.run_bound_stream(stream, fingerprint, None, Some(connection.remote_id().to_string())).await
+    mesh.run_bound_stream(
+        stream,
+        fingerprint,
+        None,
+        Some(connection.remote_id().to_string()),
+    )
+    .await
 }
 
 /// Explicit persistent seed configuration; changes take effect on restart.
@@ -238,15 +287,28 @@ pub(super) async fn start(mesh: Arc<Mesh>, tls: &TlsSettings) -> Result<(), AnyE
         Err(std::env::VarError::NotPresent) => 7444,
         Err(error) => return Err(error.into()),
     };
-    if port == 0 { return Err("Iroh sync requires a stable nonzero UDP port".into()); }
-    let preferred: BTreeSet<_> = mesh.hello.interfaces.iter()
-        .filter(|interface| !["veth", "docker", "br-", "sh-"].iter().any(|prefix| interface.name.starts_with(prefix)))
-        .flat_map(|interface| interface.addresses.iter().copied()).collect();
+    if port == 0 {
+        return Err("Iroh sync requires a stable nonzero UDP port".into());
+    }
+    let preferred: BTreeSet<_> = mesh
+        .hello
+        .interfaces
+        .iter()
+        .filter(|interface| {
+            !["veth", "docker", "br-", "sh-"]
+                .iter()
+                .any(|prefix| interface.name.starts_with(prefix))
+        })
+        .flat_map(|interface| interface.addresses.iter().copied())
+        .collect();
     let builder = Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(transport_key(&home.join("iroh-secret.key"))?)
         .clear_ip_transports()
         .bind_addr(format!("0.0.0.0:{port}"))?
-        .bind_addr_with_opts(format!("[::]:{port}"), iroh::endpoint::BindOpts::default().set_is_required(false))?
+        .bind_addr_with_opts(
+            format!("[::]:{port}"),
+            iroh::endpoint::BindOpts::default().set_is_required(false),
+        )?
         .clear_address_lookup()
         .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
         .transport_config(
@@ -318,16 +380,26 @@ pub(super) async fn start(mesh: Arc<Mesh>, tls: &TlsSettings) -> Result<(), AnyE
     tokio::spawn(async move {
         let mut running = BTreeMap::<String, tokio::task::JoinHandle<Result<(), AnyError>>>::new();
         let mut retries = BTreeMap::<String, (u64, u64)>::new();
-        let configured: BTreeSet<_> = config.seeds.iter().map(|seed| seed.endpoint.endpoint_id.clone()).collect();
+        let configured: BTreeSet<_> = config
+            .seeds
+            .iter()
+            .map(|seed| seed.endpoint.endpoint_id.clone())
+            .collect();
         // Give the concurrently starting TCP connector first opportunity.
         tokio::time::sleep(Duration::from_secs(5)).await;
         loop {
             let at = now();
-            let finished: Vec<_> = running.iter().filter(|(_, task)| task.is_finished()).map(|(id, _)| id.clone()).collect();
+            let finished: Vec<_> = running
+                .iter()
+                .filter(|(_, task)| task.is_finished())
+                .map(|(id, _)| id.clone())
+                .collect();
             for id in finished {
                 let task = running.remove(&id).unwrap();
                 match task.await {
-                    Ok(Ok(())) => { retries.insert(id, (at + 5, 5)); }
+                    Ok(Ok(())) => {
+                        retries.insert(id, (at + 5, 5));
+                    }
                     result => {
                         eprintln!("myceliumd: Iroh fallback {id}: {result:?}");
                         let delay = retries.get(&id).map_or(5, |(_, delay)| (delay * 2).min(60));
@@ -338,13 +410,32 @@ pub(super) async fn start(mesh: Arc<Mesh>, tls: &TlsSettings) -> Result<(), AnyE
             let candidates = candidates(&outgoing_mesh, &config.seeds, at).await;
             retries.retain(|id, _| candidates.contains_key(id) || running.contains_key(id));
             for (id, (owner, mut seed)) in candidates {
-                if running.len() >= LIMIT { break; }
-                if running.contains_key(&id) || retries.get(&id).is_some_and(|(next, _)| *next > at) { continue; }
+                if running.len() >= LIMIT {
+                    break;
+                }
+                if running.contains_key(&id) || retries.get(&id).is_some_and(|(next, _)| *next > at)
+                {
+                    continue;
+                }
                 // Discovery adds sparse repair edges, not an all-to-all mesh.
-                if !configured.contains(&id) && running.keys().filter(|key| !configured.contains(*key)).count() >= DISCOVERED_LINK_LIMIT { continue; }
-                if !fallback_needed(&outgoing_mesh, owner.as_deref()) { continue; }
-                if !config.public_relays { seed.endpoint.relay_urls.clear(); }
-                if seed.validate(None).is_err() { continue; }
+                if !configured.contains(&id)
+                    && running
+                        .keys()
+                        .filter(|key| !configured.contains(*key))
+                        .count()
+                        >= DISCOVERED_LINK_LIMIT
+                {
+                    continue;
+                }
+                if !fallback_needed(&outgoing_mesh, owner.as_deref()) {
+                    continue;
+                }
+                if !config.public_relays {
+                    seed.endpoint.relay_urls.clear();
+                }
+                if seed.validate(None).is_err() {
+                    continue;
+                }
                 let mesh = outgoing_mesh.clone();
                 let endpoint = outgoing_endpoint.clone();
                 let connector = connector.clone();
@@ -388,15 +479,18 @@ pub(super) async fn start(mesh: Arc<Mesh>, tls: &TlsSettings) -> Result<(), AnyE
             })();
             if let Err(error) = result {
                 eprintln!("myceliumd: Iroh rendezvous refresh: {error}");
-            } else if let Err(error) = mesh.publish(PeerEvent::SyncHints(mycelium_peer_protocol::SyncHints {
-                node_id: mesh.node_id().into(),
-                endpoint_id: rendezvous.endpoint.endpoint_id.clone(),
-                server_name: rendezvous.server_name.clone(),
-                direct_addresses: rendezvous.endpoint.direct_addresses.clone(),
-                relay_urls: rendezvous.endpoint.relay_urls.clone(),
-                observed_at: at,
-                expires_at: rendezvous.endpoint.expires_at,
-            })).await {
+            } else if let Err(error) = mesh
+                .publish(PeerEvent::SyncHints(mycelium_peer_protocol::SyncHints {
+                    node_id: mesh.node_id().into(),
+                    endpoint_id: rendezvous.endpoint.endpoint_id.clone(),
+                    server_name: rendezvous.server_name.clone(),
+                    direct_addresses: rendezvous.endpoint.direct_addresses.clone(),
+                    relay_urls: rendezvous.endpoint.relay_urls.clone(),
+                    observed_at: at,
+                    expires_at: rendezvous.endpoint.expires_at,
+                }))
+                .await
+            {
                 eprintln!("myceliumd: Iroh hint gossip: {error}");
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -431,8 +525,14 @@ mod tests {
         let result: Result<(), AnyError> = async {
             let _registration = TcpRegistration::new(&mesh.active_tcp, "peer".into());
             assert!(!fallback_needed(&mesh, Some("peer")));
-            send_with_timeout(&mut writer, &PeerMessage::Ping { sent_at: 1 }, Duration::from_millis(5)).await
-        }.await;
+            send_with_timeout(
+                &mut writer,
+                &PeerMessage::Ping { sent_at: 1 },
+                Duration::from_millis(5),
+            )
+            .await
+        }
+        .await;
         assert!(result.unwrap_err().to_string().contains("write timed out"));
         assert!(fallback_needed(&mesh, Some("peer")));
     }
@@ -444,28 +544,54 @@ mod tests {
         let owner = encode_hex(key.verifying_key().as_bytes());
         let r = rendezvous();
         let mut hints = mycelium_peer_protocol::SyncHints {
-            node_id: owner.clone(), endpoint_id: r.endpoint.endpoint_id.clone(),
-            server_name: r.server_name.clone(), direct_addresses: r.endpoint.direct_addresses.clone(),
-            relay_urls: r.endpoint.relay_urls.clone(), observed_at: 100, expires_at: 130,
+            node_id: owner.clone(),
+            endpoint_id: r.endpoint.endpoint_id.clone(),
+            server_name: r.server_name.clone(),
+            direct_addresses: r.endpoint.direct_addresses.clone(),
+            relay_urls: r.endpoint.relay_urls.clone(),
+            observed_at: 100,
+            expires_at: 130,
         };
         assert!(validate_hints(&hints, "another-owner").is_err());
-        let envelope = SignedEnvelope::sign(&key, 1, 100, PeerEvent::SyncHints(hints.clone())).unwrap();
+        let envelope =
+            SignedEnvelope::sign(&key, 1, 100, PeerEvent::SyncHints(hints.clone())).unwrap();
         envelope.verify().unwrap();
-        mesh.observations.lock().await.insert(event_key(&envelope), envelope);
+        mesh.observations
+            .lock()
+            .await
+            .insert(event_key(&envelope), envelope);
         assert!(candidates(&mesh, &[], 110).await.is_empty());
-        let binding = SignedEnvelope::sign(&key, 2, 100, PeerEvent::Transport(TransportCredentialBinding {
-            node_id: owner.clone(), kind: TransportKind::Iroh,
-            public_key: hints.endpoint_id.clone(), generation: 1, valid_until: None,
-        })).unwrap();
-        mesh.observations.lock().await.insert(event_key(&binding), binding);
+        let binding = SignedEnvelope::sign(
+            &key,
+            2,
+            100,
+            PeerEvent::Transport(TransportCredentialBinding {
+                node_id: owner.clone(),
+                kind: TransportKind::Iroh,
+                public_key: hints.endpoint_id.clone(),
+                generation: 1,
+                valid_until: None,
+            }),
+        )
+        .unwrap();
+        mesh.observations
+            .lock()
+            .await
+            .insert(event_key(&binding), binding);
         let selected = candidates(&mesh, &[], 110).await;
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected.values().next().unwrap().0.as_deref(), Some(owner.as_str()));
+        assert_eq!(
+            selected.values().next().unwrap().0.as_deref(),
+            Some(owner.as_str())
+        );
         assert!(candidates(&mesh, &[], 99).await.is_empty());
         assert!(candidates(&mesh, &[], 130).await.is_empty());
         hints.endpoint_id = SecretKey::generate().public().to_string();
         let changed = SignedEnvelope::sign(&key, 3, 110, PeerEvent::SyncHints(hints)).unwrap();
-        mesh.observations.lock().await.insert(event_key(&changed), changed);
+        mesh.observations
+            .lock()
+            .await
+            .insert(event_key(&changed), changed);
         assert!(candidates(&mesh, &[], 110).await.is_empty());
         // Saved bootstrap seeds remain dialable, but never get a new lease.
         assert_eq!(candidates(&mesh, &[r], 1000).await.len(), 1);
@@ -476,20 +602,52 @@ mod tests {
         let mesh = Mesh::ephemeral_for_test();
         let endpoint = SecretKey::generate().public().to_string();
         mesh.publish(PeerEvent::Transport(TransportCredentialBinding {
-            node_id: mesh.node_id().to_owned(), kind: TransportKind::Iroh,
-            public_key: endpoint.clone(), generation: 1, valid_until: None,
-        })).await.unwrap();
+            node_id: mesh.node_id().to_owned(),
+            kind: TransportKind::Iroh,
+            public_key: endpoint.clone(),
+            generation: 1,
+            valid_until: None,
+        }))
+        .await
+        .unwrap();
         let binding = PeerEvent::Transport(TransportCredentialBinding {
-            node_id: mesh.node_id().to_owned(), kind: TransportKind::Iroh,
-            public_key: endpoint.clone(), generation: 1, valid_until: None,
+            node_id: mesh.node_id().to_owned(),
+            kind: TransportKind::Iroh,
+            public_key: endpoint.clone(),
+            generation: 1,
+            valid_until: None,
         });
         assert!(!transport_event_supported(&binding, false));
         assert!(transport_event_supported(&binding, true));
-        assert!(mesh.local_hello().await.capabilities.iter().any(|capability| capability == "transport.iroh-key-binding"));
-        assert!(mesh.has_transport_binding(mesh.node_id(), TransportKind::Iroh, &endpoint).await);
-        assert!(!mesh.has_transport_binding(mesh.node_id(), TransportKind::Iroh, &SecretKey::generate().public().to_string()).await);
-        assert!(!mesh.has_transport_binding("another-peer", TransportKind::Iroh, &endpoint).await);
-        assert!(!mesh.has_transport_binding(mesh.node_id(), TransportKind::Mtls, &endpoint).await);
+        assert!(mesh
+            .local_hello()
+            .await
+            .capabilities
+            .iter()
+            .any(|capability| capability == "transport.iroh-key-binding"));
+        assert!(
+            mesh.has_transport_binding(mesh.node_id(), TransportKind::Iroh, &endpoint)
+                .await
+        );
+        assert!(
+            !mesh
+                .has_transport_binding(
+                    mesh.node_id(),
+                    TransportKind::Iroh,
+                    &SecretKey::generate().public().to_string()
+                )
+                .await
+        );
+        assert!(
+            !mesh
+                .has_transport_binding("another-peer", TransportKind::Iroh, &endpoint)
+                .await
+        );
+        assert!(
+            !mesh
+                .has_transport_binding(mesh.node_id(), TransportKind::Mtls, &endpoint)
+                .await
+        );
     }
 
     #[test]
@@ -506,7 +664,11 @@ mod tests {
         assert!(result.iter().all(|address| address.ip().is_ipv4()));
         assert!(!result.contains(&"169.254.1.1:7443".parse().unwrap()));
         assert_eq!(
-            portable_addresses(["127.0.0.1:7443".parse().unwrap()].into_iter(), &BTreeSet::new()).len(),
+            portable_addresses(
+                ["127.0.0.1:7443".parse().unwrap()].into_iter(),
+                &BTreeSet::new()
+            )
+            .len(),
             1
         );
     }

@@ -34,8 +34,7 @@ fn caps() -> &'static BTreeMap<String, CapSpec> {
             ),
             (
                 ID_CAPABILITIES.to_owned(),
-                CapSpec::readonly("raw vyos `set` command list of this device")
-                    .returns("string"),
+                CapSpec::readonly("raw vyos `set` command list of this device").returns("string"),
             ),
             (
                 ID_VLAN_LIST.to_owned(),
@@ -44,12 +43,18 @@ fn caps() -> &'static BTreeMap<String, CapSpec> {
             ),
             (
                 ID_VLAN_ASSIGN.to_owned(),
-                CapSpec::mutation("attach a port to a VLAN (vyos: vif); creates the VLAN on this port")
-                    .param("port", ParamType::Str, "physical port, e.g. eth1")
-                    .param("id", ParamType::Int, "802.1q VLAN id")
-                    .param("name", ParamType::Str, "VLAN/description label")
-                    .param("tagged", ParamType::Bool, "true=trunk vif, false=access")
-                    .param("address", ParamType::Str, "CIDR for this VLAN on this port, e.g. 10.0.35.1/24"),
+                CapSpec::mutation(
+                    "attach a port to a VLAN (vyos: vif); creates the VLAN on this port",
+                )
+                .param("port", ParamType::Str, "physical port, e.g. eth1")
+                .param("id", ParamType::Int, "802.1q VLAN id")
+                .param("name", ParamType::Str, "VLAN/description label")
+                .param("tagged", ParamType::Bool, "true=trunk vif, false=access")
+                .param(
+                    "address",
+                    ParamType::Str,
+                    "CIDR for this VLAN on this port, e.g. 10.0.35.1/24",
+                ),
             ),
             (
                 ID_DHCP_LIST_POOLS.to_owned(),
@@ -75,7 +80,11 @@ fn caps() -> &'static BTreeMap<String, CapSpec> {
                 CapSpec::mutation("reserve an address for a MAC in a dhcp pool")
                     .param("mac", ParamType::Str, "aa:bb:cc:dd:ee:ff")
                     .param("ip", ParamType::Str, "reserved address")
-                    .param("pool", ParamType::Str, "shared-network-name; auto-detected from ip when omitted")
+                    .param(
+                        "pool",
+                        ParamType::Str,
+                        "shared-network-name; auto-detected from ip when omitted",
+                    )
                     .param("name", ParamType::Str, "lease hostname"),
             ),
         ])
@@ -135,11 +144,17 @@ impl EdgeOsDevice {
             .await
             .map_err(|e| MyceliumError::Transport(format!("identify: {e}")))?;
         if !out.success() {
-            return Err(MyceliumError::Device { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(MyceliumError::Device {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let cfg_out = session.cli(PRIMARY_COMMAND).await?;
         if !cfg_out.success() {
-            return Err(MyceliumError::Device { exit_code: cfg_out.exit_code, stderr: cfg_out.stderr });
+            return Err(MyceliumError::Device {
+                exit_code: cfg_out.exit_code,
+                stderr: cfg_out.stderr,
+            });
         }
         let version = parse_show_version(&out.stdout);
         let mut config = EdgeConfig::from_commands(&cfg_out.stdout);
@@ -164,7 +179,10 @@ impl EdgeOsDevice {
     async fn run_config(&self, ctx: &ExecContext, cmds: Vec<String>) -> Result<CapResult> {
         if ctx.dry_run {
             return Ok(CapResult::dry_run(
-                cmds.into_iter().map(|c| c.into_value()).collect::<Vec<_>>().into_value(),
+                cmds.into_iter()
+                    .map(|c| c.into_value())
+                    .collect::<Vec<_>>()
+                    .into_value(),
             ));
         }
         let mut script = String::from("configure\n");
@@ -177,7 +195,10 @@ impl EdgeOsDevice {
             let detail = line_error(&out.stdout)
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("exit {}", out.exit_code));
-            return Err(MyceliumError::Device { exit_code: out.exit_code, stderr: detail });
+            return Err(MyceliumError::Device {
+                exit_code: out.exit_code,
+                stderr: detail,
+            });
         }
         Ok(CapResult::ok(Value::Str(out.stdout)))
     }
@@ -287,7 +308,11 @@ impl EdgeOsDevice {
                         mac: Some(e.mac),
                         ip: e.ip,
                         hostname: None,
-                        port: Some(PortRef { device: me.clone(), port: e.iface, vif: None }),
+                        port: Some(PortRef {
+                            device: me.clone(),
+                            port: e.iface,
+                            vif: None,
+                        }),
                         origin: Origin::new(me.clone(), "arp"),
                     });
                 }
@@ -329,7 +354,9 @@ pub struct EdgeIdentity {
 }
 
 fn line_error(text: &str) -> Option<&str> {
-    text.lines().map(|l| l.trim_start()).find(|l| l.starts_with("Error") || l.starts_with("ERROR"))
+    text.lines()
+        .map(|l| l.trim_start())
+        .find(|l| l.starts_with("Error") || l.starts_with("ERROR"))
 }
 
 #[async_trait]
@@ -442,9 +469,7 @@ impl Device for EdgeOsDevice {
             ID_DHCP_LIST_POOLS => {
                 let cfg = self.show(PRIMARY_COMMAND).await?;
                 let config = EdgeConfig::from_commands(&cfg);
-                Ok(CapResult::ok(
-                    serde_json_to_value(&config.dhcp)?,
-                ))
+                Ok(CapResult::ok(serde_json_to_value(&config.dhcp)?))
             }
             ID_DHCP_ENSURE_POOL => {
                 let pool = get_str(&params, "pool")?;
@@ -512,18 +537,20 @@ impl Device for EdgeOsDevice {
                 let ip_s = get_str(&params, "ip")?;
                 let name = get_optional_str(&params, "name")?;
                 let requested_pool = get_optional_str(&params, "pool")?;
-                let mac = MacAddress::parse(&mac_s).ok_or_else(|| {
-                    MyceliumError::Validation(format!("invalid mac {mac_s}"))
-                })?;
-                let ip: IpAddr =
-                    ip_s.parse().map_err(|_| MyceliumError::Validation(format!("invalid ip {ip_s}")))?;
+                let mac = MacAddress::parse(&mac_s)
+                    .ok_or_else(|| MyceliumError::Validation(format!("invalid mac {mac_s}")))?;
+                let ip: IpAddr = ip_s
+                    .parse()
+                    .map_err(|_| MyceliumError::Validation(format!("invalid ip {ip_s}")))?;
                 let cfg = self.show(PRIMARY_COMMAND).await?;
                 let config = EdgeConfig::from_commands(&cfg);
 
                 let mut matches: Vec<(String, String)> = Vec::new(); // pool, cidr
                 for pool in &config.dhcp {
                     for subnet in &pool.subnets {
-                        let Some((net, pfx)) = parse_cidr_str(&subnet.cidr) else { continue };
+                        let Some((net, pfx)) = parse_cidr_str(&subnet.cidr) else {
+                            continue;
+                        };
                         let in_pool = if subnet.static_leases.iter().any(|l| l.mac == mac) {
                             true
                         } else {
@@ -608,7 +635,12 @@ impl Identity for EdgeOsDevice {}
 
 #[async_trait]
 impl VlanManagement for EdgeOsDevice {
-    async fn create_vlan(&self, ctx: &ExecContext, id: u16, name: Option<&str>) -> Result<CapResult> {
+    async fn create_vlan(
+        &self,
+        ctx: &ExecContext,
+        id: u16,
+        name: Option<&str>,
+    ) -> Result<CapResult> {
         // vyos truth: a VLAN exists per-port only; there is no global VLAN
         // object to create. Point the caller at the honest capability.
         let _ = (ctx, id, name);

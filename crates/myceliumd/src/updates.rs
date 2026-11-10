@@ -111,7 +111,9 @@ pub fn running_release(releases: &[ReleaseManifest]) -> RunningRelease {
     }
     let state = crate::read_update_state();
     let (version, source, matches) = match (state.release_version, state.release_digest) {
-        (Some(version), Some(recorded)) if recorded == digest => (Some(version), "update state", true),
+        (Some(version), Some(recorded)) if recorded == digest => {
+            (Some(version), "update state", true)
+        }
         (Some(version), _) => (Some(version), "update state", false),
         _ => (None, "unrecorded", false),
     };

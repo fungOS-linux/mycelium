@@ -27,7 +27,14 @@ const PASSIVE_ADVERTISEMENTS_COMMAND: &str = "if command -v nc >/dev/null 2>&1 &
 
 fn parse_health(text: &str) -> Result<Value> {
     const SECTIONS: [&str; 8] = [
-        "UPTIME", "LOAD", "MEMORY", "DISK", "PRESSURE", "SOCKETS", "SSH", "PROCESSES",
+        "UPTIME",
+        "LOAD",
+        "MEMORY",
+        "DISK",
+        "PRESSURE",
+        "SOCKETS",
+        "SSH",
+        "PROCESSES",
     ];
     let mut output = Params::new();
     for (index, name) in SECTIONS.iter().enumerate() {
@@ -41,7 +48,10 @@ fn parse_health(text: &str) -> Result<Value> {
             .and_then(|next| text[start..].find(&format!("__{next}__\n")))
             .map(|offset| start + offset)
             .unwrap_or(text.len());
-        output.insert(name.to_ascii_lowercase(), Value::Str(text[start..end].trim().into()));
+        output.insert(
+            name.to_ascii_lowercase(),
+            Value::Str(text[start..end].trim().into()),
+        );
     }
     Ok(Value::Map(output))
 }

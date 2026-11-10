@@ -41,7 +41,9 @@ impl Client {
         let stream = UnixStream::connect(&socket)
             .await
             .map_err(ClientError::Connect)?;
-        Ok(Self { stream: BufStream::new(stream) })
+        Ok(Self {
+            stream: BufStream::new(stream),
+        })
     }
 
     /// PID of the process answering this Unix socket, when the OS exposes it.
@@ -58,7 +60,10 @@ impl Client {
     /// (the CLI and daemon ship together; PATH never consulted).
     pub fn spawn_daemon() -> Result<(), ClientError> {
         let exe = std::env::current_exe().map_err(|e| ClientError::Spawn(e.to_string()))?;
-        if cfg!(target_os = "linux") && std::fs::canonicalize(&exe).map_err(ClientError::Io)? == std::path::Path::new("/usr/bin/mycelium") {
+        if cfg!(target_os = "linux")
+            && std::fs::canonicalize(&exe).map_err(ClientError::Io)?
+                == std::path::Path::new("/usr/bin/mycelium")
+        {
             return Err(ClientError::Spawn("package-owned Mycelium must run through its enrolled systemd service; use sudo mycelium setup --packaged, not an unmanaged daemon".into()));
         }
         let home = crate::home_dir();
@@ -68,7 +73,9 @@ impl Client {
             .append(true)
             .open(home.join("daemon.log"))
             .map_err(|e| ClientError::Spawn(e.to_string()))?;
-        let log_err = log.try_clone().map_err(|e| ClientError::Spawn(e.to_string()))?;
+        let log_err = log
+            .try_clone()
+            .map_err(|e| ClientError::Spawn(e.to_string()))?;
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("_serve")
@@ -183,12 +190,19 @@ impl From<std::io::Error> for ClientError {
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientError::Connect(e) => write!(f, "cannot reach myceliumd socket ({}): {e}", crate::socket_path().display()),
+            ClientError::Connect(e) => write!(
+                f,
+                "cannot reach myceliumd socket ({}): {e}",
+                crate::socket_path().display()
+            ),
             ClientError::Io(e) => write!(f, "socket io: {e}"),
             ClientError::Protocol(e) => write!(f, "protocol error: {e}"),
             ClientError::Spawn(e) => write!(f, "could not spawn myceliumd: {e}"),
             ClientError::DaemonUnresponsive => {
-                write!(f, "myceliumd did not come up within 5s (see ~/.mycelium/daemon.log)")
+                write!(
+                    f,
+                    "myceliumd did not come up within 5s (see ~/.mycelium/daemon.log)"
+                )
             }
             ClientError::Rpc { message, kind } => write!(f, "[{kind}] {message}"),
         }

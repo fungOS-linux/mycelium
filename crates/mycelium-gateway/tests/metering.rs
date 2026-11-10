@@ -46,7 +46,10 @@ async fn wait_for_requests(
     let mut last = Value::Null;
     for _ in 0..50 {
         if let Ok(response) = client
-            .get(format!("http://127.0.0.1:{}/.mycelium/usage", gateway.port()))
+            .get(format!(
+                "http://127.0.0.1:{}/.mycelium/usage",
+                gateway.port()
+            ))
             .send()
             .await
         {
@@ -147,7 +150,10 @@ async fn counts_tokens_from_a_buffered_completion() {
     assert!(wait_health(&gateway, &client).await);
 
     let response = client
-        .post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port()))
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            gateway.port()
+        ))
         .header("host", "ai.myc")
         .json(&json!({"model": "fpl/coder", "messages": []}))
         .send()
@@ -179,7 +185,10 @@ async fn streaming_requests_ask_for_usage_and_count_it() {
     assert!(wait_health(&gateway, &client).await);
 
     let body = client
-        .post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port()))
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            gateway.port()
+        ))
         .header("host", "ai.myc")
         .json(&json!({"model": "fpl/coder", "stream": true, "messages": []}))
         .send()
@@ -218,7 +227,10 @@ async fn an_unreachable_first_upstream_falls_through_to_the_next() {
     assert!(wait_health(&gateway, &client).await);
 
     let response = client
-        .post(format!("http://127.0.0.1:{}/v1/chat/completions", gateway.port()))
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            gateway.port()
+        ))
         .header("host", "ai.myc")
         .json(&json!({"model": "fpl/coder", "messages": []}))
         .send()
