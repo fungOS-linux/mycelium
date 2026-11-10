@@ -1,5 +1,10 @@
 //! Generic application-owned leases carried by existing signed topology gossip.
 //! No application protocol, Unibus dependency, proxying, or permission issuance.
+//!
+//! An owner may declare the names it answers on with a comma-separated `hosts`
+//! attribute. That attribute is the only way a service becomes reachable by name
+//! anywhere in the fleet: the gateway derives its host table from the catalog,
+//! so a name exists exactly as long as a fresh lease claims it.
 use fpl_resource_observation::{SCHEMA_VERSION, ServiceCatalog, ServiceObservation};
 use mycelium_core::{Observation, Origin, ServiceAdvertisement};
 use std::{collections::BTreeSet, io::Read, path::Path};
@@ -38,6 +43,9 @@ fn validate(observation: &ServiceObservation, node: &str) -> Result<(), String> 
     {
         return Err("application lease exceeds bounds".into());
     }
+    if let Some(hosts) = observation.value.attributes.get("hosts") {
+        validate_hosts(hosts)?;
+    }
     for endpoint in &observation.value.endpoints {
         let url = reqwest::Url::parse(endpoint).map_err(|_| "invalid application endpoint")?;
         if !matches!(url.scheme(), "http" | "https" | "tcp" | "quic" | "iroh")
@@ -48,6 +56,33 @@ fn validate(observation: &ServiceObservation, node: &str) -> Result<(), String> 
             || url.fragment().is_some()
         {
             return Err("application endpoints must be credential-free connection hints".into());
+        }
+    }
+    Ok(())
+}
+
+/// Names an owner may claim. Bounded, lowercase, credential-free DNS names: an
+/// owner that could claim a wildcard or an absolute URL could shadow every other
+/// service in the fleet.
+fn validate_hosts(hosts: &str) -> Result<(), String> {
+    let names = hosts
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if names.is_empty() || names.len() > 8 {
+        return Err("application hosts must list 1-8 names".into());
+    }
+    for name in names {
+        let labels = name.split('.').collect::<Vec<_>>();
+        if name.len() > 253
+            || labels.len() < 2
+            || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-.".contains(&b))
+            || labels
+                .iter()
+                .any(|label| label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-'))
+        {
+            return Err(format!("application host `{name}` is not a plain lowercase DNS name"));
         }
     }
     Ok(())
@@ -204,5 +239,41 @@ mod tests {
         assert_eq!(observation.provenance.observer, "host");
         assert_eq!(observation.expires_at, 160);
         assert!(observation.value.attributes.contains_key("gateway_lease"));
+    }
+
+    #[test]
+    fn hosts_attribute_accepts_plain_names_and_rejects_wildcards() {
+        assert!(validate_hosts("files.myc").is_ok());
+        assert!(validate_hosts("pulse.myc, worklog.myc").is_ok());
+        assert!(validate_hosts("home.myc.fpl.dev").is_ok());
+        assert!(validate_hosts("").is_err());
+        assert!(validate_hosts("*.myc").is_err());
+        assert!(validate_hosts("Files.myc").is_err());
+        assert!(validate_hosts("myc").is_err());
+        assert!(validate_hosts("-bad.myc").is_err());
+        assert!(validate_hosts(&["a.myc"; 9].join(",")).is_err());
+    }
+
+    #[test]
+    fn a_lease_claiming_a_name_is_rejected_when_the_name_is_not_plain() {
+        let mut document = document();
+        document["observations"][0]["value"]["attributes"]["hosts"] =
+            serde_json::json!("*.myc");
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert!(observe(&bytes, "peer", 100).is_err());
+
+        document["observations"][0]["value"]["attributes"]["hosts"] =
+            serde_json::json!("files.myc");
+        let bytes = serde_json::to_vec(&document).unwrap();
+        let mut observations = observe(&bytes, "peer", 100).unwrap();
+        let Observation::ServiceAdvertisement { advertisement, .. } = observations.remove(0)
+        else {
+            panic!()
+        };
+        let result = project(&advertisement).unwrap().unwrap();
+        assert_eq!(
+            result.value.attributes.get("hosts").map(String::as_str),
+            Some("files.myc")
+        );
     }
 }

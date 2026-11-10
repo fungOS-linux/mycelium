@@ -113,13 +113,37 @@ matters here rather than being a side quest.
   side must verify that signature and must not accept an unsigned actor header
   from any other source.
 
-## Open questions
+## Order of work
 
-- **Which names may be sticky at all.** A node that dies mid-stream costs a
-  reconnect. For a terminal that is acceptable; for a long upload it may not be.
-- **Where the assertion key lives.** One shared edge key is simple and means any
-  compromised edge can mint any actor. Per-node keys are more work and a smaller
-  blast radius.
+The edge does not have to be built before it is useful. The local loopback
+gateway is already an edge; everything else is an outer ring.
+
+1. **Names come from the catalog.** An application lease may claim its names in
+   a `hosts` attribute, and the gateway derives its host table from the catalog
+   instead of `~/.mycelium/gateway/routes.json`. `routes.json` stays only for
+   overrides that no service can express, such as a public fallback upstream or a
+   per-route token. Until this lands, every node needs a hand-edited route file,
+   which is the opposite of anycast.
+2. **Principal.** Palisade already answers who: vouch, mTLS or bearer, one
+   per-location choice. What is missing is turning its assertion into Soil's
+   `oidc:<issuer>#<subject>` and refusing an unsigned actor header. This is
+   needed, not deferred.
+3. **Outer ring.** Managed `cloudflared` first, then a configurable L4 edge with
+   SNI once there is a reason to own it. Nothing above this line depends on
+   which outer ring wins.
+
+Deferred on purpose, to be revisited once the above works:
+
+- **Stickiness.** A re-pick per request is fine until a session spans requests.
+- **Observability and rollout.** No request attribution, connector health or
+  canary yet.
+- **Certificate issuance.** Palisade reloads what it is given; who issues and
+  rotates is `pulse.myc`'s problem long term.
+- **Edge actor key custody** (`mycelium-ya35`).
+
+Spore names are not a gap in this list. A Spore gets its names in its package
+manifest, and installing it publishes the lease that step 1 already understands.
+
 
 ## Related threads
 
