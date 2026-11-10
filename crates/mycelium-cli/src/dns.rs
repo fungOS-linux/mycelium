@@ -17,6 +17,11 @@ pub(crate) fn derive_records(
     let mut records = BTreeSet::new();
     let mut names = BTreeMap::<String, String>::new();
     let mut addresses = BTreeMap::<(String, bool), IpAddr>::new();
+    // Service names are not node names: many nodes may publish the same kind,
+    // so a competing owner is normal here. Resolved by preference (this site
+    // first, then the smallest owner id for determinism) rather than by the
+    // error a node name would raise for two machines claiming one name.
+    let mut service = BTreeMap::<(String, bool), (IpAddr, String, bool, String)>::new();
     for binding in bindings {
         let prefixes = binding
             .advertised_prefixes
@@ -66,8 +71,106 @@ pub(crate) fn derive_records(
                 });
             }
         }
+
+        // An application lease carries its kind and endpoints, so a published
+        // service earns an apex name: `unibus.<suffix>` points at a hub, not at
+        // a machine. A name resolves to an address, not a port, so an endpoint
+        // is reduced to its host - and both families come free, because the
+        // record already carries an IpAddr.
+        for advertisement in topology.advertisements.values() {
+            if advertisement.service_type != "_application-owner._tcp" {
+                continue;
+            }
+            let Some(encoded) = advertisement
+                .txt
+                .iter()
+                .find_map(|value| value.strip_prefix("observation="))
+            else {
+                continue;
+            };
+            let Ok(observation) = serde_json::from_str::<serde_json::Value>(encoded) else {
+                continue;
+            };
+            let Some(kind) = observation["value"]["kind"].as_str() else {
+                continue;
+            };
+            if !service_label(kind) {
+                continue;
+            }
+            let Some(endpoint) = observation["value"]["endpoints"]
+                .as_array()
+                .and_then(|endpoints| endpoints.first())
+                .and_then(|endpoint| endpoint.as_str())
+            else {
+                continue;
+            };
+            let Some(address) = endpoint_address(endpoint) else {
+                continue;
+            };
+            // `plan` refuses a loopback, unspecified or multicast record and
+            // fails the whole site when it sees one. A lease that names such an
+            // endpoint is a service only this node can dial, so it earns no
+            // name - and, crucially, cannot take the site's DNS down with it.
+            if address.is_unspecified() || address.is_loopback() || address.is_multicast() {
+                continue;
+            }
+            let Some(owner) = advertisement.target.clone() else {
+                continue;
+            };
+            let in_site = topology
+                .nodes
+                .get(&owner)
+                .is_none_or(|node| node.sites.is_empty() || node.sites.contains(&binding.site));
+            let key = (format!("{kind}.{suffix}"), address.is_ipv4());
+            let candidate = (address, owner, in_site, binding.site.clone());
+            match service.get(&key) {
+                // The incumbent already answers for this site; keep it.
+                Some((_, _, true, _)) if !in_site => {}
+                // Neither is local: pick deterministically instead of by order.
+                Some((_, existing, false, _)) if !in_site && existing < &candidate.1 => {}
+                _ => {
+                    service.insert(key, candidate);
+                }
+            }
+        }
+    }
+
+    for ((name, family), (address, owner, _, site)) in service {
+        names.insert(name.clone(), owner.clone());
+        addresses.insert((name.clone(), family), address);
+        records.insert(DnsRecord {
+            name,
+            address,
+            // A service name is still a site's name: `plan` keeps only records
+            // for the site it is planning, so an empty site here silently
+            // dropped every one of them.
+            site,
+            node: owner,
+        });
     }
     Ok(records.into_iter().collect())
+}
+
+/// Whether a service kind is a name a fleet should resolve.
+///
+/// The rule is the shape of the kind, not a curated list: `confluence` and
+/// `unibus` are names, while `redis/tcp/6379` is a fact about one node's port.
+/// A list would have to be edited every time a Spore declares a new kind, and
+/// it would be edited in Mycelium - by whoever remembers to - rather than in
+/// the Spore that owns the name.
+fn service_label(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind.len() <= 63
+        && kind.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+}
+
+/// `tcp://10.0.0.1:18890` -> 10.0.0.1.
+fn endpoint_address(endpoint: &str) -> Option<IpAddr> {
+    let rest = endpoint.split_once("://")?.1;
+    let host = rest.rsplit_once(':').map(|(host, _)| host).unwrap_or(rest);
+    host.trim_matches(['[', ']']).parse().ok()
 }
 
 #[derive(Clone, Copy)]
@@ -444,6 +547,115 @@ pub(crate) async fn ensure(home: &Path) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use mycelium_core::topology::{IpRecord, TopoNode};
+
+    /// A one-node fleet whose only interesting fact is the lease it publishes.
+    fn hub_publishing(kind: &str, endpoint: &str) -> Topology {
+        use mycelium_core::{Observation, Origin, ServiceAdvertisement};
+
+        let mut topology = Topology::empty();
+        let hub = TopoNode {
+            id: "hub-cell".into(),
+            hostnames: BTreeSet::from(["hub".into()]),
+            sites: BTreeSet::from(["home".into()]),
+            ..TopoNode::default()
+        };
+        topology.nodes.insert(hub.id.clone(), hub);
+
+        // Exactly the document `myceliumd` projects into the advertisement.
+        let lease = serde_json::json!({
+            "schema_version": 1,
+            "service_id": format!("service/hub-cell/application/{kind}"),
+            "observed_at": 100,
+            "expires_at": 160,
+            "provenance": {"provider": "application", "observer": "hub-cell"},
+            "confidence": "strong",
+            "value": {
+                "kind": kind,
+                "endpoints": [endpoint],
+                "attributes": {"node_id": "hub-cell"}
+            }
+        });
+        topology.observe_all(vec![Observation::ServiceAdvertisement {
+            advertisement: ServiceAdvertisement {
+                instance: format!("service/hub-cell/application/{kind}"),
+                service_type: "_application-owner._tcp".into(),
+                domain: "hub-cell.mycelium".into(),
+                target: Some("hub-cell".into()),
+                addresses: BTreeSet::new(),
+                port: None,
+                txt: BTreeSet::from([format!("observation={lease}")]),
+                interface: None,
+                ttl: Some(60),
+                first_seen: 100,
+                last_seen: 100,
+                origins: BTreeSet::from(["hub-cell".into()]),
+            },
+            origin: Origin::new("hub-cell", "application-owner-lease"),
+        }]);
+        topology
+    }
+
+    fn home_binding() -> WireGuardBinding {
+        WireGuardBinding {
+            credential: mycelium_peer_protocol::TransportCredentialBinding {
+                node_id: "identity".into(),
+                kind: mycelium_peer_protocol::TransportKind::WireGuard,
+                public_key: "public".into(),
+                generation: 1,
+                valid_until: None,
+            },
+            hostname: "gateway".into(),
+            site: "home".into(),
+            endpoint: None,
+            advertised_prefixes: vec!["10.253.0.0/16".into()],
+        }
+    }
+
+    #[test]
+    fn a_service_observation_earns_an_apex_name() {
+        let topology = hub_publishing("unibus", "tcp://10.253.0.6:18890");
+        let records = derive_records(&topology, &[home_binding()], "myc").unwrap();
+
+        // Through the planner, not just the derivation: `plan` keeps only the
+        // records belonging to the site it is planning, and the planner is what
+        // the resolver actually applies. Testing the derivation alone would
+        // pass while every service name was silently dropped.
+        let planned = plan("home", "myc", records, Vec::new()).expect("the site plan applies");
+        let unibus = planned
+            .records
+            .iter()
+            .find(|record| record.name == "unibus.myc")
+            .expect("a published service earns an apex name");
+        assert_eq!(unibus.address.to_string(), "10.253.0.6");
+
+        // Both families, no special case: the endpoint decides.
+        let v6 = endpoint_address("tcp://[fd7a:115c:a1e0::6]:18890").expect("v6 endpoint");
+        assert!(v6.is_ipv6());
+        assert_eq!(v6.to_string(), "fd7a:115c:a1e0::6");
+        assert!(endpoint_address("not-an-endpoint").is_none());
+    }
+
+    #[test]
+    fn a_lease_no_other_node_could_dial_earns_no_name() {
+        let topology = hub_publishing("unibus", "tcp://127.0.0.1:18890");
+        let records = derive_records(&topology, &[home_binding()], "myc").unwrap();
+
+        // `plan` refuses a loopback record and fails the whole site when it
+        // meets one, so this lease must earn nothing and break nothing.
+        let planned = plan("home", "myc", records, Vec::new())
+            .expect("a lease only its own node can dial must not take the site down");
+        assert!(planned.records.is_empty(), "{:?}", planned.records);
+    }
+
+    #[test]
+    fn a_port_derived_kind_is_not_a_name() {
+        let topology = hub_publishing("redis/tcp/6379", "tcp://10.253.0.6:6379");
+        let records = derive_records(&topology, &[home_binding()], "myc").unwrap();
+        assert!(
+            records.is_empty(),
+            "a port is a fact about one node, not a fleet name: {records:?}"
+        );
+    }
 
     #[test]
     fn derives_only_addresses_reachable_through_signed_site_routes() {
