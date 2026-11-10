@@ -2736,8 +2736,10 @@ name = "mycelium-gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "fpl-resource-observation",
  "futures-util",
  "hyper-util",
+ "mycelium-dns-policy",
  "mycelium-peer-protocol",
  "rcgen",
  "reqwest 0.12.28",

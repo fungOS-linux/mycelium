@@ -1,13 +1,18 @@
 //! Service names projected from application-owned leases.
 //!
-//! One rule, two consumers: the resolver turns these into DNS records and the
-//! gateway turns them into host routes. Neither owns the rule, so a service that
-//! stops renewing its lease loses its name in both places at the same moment.
+//! One rule, two consumers: the resolver turns these names into DNS records and
+//! the gateway turns them into host routes. Neither owns the rule, so a service
+//! that stops renewing its lease loses its name in both places at the same
+//! moment. The claim stage decides *which names exist*; projection only attaches
+//! them to addresses the caller already trusts.
 
 use crate::canonical_domain;
 use fpl_resource_observation::{ServiceCatalog, SCHEMA_VERSION};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
+
+/// Only a lease the application wrote for itself may claim a name.
+pub const APPLICATION_OWNER_LEASE: &str = "mycelium-application-owner-lease";
 
 /// A host address a name can be projected onto. The caller supplies these from
 /// whatever it already trusts as its zone.
@@ -16,6 +21,19 @@ pub struct ServiceHost {
     pub name: String,
     pub address: IpAddr,
     pub node: String,
+}
+
+/// A fresh, application-owned lease whose kind the zone gave a label. This is
+/// the whole of the naming rule: it needs no address, so a router can use it
+/// without knowing the zone's host records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceClaim {
+    pub service_id: String,
+    pub kind: String,
+    pub label: String,
+    pub node: String,
+    pub endpoints: BTreeSet<String>,
+    pub expires_at: u64,
 }
 
 /// One name a service currently claims.
@@ -39,6 +57,44 @@ pub fn entrance_address(endpoint: &str) -> Option<IpAddr> {
     (socket.port() != 0 && socket.port() != 80).then_some(socket.ip())
 }
 
+/// Every service that may currently answer to a name.
+pub fn claimed_services(
+    aliases: &BTreeMap<String, String>,
+    catalog: &ServiceCatalog,
+    now: u64,
+) -> Result<Vec<ServiceClaim>, String> {
+    if catalog.schema_version != SCHEMA_VERSION || catalog.observations.len() > 4096 {
+        return Err("unsupported or oversized service DNS catalog".into());
+    }
+    let mut identities = BTreeSet::new();
+    let mut claims = Vec::new();
+    for service in &catalog.observations {
+        let Some(label) = aliases.get(&service.value.kind) else {
+            continue;
+        };
+        if service.schema_version != SCHEMA_VERSION
+            || !service.is_fresh_at(now)
+            || service.expires_at.saturating_sub(service.observed_at) > 300
+            || service.provenance.provider != APPLICATION_OWNER_LEASE
+            || service.value.attributes.get("node_id") != Some(&service.provenance.observer)
+        {
+            continue;
+        }
+        if !identities.insert(&service.service_id) {
+            return Err("duplicate service DNS identity".into());
+        }
+        claims.push(ServiceClaim {
+            service_id: service.service_id.0.clone(),
+            kind: service.value.kind.clone(),
+            label: label.clone(),
+            node: service.provenance.observer.clone(),
+            endpoints: service.value.endpoints.clone(),
+            expires_at: service.expires_at,
+        });
+    }
+    Ok(claims)
+}
+
 /// Project every name the catalog currently claims.
 ///
 /// A name exists only for a fresh lease written by the application itself, on
@@ -53,52 +109,31 @@ pub fn project_service_names(
     catalog: &ServiceCatalog,
     now: u64,
 ) -> Result<Vec<ServiceName>, String> {
-    if catalog.schema_version != SCHEMA_VERSION || catalog.observations.len() > 4096 {
-        return Err("unsupported or oversized service DNS catalog".into());
-    }
-    let mut identities = BTreeSet::new();
     let mut names = Vec::new();
-    for service in &catalog.observations {
-        let Some(label) = aliases.get(&service.value.kind) else {
-            continue;
-        };
-        if service.schema_version != SCHEMA_VERSION
-            || !service.is_fresh_at(now)
-            || service.expires_at.saturating_sub(service.observed_at) > 300
-            || service.provenance.provider != "mycelium-application-owner-lease"
-            || service.value.attributes.get("node_id") != Some(&service.provenance.observer)
-        {
-            continue;
-        }
-        if !identities.insert(&service.service_id) {
-            return Err("duplicate service DNS identity".into());
-        }
-        for endpoint in &service.value.endpoints {
+    for claim in claimed_services(aliases, catalog, now)? {
+        for endpoint in &claim.endpoints {
             let Some(address) = entrance_address(endpoint) else {
                 continue;
             };
             for (index, host) in hosts.iter().enumerate() {
-                if host.node != service.provenance.observer || host.address != address {
+                if host.node != claim.node || host.address != address {
                     continue;
                 }
                 let projected = ServiceName {
-                    name: canonical_domain(&format!("{label}.{}", host.name))?,
-                    kind: service.value.kind.clone(),
-                    node: service.provenance.observer.clone(),
+                    name: canonical_domain(&format!("{}.{}", claim.label, host.name))?,
+                    kind: claim.kind.clone(),
+                    node: claim.node.clone(),
                     endpoint: endpoint.clone(),
                     address,
-                    expires_at: service.expires_at,
+                    expires_at: claim.expires_at,
                     host: index,
                 };
-                let bare = (apex.get(&service.value.kind) == Some(&service.provenance.observer))
-                    .then(|| canonical_domain(&format!("{label}.{suffix}")))
+                let bare = (apex.get(&claim.kind) == Some(&claim.node))
+                    .then(|| canonical_domain(&format!("{}.{suffix}", claim.label)))
                     .transpose()?;
                 names.push(projected.clone());
                 if let Some(name) = bare {
-                    names.push(ServiceName {
-                        name,
-                        ..projected
-                    });
+                    names.push(ServiceName { name, ..projected });
                 }
             }
         }
@@ -111,7 +146,7 @@ mod tests {
     use super::*;
     use fpl_resource_observation::ServiceCatalog;
 
-    fn catalog(hosts: &str, kind: &str, provider: &str, observer: &str, attributes: serde_json::Value) -> ServiceCatalog {
+    fn catalog(provider: &str, observer: &str, node: &str) -> ServiceCatalog {
         serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "observations": [{
@@ -122,9 +157,9 @@ mod tests {
                 "provenance": {"provider": provider, "observer": observer},
                 "confidence": "strong",
                 "value": {
-                    "kind": kind,
+                    "kind": "store",
                     "endpoints": ["https://100.108.9.93:8800"],
-                    "attributes": attributes
+                    "attributes": {"node_id": node}
                 }
             }]
         }))
@@ -145,8 +180,10 @@ mod tests {
 
     #[test]
     fn a_fresh_lease_projects_onto_its_own_host_record() {
-        let catalog = catalog("store", "store", "mycelium-application-owner-lease", "n1", serde_json::json!({"node_id": "n1"}));
-        let names = project_service_names(&aliases(), &BTreeMap::new(), "myc", &hosts(), &catalog, 100).unwrap();
+        let catalog = catalog(APPLICATION_OWNER_LEASE, "n1", "n1");
+        let names =
+            project_service_names(&aliases(), &BTreeMap::new(), "myc", &hosts(), &catalog, 100)
+                .unwrap();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].name, "store.studio.wagar-house.myc");
         assert_eq!(names[0].kind, "store");
@@ -155,29 +192,73 @@ mod tests {
 
     #[test]
     fn a_lease_that_is_not_the_application_owners_never_names_anything() {
-        let stale = catalog("store", "store", "mycelium-application-owner-lease", "n1", serde_json::json!({"node_id": "n1"}));
-        assert!(project_service_names(&aliases(), &BTreeMap::new(), "myc", &hosts(), &stale, 201).unwrap().is_empty());
+        let stale = catalog(APPLICATION_OWNER_LEASE, "n1", "n1");
+        assert!(
+            project_service_names(&aliases(), &BTreeMap::new(), "myc", &hosts(), &stale, 201)
+                .unwrap()
+                .is_empty()
+        );
 
-        let scanned = catalog("store", "store", "mdns", "n1", serde_json::json!({"node_id": "n1"}));
-        assert!(project_service_names(&aliases(), &BTreeMap::new(), "myc", &hosts(), &scanned, 100).unwrap().is_empty());
+        let scanned = catalog("mdns", "n1", "n1");
+        assert!(project_service_names(
+            &aliases(),
+            &BTreeMap::new(),
+            "myc",
+            &hosts(),
+            &scanned,
+            100
+        )
+        .unwrap()
+        .is_empty());
 
-        let foreign = catalog("store", "store", "mycelium-application-owner-lease", "n1", serde_json::json!({"node_id": "n2"}));
-        assert!(project_service_names(&aliases(), &BTreeMap::new(), "myc", &hosts(), &foreign, 100).unwrap().is_empty());
+        let foreign = catalog(APPLICATION_OWNER_LEASE, "n1", "n2");
+        assert!(project_service_names(
+            &aliases(),
+            &BTreeMap::new(),
+            "myc",
+            &hosts(),
+            &foreign,
+            100
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
     fn the_bare_name_belongs_to_the_observer_the_zone_names() {
-        let catalog = catalog("store", "store", "mycelium-application-owner-lease", "n1", serde_json::json!({"node_id": "n1"}));
+        let catalog = catalog(APPLICATION_OWNER_LEASE, "n1", "n1");
         let apex = BTreeMap::from([("store".to_owned(), "n1".to_owned())]);
-        let names = project_service_names(&aliases(), &apex, "myc", &hosts(), &catalog, 100).unwrap();
-        assert_eq!(names.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), vec![
-            "store.studio.wagar-house.myc",
-            "store.myc"
-        ]);
+        let names =
+            project_service_names(&aliases(), &apex, "myc", &hosts(), &catalog, 100).unwrap();
+        assert_eq!(
+            names
+                .iter()
+                .map(|name| name.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["store.studio.wagar-house.myc", "store.myc"]
+        );
 
         let other = BTreeMap::from([("store".to_owned(), "n2".to_owned())]);
-        let names = project_service_names(&aliases(), &other, "myc", &hosts(), &catalog, 100).unwrap();
+        let names =
+            project_service_names(&aliases(), &other, "myc", &hosts(), &catalog, 100).unwrap();
         assert_eq!(names.len(), 1);
+    }
+
+    /// A router knows no host records and no addresses: the claim alone is what
+    /// it needs, and it is the same rule the resolver applied.
+    #[test]
+    fn a_claim_exists_without_any_host_record() {
+        let catalog = catalog(APPLICATION_OWNER_LEASE, "n1", "n1");
+        let claims = claimed_services(&aliases(), &catalog, 100).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].label, "store");
+        assert_eq!(claims[0].kind, "store");
+        assert_eq!(claims[0].node, "n1");
+
+        let unlabelled = BTreeMap::new();
+        assert!(claimed_services(&unlabelled, &catalog, 100)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

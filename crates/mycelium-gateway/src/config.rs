@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fmt, fs,
     path::{Path, PathBuf},
 };
@@ -65,6 +66,11 @@ pub struct GatewayConfig {
     pub service_refresh_secs: u64,
     #[serde(default)]
     pub metering: MeteringConfig,
+    /// Opt-in `service kind -> single DNS label`. The same map lives in the
+    /// resolver settings, which is where it is normally written; this copy wins
+    /// when both exist so a gateway can be tested without touching the resolver.
+    #[serde(default)]
+    pub service_aliases: BTreeMap<String, String>,
 }
 
 fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -95,6 +101,7 @@ impl Default for GatewayConfig {
             mycelium_bin: None,
             service_refresh_secs: default_service_refresh_secs(),
             metering: MeteringConfig::default(),
+            service_aliases: BTreeMap::new(),
         }
     }
 }

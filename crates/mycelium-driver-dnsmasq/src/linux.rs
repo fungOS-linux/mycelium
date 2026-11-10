@@ -88,7 +88,7 @@ pub(super) async fn apply(settings: &Settings) -> Result<Value, String> {
                 .map_err(|e| format!("TCP listener unavailable: {e}"))?;
         }
     }
-    let stored = directory.join("active-settings.json");
+    let stored = mycelium_dns_policy::settings::active_settings_path(&directory);
     let old_settings = fs::read(&stored).ok();
     if active {
         control(&["stop", UNIT])?;

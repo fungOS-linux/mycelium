@@ -10,6 +10,7 @@ use axum::Router;
 use futures_util::{Stream, StreamExt};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
+use mycelium_dns_policy::settings::{self, Naming};
 use mycelium_peer_protocol::gateway_usage::GatewayUsageSnapshot;
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -99,12 +100,17 @@ pub async fn run_with_options(
         Some(path) => (GatewayConfig::load(path)?, mtime(path)),
         None => (default_config(), None),
     };
+    let naming = Arc::new(std::sync::RwLock::new(merged_naming(
+        &config,
+        installed_naming(),
+    )));
     let table = Arc::new(std::sync::RwLock::new(RouteTable::new(
         config.routes.clone(),
         config.default_route.clone(),
     )));
     let services = Arc::new(std::sync::RwLock::new(ServiceIndex::default()));
     let services_for_reload = services.clone();
+    let naming_for_reload = naming.clone();
     let discovery = config
         .routes
         .iter()
@@ -120,7 +126,8 @@ pub async fn run_with_options(
         });
 
     if let Some((bin, refresh_secs)) = discovery.clone() {
-        match ServiceIndex::load(&bin).await {
+        let snapshot = naming.read().unwrap().clone();
+        match ServiceIndex::load(&bin, &snapshot).await {
             Ok(index) => {
                 eprintln!(
                     "mycelium-gateway: discovered {} service endpoints from {}",
@@ -136,7 +143,13 @@ pub async fn run_with_options(
                 );
             }
         }
-        spawn_service_refresh(bin, refresh_secs, services.clone(), table.clone());
+        spawn_service_refresh(
+            bin,
+            refresh_secs,
+            services.clone(),
+            table.clone(),
+            naming.clone(),
+        );
     }
 
     let usage = Arc::new(UsageStore::open(usage_path.clone()));
@@ -163,7 +176,14 @@ pub async fn run_with_options(
     };
 
     if let (Some(path), true) = (config_path, reload_secs > 0) {
-        spawn_reload(path, table, initial_mtime, reload_secs, services_for_reload);
+        spawn_reload(
+            path,
+            table,
+            initial_mtime,
+            reload_secs,
+            services_for_reload,
+            naming_for_reload,
+        );
     }
 
     let listener = TcpListener::bind(listen).await?;
@@ -273,16 +293,46 @@ fn read_token(path: &Path) -> std::io::Result<String> {
     Ok(token)
 }
 
+/// The naming policy this host installed with its resolver, if any. Reading it
+/// through `mycelium-dns-policy` keeps the gateway on the same contract as the
+/// resolver instead of rediscovering the file.
+fn installed_naming() -> Naming {
+    let Some(directory) = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".mycelium/dns"))
+    else {
+        return Naming::default();
+    };
+    match settings::load_active(&directory) {
+        Ok(naming) => naming.unwrap_or_default(),
+        Err(error) => {
+            eprintln!("mycelium-gateway: resolver naming ignored: {error}");
+            Naming::default()
+        }
+    }
+}
+
+/// Config aliases win over the installed copy so a gateway can be tested
+/// without editing the machine's DNS policy.
+fn merged_naming(config: &GatewayConfig, mut naming: Naming) -> Naming {
+    for (kind, label) in &config.service_aliases {
+        naming.service_aliases.insert(kind.clone(), label.clone());
+    }
+    naming
+}
+
 fn spawn_service_refresh(
     bin: PathBuf,
     refresh_secs: u64,
     services: Arc<std::sync::RwLock<ServiceIndex>>,
     table: Arc<std::sync::RwLock<RouteTable>>,
+    naming: Arc<std::sync::RwLock<Naming>>,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
-            match ServiceIndex::load(&bin).await {
+            let snapshot = naming.read().unwrap().clone();
+            match ServiceIndex::load(&bin, &snapshot).await {
                 Ok(index) => {
                     // Take the locks one at a time, in this order: the reload
                     // path reads the catalog before the table, and holding both
@@ -306,6 +356,7 @@ fn spawn_reload(
     mut last_mtime: Option<std::time::SystemTime>,
     reload_secs: u64,
     services: Arc<std::sync::RwLock<ServiceIndex>>,
+    naming: Arc<std::sync::RwLock<Naming>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -319,6 +370,9 @@ fn spawn_reload(
             last_mtime = current;
             match GatewayConfig::load(&path) {
                 Ok(config) => {
+                    // Aliases live in the config too, so a reload that adds a
+                    // label must be visible to the next projection.
+                    *naming.write().unwrap() = merged_naming(&config, installed_naming());
                     let index = services.read().unwrap().clone();
                     let mut table = table.write().unwrap();
                     *table = RouteTable::new(config.routes, config.default_route);
@@ -553,21 +607,24 @@ fn request_host(request: &Request<Body>) -> String {
 }
 
 /// Candidate order is a single rule: this machine first, then its mesh, then
-/// the remote fallbacks an operator configured (the public edge). Loopback is
-/// the only signal the gateway needs to tell local from off-host, so an operator
-/// does not have to keep a second ordering knob in sync with the addresses they
-/// already wrote down.
+/// the remote fallbacks an operator configured (the public edge).
+///
+/// Local means "the endpoint belongs to this node", and the catalog is the
+/// authority for that: a service here advertises the fleet address other nodes
+/// reach it on, so an address alone cannot say whether it is on this machine.
+/// Configured upstreams have no catalog entry, and loopback is all their URL can
+/// tell us.
 fn targets_for(route: &Route, services: &ServiceIndex) -> Vec<Target> {
     let mut local = Vec::new();
     let mut mesh = Vec::new();
     let mut fallback = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut push = |base: reqwest::Url, configured: bool| {
+    let mut push = |base: reqwest::Url, configured: bool, remote: bool| {
         if !seen.insert(base.to_string()) {
             return;
         }
         let target = Target {
-            remote: !is_loopback(&base),
+            remote,
             configured,
             base,
         };
@@ -578,11 +635,12 @@ fn targets_for(route: &Route, services: &ServiceIndex) -> Vec<Target> {
         }
     };
     for base in route.upstream_urls() {
-        push(base, true);
+        let remote = !is_loopback(&base);
+        push(base, true, remote);
     }
     if let Some(kind) = &route.service_kind {
         for candidate in services.candidates(kind) {
-            push(candidate.url.clone(), false);
+            push(candidate.url.clone(), false, !candidate.local);
         }
     }
     local.extend(mesh);
@@ -918,6 +976,35 @@ mod tests {
     use super::*;
     use crate::discovery::ServiceIndex;
 
+    #[test]
+    fn config_aliases_win_over_the_installed_naming_policy() {
+        let config = GatewayConfig {
+            service_aliases: std::collections::BTreeMap::from([(
+                "store".to_owned(),
+                "shop".to_owned(),
+            )]),
+            ..GatewayConfig::default()
+        };
+        let installed = Naming {
+            service_aliases: std::collections::BTreeMap::from([
+                ("store".to_owned(), "store".to_owned()),
+                ("files".to_owned(), "files".to_owned()),
+            ]),
+            suffix: "lab".to_owned(),
+            ..Naming::default()
+        };
+        let merged = merged_naming(&config, installed);
+        assert_eq!(
+            merged.service_aliases.get("store").map(String::as_str),
+            Some("shop")
+        );
+        assert_eq!(
+            merged.service_aliases.get("files").map(String::as_str),
+            Some("files")
+        );
+        assert_eq!(merged.suffix, "lab");
+    }
+
     fn uri(value: &str) -> Uri {
         value.parse().unwrap()
     }
@@ -936,10 +1023,15 @@ mod tests {
 
     fn catalog() -> serde_json::Value {
         json!({
+            "schema_version": 1,
             "observations": [
                 {
+                    "schema_version": 1,
+                    "service_id": "service/remote/ai",
+                    "observed_at": 100,
                     "expires_at": 200,
-                    "provenance": {"observer": "remote-node"},
+                    "provenance": {"provider": "mdns", "observer": "remote-node"},
+                    "confidence": "strong",
                     "value": {
                         "kind": "ai",
                         "endpoints": ["http://10.0.0.5:8122"],
@@ -947,8 +1039,12 @@ mod tests {
                     }
                 },
                 {
+                    "schema_version": 1,
+                    "service_id": "service/local/ai",
+                    "observed_at": 100,
                     "expires_at": 200,
-                    "provenance": {"observer": "local-node"},
+                    "provenance": {"provider": "mdns", "observer": "local-node"},
+                    "confidence": "strong",
                     "value": {
                         "kind": "ai",
                         "endpoints": ["http://127.0.0.1:8122"],
@@ -961,7 +1057,8 @@ mod tests {
 
     #[test]
     fn candidates_run_local_then_mesh_then_public_edge() {
-        let index = ServiceIndex::from_catalog("local-node", &catalog(), 150).unwrap();
+        let index =
+            ServiceIndex::from_catalog("local-node", &catalog(), 150, &Naming::default()).unwrap();
         // Declared with the public edge first: loopback still wins.
         let targets = targets_for(
             &route(&["https://ai.fpl.dev", "http://127.0.0.1:4000"], Some("ai")),
@@ -983,6 +1080,47 @@ mod tests {
         assert!(!targets[1].remote && !targets[1].configured);
         assert!(targets[2].remote && !targets[2].configured);
         assert!(targets[3].remote && targets[3].configured);
+    }
+
+    /// A service on this machine advertises the address other nodes reach it
+    /// on, so the catalog's ownership decides; the address cannot.
+    #[test]
+    fn a_local_endpoint_stays_local_when_it_advertises_its_fleet_address() {
+        let lease = |id: &str, node: &str, endpoint: &str| {
+            json!({
+                "schema_version": 1,
+                "service_id": format!("service/{id}"),
+                "observed_at": 100,
+                "expires_at": 200,
+                "provenance": {"provider": "mdns", "observer": node},
+                "confidence": "strong",
+                "value": {
+                    "kind": "files",
+                    "endpoints": [endpoint],
+                    "attributes": {"node_id": node}
+                }
+            })
+        };
+        let catalog = json!({
+            "schema_version": 1,
+            "observations": [
+                lease("local", "local-node", "http://10.99.0.4:8803"),
+                lease("remote", "remote-node", "http://10.99.0.9:8803"),
+            ]
+        });
+        let index =
+            ServiceIndex::from_catalog("local-node", &catalog, 150, &Naming::default()).unwrap();
+        let targets = targets_for(&route(&[], Some("files")), &index);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.base.as_str(), target.remote))
+                .collect::<Vec<_>>(),
+            vec![
+                ("http://10.99.0.4:8803/", false),
+                ("http://10.99.0.9:8803/", true)
+            ]
+        );
     }
 
     #[test]

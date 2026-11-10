@@ -1,9 +1,7 @@
 //! DNS aliases from application-owned leases, never scanned listeners or ACLs.
 use super::Settings;
 use fpl_resource_observation::ServiceCatalog;
-use mycelium_dns_policy::service_names::{
-    entrance_address as address, project_service_names, ServiceHost,
-};
+use mycelium_dns_policy::service_names::{project_service_names, ServiceHost};
 use mycelium_dns_policy::{canonical_domain, DnsRecord};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -124,6 +122,7 @@ pub(super) fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mycelium_dns_policy::service_names::entrance_address;
     use serde_json::json;
     struct PolicyFile(std::path::PathBuf);
     impl PolicyFile {
@@ -345,7 +344,7 @@ mod tests {
             "https://192.0.2.12:8444/admin",
             "https://192.0.2.12:8444?token=x",
         ] {
-            assert!(address(url).is_none());
+            assert!(entrance_address(url).is_none());
         }
     }
 }

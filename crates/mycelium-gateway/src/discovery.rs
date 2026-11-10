@@ -1,3 +1,6 @@
+use fpl_resource_observation::ServiceCatalog;
+use mycelium_dns_policy::service_names::claimed_services;
+use mycelium_dns_policy::settings::Naming;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::path::Path;
@@ -5,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// A cold catalog takes about ten seconds while the daemon merges peer
+/// topology, so the bound has to clear that without trusting a hung call.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
@@ -45,7 +50,7 @@ impl ServiceIndex {
     /// Read the local node identity and the authenticated service catalog from
     /// the running myceliumd. This is intentionally the same CLI surface the
     /// DNS resolver uses, so the gateway and resolver see one catalog.
-    pub async fn load(bin: &Path) -> Result<Self, String> {
+    pub async fn load(bin: &Path, naming: &Naming) -> Result<Self, String> {
         let status = run_json(bin, &["node", "status", "--json"]).await?;
         let local_node = status
             .pointer("/node/hello/node_id")
@@ -54,77 +59,40 @@ impl ServiceIndex {
             .ok_or("mycelium node status has no node_id")?
             .to_owned();
         let catalog = run_json(bin, &["services", "--json"]).await?;
-        Self::from_catalog(&local_node, &catalog, now())
+        Self::from_catalog(&local_node, &catalog, now(), naming)
     }
 
+    /// Build the index from one catalog. Names come from the shared rule in
+    /// `mycelium-dns-policy`, so a route can never answer to a name the resolver
+    /// would not publish.
     pub(crate) fn from_catalog(
         local_node: &str,
         catalog: &serde_json::Value,
         now: u64,
+        naming: &Naming,
     ) -> Result<Self, String> {
-        let observations = catalog
-            .get("observations")
-            .and_then(serde_json::Value::as_array)
-            .ok_or("service catalog has no observations")?;
+        let catalog = serde_json::from_value::<ServiceCatalog>(catalog.clone())
+            .map_err(|error| format!("bad service catalog: {error}"))?;
+        let mut hosts = BTreeMap::new();
+        for claim in claimed_services(&naming.service_aliases, &catalog, now)? {
+            hosts.insert(format!("{}.{}", claim.label, naming.suffix), claim.kind);
+        }
         let mut by_kind: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-        let mut hosts: BTreeMap<String, String> = BTreeMap::new();
         let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-        for observation in observations {
-            let Some(service) = observation.get("value") else {
-                continue;
-            };
-            let Some(kind) = service.get("kind").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            if kind.is_empty() {
+        for observation in &catalog.observations {
+            let kind = observation.value.kind.as_str();
+            if kind.is_empty() || observation.expires_at <= now {
                 continue;
             }
-            let expires_at = observation
-                .get("expires_at")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if expires_at <= now {
-                continue;
-            }
-            // A name exists only while a fresh lease claims it. Two owners may
-            // claim the same name; the kind is chosen deterministically so a
-            // catalog rebuild cannot shuffle which one the gateway picks.
-            if let Some(declared) = service
-                .pointer("/attributes/hosts")
-                .and_then(serde_json::Value::as_str)
-            {
-                for host in declared
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|host| !host.is_empty())
-                {
-                    let host = host.to_ascii_lowercase();
-                    match hosts.get(&host) {
-                        Some(existing) if existing.as_str() <= kind => {}
-                        _ => {
-                            hosts.insert(host, kind.to_owned());
-                        }
-                    }
-                }
-            }
-            let observer = observation
-                .pointer("/provenance/observer")
-                .and_then(serde_json::Value::as_str);
-            let node = service
-                .pointer("/attributes/node_id")
-                .and_then(serde_json::Value::as_str)
+            let observer = Some(observation.provenance.observer.as_str());
+            let node = observation
+                .value
+                .attributes
+                .get("node_id")
+                .map(String::as_str)
                 .or(observer);
             let local = node == Some(local_node) || observer == Some(local_node);
-            let Some(endpoints) = service
-                .get("endpoints")
-                .and_then(serde_json::Value::as_array)
-            else {
-                continue;
-            };
-            for endpoint in endpoints {
-                let Some(endpoint) = endpoint.as_str() else {
-                    continue;
-                };
+            for endpoint in &observation.value.endpoints {
                 let Ok(url) = reqwest::Url::parse(endpoint) else {
                     continue;
                 };
@@ -148,7 +116,7 @@ impl ServiceIndex {
                     url,
                     local,
                     node: node.map(str::to_owned),
-                    expires_at,
+                    expires_at: observation.expires_at,
                 });
             }
         }
@@ -211,45 +179,76 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::ServiceIndex;
+    use mycelium_dns_policy::settings::Naming;
     use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn observation(
+        id: &str,
+        provider: &str,
+        observer: &str,
+        node: &str,
+        expires_at: u64,
+        endpoints: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "schema_version": 1,
+            "service_id": format!("service/{id}"),
+            "observed_at": 100,
+            "expires_at": expires_at,
+            "provenance": {"provider": provider, "observer": observer},
+            "confidence": "strong",
+            "value": {
+                "kind": "ai",
+                "endpoints": endpoints,
+                "attributes": {"node_id": node}
+            }
+        })
+    }
 
     fn catalog() -> serde_json::Value {
         json!({
+            "schema_version": 1,
             "observations": [
-                {
-                    "expires_at": 200,
-                    "provenance": {"observer": "local-node"},
-                    "value": {
-                        "kind": "ai",
-                        "endpoints": ["http://127.0.0.1:4001"],
-                        "attributes": {"node_id": "local-node"}
-                    }
-                },
-                {
-                    "expires_at": 200,
-                    "provenance": {"observer": "remote-node"},
-                    "value": {
-                        "kind": "ai",
-                        "endpoints": ["http://10.253.0.9:4001", "http://127.0.0.1:4001"],
-                        "attributes": {"node_id": "remote-node"}
-                    }
-                },
-                {
-                    "expires_at": 100,
-                    "provenance": {"observer": "local-node"},
-                    "value": {
-                        "kind": "ai",
-                        "endpoints": ["http://127.0.0.1:4999"],
-                        "attributes": {"node_id": "local-node"}
-                    }
-                }
+                observation(
+                    "local",
+                    "mdns",
+                    "local-node",
+                    "local-node",
+                    200,
+                    json!(["http://127.0.0.1:4001"]),
+                ),
+                observation(
+                    "remote",
+                    "mdns",
+                    "remote-node",
+                    "remote-node",
+                    200,
+                    json!(["http://10.253.0.9:4001", "http://127.0.0.1:4001"]),
+                ),
+                observation(
+                    "stale",
+                    "mdns",
+                    "local-node",
+                    "local-node",
+                    100,
+                    json!(["http://127.0.0.1:4999"]),
+                ),
             ]
         })
     }
 
+    fn naming() -> Naming {
+        Naming {
+            service_aliases: BTreeMap::from([("ai".to_owned(), "ai".to_owned())]),
+            ..Naming::default()
+        }
+    }
+
     #[test]
     fn keeps_local_loopback_and_drops_remote_loopback() {
-        let index = ServiceIndex::from_catalog("local-node", &catalog(), 150).unwrap();
+        let index =
+            ServiceIndex::from_catalog("local-node", &catalog(), 150, &Naming::default()).unwrap();
         let candidates = index.candidates("ai");
         assert_eq!(candidates.len(), 2);
         assert!(candidates[0].local);
@@ -260,7 +259,45 @@ mod tests {
 
     #[test]
     fn expires_stale_leases() {
-        let index = ServiceIndex::from_catalog("local-node", &catalog(), 201).unwrap();
+        let index =
+            ServiceIndex::from_catalog("local-node", &catalog(), 201, &Naming::default()).unwrap();
         assert!(index.candidates("ai").is_empty());
+    }
+
+    #[test]
+    fn a_name_needs_an_application_lease_and_a_zone_label() {
+        let application = json!({
+            "schema_version": 1,
+            "observations": [observation(
+                "local",
+                "mycelium-application-owner-lease",
+                "local-node",
+                "local-node",
+                200,
+                json!(["http://127.0.0.1:4001"]),
+            )]
+        });
+        let index = ServiceIndex::from_catalog("local-node", &application, 150, &naming()).unwrap();
+        assert_eq!(index.hosts().get("ai.myc").map(String::as_str), Some("ai"));
+
+        // The same lease without an opted-in label, and a scanned listener with
+        // one, are both nameless.
+        let unlabelled =
+            ServiceIndex::from_catalog("local-node", &application, 150, &Naming::default())
+                .unwrap();
+        assert!(unlabelled.hosts().is_empty());
+        let scanned = ServiceIndex::from_catalog("local-node", &catalog(), 150, &naming()).unwrap();
+        assert!(scanned.hosts().is_empty());
+    }
+
+    #[test]
+    fn a_catalog_that_is_not_the_service_contract_is_rejected() {
+        assert!(ServiceIndex::from_catalog(
+            "local-node",
+            &json!({"observations": [{"expires_at": 200}]}),
+            100,
+            &Naming::default(),
+        )
+        .is_err());
     }
 }
