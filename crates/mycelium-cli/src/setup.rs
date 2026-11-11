@@ -8,13 +8,14 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         return Err("--packaged requires the installed owner-built Mycelium Debian package".into());
     }
     let system_service = packaged || args.iter().any(|argument| argument == "--system-service");
-    let local_gateway = args.iter().any(|argument| argument == "--local-gateway");
+    // A peer is only useful if its services are reachable: an enrolled node with
+    // no gateway answers no .myc name and reaches nothing on the mesh. So the
+    // local gateway is part of enrollment, not a follow-up step. Packaged
+    // installs own their units; --no-local-gateway opts out.
+    let local_gateway = !packaged && !args.iter().any(|argument| argument == "--no-local-gateway");
     let trust_gateway = args.iter().any(|argument| argument == "--trust-cert");
     if trust_gateway && !local_gateway {
-        return Err("--trust-cert requires --local-gateway".into());
-    }
-    if local_gateway && packaged {
-        return Err("--local-gateway is not available in the packaged system installation".into());
+        return Err("--trust-cert requires a local gateway".into());
     }
     let home = value(args, "--path").map(expand_home).unwrap_or_else(|| {
         if packaged {
