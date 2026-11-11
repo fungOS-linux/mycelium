@@ -77,6 +77,25 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(home).join(".mycelium")
 }
 
+/// Unique scratch directory for one test, created before it is returned.
+///
+/// Tests are parallel threads of a single process, so a path keyed by the
+/// process id is shared state between them, and a clock suffix collides when two
+/// calls land in the same tick.
+#[cfg(test)]
+pub(crate) fn test_dir(prefix: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "mycelium-{prefix}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create test directory");
+    dir
+}
+
 pub fn socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("MYCELIUM_SOCKET") {
         return PathBuf::from(p);

@@ -1,5 +1,9 @@
 //! Generic application-owned leases carried by existing signed topology gossip.
 //! No application protocol, Unibus dependency, proxying, or permission issuance.
+//!
+//! A lease carries the labels its service asks for. The zone composes them into
+//! names, so a name exists exactly as long as a fresh lease claims it, and DNS
+//! and routing answer the same name because the daemon publishes it once.
 use fpl_resource_observation::{
     Confidence, Provenance, Service, ServiceCatalog, ServiceId, ServiceObservation, SCHEMA_VERSION,
 };
@@ -29,6 +33,16 @@ fn validate(observation: &ServiceObservation, node: &str) -> Result<(), String> 
         || observation.expires_at - observation.observed_at > 300
     {
         return Err("invalid application lease identity, owner or validity".into());
+    }
+    let mut names = BTreeSet::new();
+    if observation.value.names.len() > 8
+        || !observation
+            .value
+            .names
+            .iter()
+            .all(|name| mycelium_dns_policy::service_names::valid_label(name) && names.insert(name))
+    {
+        return Err("application lease names must be 1-8 unique DNS labels".into());
     }
     if observation.value.endpoints.is_empty()
         || observation.value.endpoints.len() > 32
@@ -79,9 +93,15 @@ pub fn observe(bytes: &[u8], node: &str, now: u64) -> Result<Vec<Observation>, S
         return Err("unsupported or oversized application lease document".into());
     }
     let mut seen = BTreeSet::new();
+    let mut claimed = BTreeSet::new();
     let mut observations = Vec::new();
     for observation in document.observations {
         validate(&observation, node)?;
+        for name in &observation.value.names {
+            if !claimed.insert(name.clone()) {
+                return Err(format!("two application leases claim `{name}`"));
+            }
+        }
         if !seen.insert(observation.service_id.clone()) || observation.observed_at > now {
             return Err("duplicate or future application owner lease".into());
         }
@@ -252,5 +272,45 @@ mod tests {
         assert_eq!(observation.provenance.observer, "host");
         assert_eq!(observation.expires_at, 160);
         assert!(observation.value.attributes.contains_key("gateway_lease"));
+    }
+
+    #[test]
+    fn names_must_be_unique_labels_and_travel_with_the_lease() {
+        let mut document = document();
+        document["observations"][0]["value"]["names"] = serde_json::json!(["files", "docs"]);
+        let bytes = serde_json::to_vec(&document).unwrap();
+        let mut observations = observe(&bytes, "peer", 100).unwrap();
+        let Observation::ServiceAdvertisement { advertisement, .. } = observations.remove(0) else {
+            panic!()
+        };
+        let result = project(&advertisement).unwrap().unwrap();
+        assert_eq!(
+            result.value.names,
+            vec!["files".to_owned(), "docs".to_owned()]
+        );
+
+        for names in [
+            serde_json::json!(["Files"]),
+            serde_json::json!(["files.myc"]),
+            serde_json::json!(["-files"]),
+            serde_json::json!(["files", "files"]),
+            serde_json::json!(["a", "b", "c", "d", "e", "f", "g", "h", "i"]),
+        ] {
+            document["observations"][0]["value"]["names"] = names;
+            assert!(observe(&serde_json::to_vec(&document).unwrap(), "peer", 100).is_err());
+        }
+    }
+
+    #[test]
+    fn two_leases_in_one_document_cannot_claim_one_name() {
+        let mut document = document();
+        document["observations"][0]["value"]["names"] = serde_json::json!(["files"]);
+        let mut second = document["observations"][0].clone();
+        second["service_id"] = serde_json::json!("service/peer/application/other");
+        document["observations"]
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        assert!(observe(&serde_json::to_vec(&document).unwrap(), "peer", 100).is_err());
     }
 }

@@ -1115,7 +1115,7 @@ async fn apply(settings: &Settings, _config: &Path) -> Result<Value, String> {
         return Err("existing launch agent has another owner".into());
     }
     let old = fs::read(&plist).ok();
-    let stored = directory.join("active-settings.json");
+    let stored = mycelium_dns_policy::settings::active_settings_path(&directory);
     let old_settings = fs::read(&stored).ok();
     if print.status.success()
         && !Command::new("launchctl")

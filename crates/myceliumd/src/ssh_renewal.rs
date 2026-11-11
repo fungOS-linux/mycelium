@@ -508,15 +508,7 @@ mod tests {
     #[test]
     fn native_certificate_is_ca_verified_serial_bound_and_grant_clamped() {
         let (request, state) = fixture();
-        let directory = std::env::temp_dir().join(format!(
-            "mycelium-renewal-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&directory).unwrap();
+        let directory = crate::test_dir("renewal-test");
         let ca = ssh_key::PrivateKey::new(
             ssh_key::private::Ed25519Keypair::from_seed(&[17; 32]).into(),
             "test CA",

@@ -11,9 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
+fpl-resource-observation.workspace = true
 futures-util = "0.3"
 hyper-util.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+mycelium-dns-policy.workspace = true
 mycelium-peer-protocol.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true

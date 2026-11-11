@@ -1,11 +1,14 @@
 //! DNS aliases from application-owned leases, never scanned listeners or ACLs.
 use super::Settings;
-use fpl_resource_observation::{ServiceCatalog, SCHEMA_VERSION};
+use fpl_resource_observation::ServiceCatalog;
+use mycelium_dns_policy::service_names::{
+    project_service_names, ServiceHost, APPLICATION_OWNER_LEASE,
+};
 use mycelium_dns_policy::{canonical_domain, DnsRecord};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
 };
 
 /// Explicit local plugin files supply labels, never records or authority.
@@ -72,12 +75,25 @@ pub(super) fn validate_aliases(aliases: &BTreeMap<String, String>) -> Result<(),
     Ok(())
 }
 
-/// Restricted literal HTTPS entrance. Names, paths, credentials and queries are
-/// not rewritten or resolved; service catalogs retain ports and transport hints.
-fn address(endpoint: &str) -> Option<IpAddr> {
-    let authority = endpoint.strip_prefix("https://")?.trim_end_matches('/');
-    let socket: SocketAddr = authority.parse().ok()?;
-    (socket.port() != 0 && socket.port() != 80).then_some(socket.ip())
+/// Alias plugins are local policy the daemon cannot evaluate, so the DNS adapter
+/// fills the names a published catalog left empty. A published name wins.
+fn with_fallback_names(
+    catalog: &ServiceCatalog,
+    aliases: &BTreeMap<String, String>,
+    suffix: &str,
+) -> ServiceCatalog {
+    let mut catalog = catalog.clone();
+    for observation in &mut catalog.observations {
+        if observation.provenance.provider != APPLICATION_OWNER_LEASE
+            || !observation.value.names.is_empty()
+        {
+            continue;
+        }
+        if let Some(label) = aliases.get(&observation.value.kind) {
+            observation.value.names = vec![format!("{label}.{suffix}")];
+        }
+    }
+    catalog
 }
 
 pub(super) fn project(
@@ -87,59 +103,37 @@ pub(super) fn project(
     now: u64,
     mut deadline: u64,
 ) -> Result<(Vec<DnsRecord>, u64), String> {
-    let aliases = aliases(settings)?;
-    if catalog.schema_version != SCHEMA_VERSION || catalog.observations.len() > 4096 {
-        return Err("unsupported or oversized service DNS catalog".into());
-    }
-    let hosts = records.clone();
-    let mut identities = BTreeSet::new();
-    let mut entrances = BTreeMap::new();
-    for service in &catalog.observations {
-        let Some(label) = aliases.get(&service.value.kind) else {
-            continue;
-        };
-        if service.schema_version != SCHEMA_VERSION
-            || !service.is_fresh_at(now)
-            || service.expires_at.saturating_sub(service.observed_at) > 300
-            || service.provenance.provider != "mycelium-application-owner-lease"
-            || service.value.attributes.get("node_id") != Some(&service.provenance.observer)
+    let originals = records.clone();
+    let hosts = originals
+        .iter()
+        .map(|record| ServiceHost {
+            name: record.name.clone(),
+            address: record.address,
+            node: record.node.clone(),
+        })
+        .collect::<Vec<_>>();
+    // The naming rule is shared with the gateway; this is only the DNS half.
+    let published = with_fallback_names(catalog, &aliases(settings)?, &settings.resolver.suffix);
+    let projected = project_service_names(
+        &settings.service_index_peers,
+        &settings.resolver.suffix,
+        &hosts,
+        &published,
+        now,
+    )?;
+    let mut entrances: BTreeMap<(String, IpAddr), String> = BTreeMap::new();
+    for entry in projected {
+        // One entrance per name/address: DNS cannot choose a port or URL.
+        if entrances
+            .insert((entry.name.clone(), entry.address), entry.endpoint.clone())
+            .is_some_and(|old| old != entry.endpoint)
         {
-            continue;
+            return Err("ambiguous service entrance; DNS cannot select ports".into());
         }
-        if !identities.insert(&service.service_id) {
-            return Err("duplicate service DNS identity".into());
-        }
-        for endpoint in &service.value.endpoints {
-            let Some(ip) = address(endpoint) else {
-                continue;
-            };
-            for host in hosts
-                .iter()
-                .filter(|r| r.node == service.provenance.observer && r.address == ip)
-            {
-                let name = canonical_domain(&format!("{label}.{}", host.name))?;
-                // One entrance per name/address: DNS cannot choose a port or URL.
-                if entrances
-                    .insert((name.clone(), ip), endpoint.clone())
-                    .is_some_and(|old| old != *endpoint)
-                {
-                    return Err("ambiguous service entrance; DNS cannot select ports".into());
-                }
-                records.push(DnsRecord {
-                    name,
-                    ..host.clone()
-                });
-                if settings.service_index_peers.get(&service.value.kind)
-                    == Some(&service.provenance.observer)
-                {
-                    records.push(DnsRecord {
-                        name: canonical_domain(&format!("{label}.{}", settings.resolver.suffix))?,
-                        ..host.clone()
-                    });
-                }
-                deadline = deadline.min(service.expires_at);
-            }
-        }
+        let mut record = originals[entry.host].clone();
+        record.name = entry.name;
+        records.push(record);
+        deadline = deadline.min(entry.expires_at);
     }
     records.sort();
     records.dedup();
@@ -150,6 +144,7 @@ pub(super) fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mycelium_dns_policy::service_names::entrance_address;
     use serde_json::json;
     struct PolicyFile(std::path::PathBuf);
     impl PolicyFile {
@@ -371,7 +366,7 @@ mod tests {
             "https://192.0.2.12:8444/admin",
             "https://192.0.2.12:8444?token=x",
         ] {
-            assert!(address(url).is_none());
+            assert!(entrance_address(url).is_none());
         }
     }
 }

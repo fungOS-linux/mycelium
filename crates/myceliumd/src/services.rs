@@ -4,10 +4,18 @@ use fpl_resource_observation::{
     Confidence, Provenance, Service, ServiceCatalog, ServiceId, ServiceObservation, SCHEMA_VERSION,
 };
 use mycelium_core::{ServiceRecord, Topology};
+use mycelium_dns_policy::service_names::{valid_label, APPLICATION_OWNER_LEASE};
+use mycelium_dns_policy::settings::{self, Naming};
 
 const SERVICE_TTL_SECONDS: u64 = 15 * 60;
 
 pub fn project(topology: &Topology) -> ServiceCatalog {
+    project_with_naming(topology, naming().as_ref())
+}
+
+/// Project with an explicit naming policy. Publication is the only place labels
+/// become names, so callers that need determinism supply the policy themselves.
+pub fn project_with_naming(topology: &Topology, naming: Option<&Naming>) -> ServiceCatalog {
     let mut catalog = ServiceCatalog {
         schema_version: SCHEMA_VERSION,
         ..ServiceCatalog::default()
@@ -133,6 +141,7 @@ pub fn project(topology: &Topology) -> ServiceCatalog {
                 confidence: recognized.confidence,
                 value: Service {
                     kind: kind.to_owned(),
+                    names: Vec::new(),
                     endpoints,
                     protocols,
                     formats,
@@ -141,8 +150,55 @@ pub fn project(topology: &Topology) -> ServiceCatalog {
             });
         }
     }
+    publish_names(&mut catalog, naming);
     catalog.normalize();
     catalog
+}
+
+/// Name the services this zone answers for.
+///
+/// The owner declares labels in its lease; the zone's alias table overrides them,
+/// so a desktop can rename what it installed. Published names are composed with
+/// the zone's suffix, which is why no consumer needs the zone's policy.
+fn publish_names(catalog: &mut ServiceCatalog, naming: Option<&Naming>) {
+    for observation in &mut catalog.observations {
+        if observation.provenance.provider != APPLICATION_OWNER_LEASE {
+            continue;
+        }
+        let Some(naming) = naming else {
+            // No readable policy means the declared labels are unanswered claims;
+            // publish none rather than names this zone may not answer.
+            observation.value.names.clear();
+            continue;
+        };
+        let labels = match naming.service_aliases.get(&observation.value.kind) {
+            Some(label) => vec![label.clone()],
+            None => observation.value.names.clone(),
+        };
+        let mut names = BTreeSet::new();
+        for label in labels {
+            if !valid_label(&label) {
+                eprintln!(
+                    "myceliumd: application lease {} asks for invalid name `{label}`",
+                    observation.service_id.0
+                );
+                continue;
+            }
+            names.insert(format!("{label}.{}", naming.suffix));
+        }
+        observation.value.names = names.into_iter().collect();
+    }
+}
+
+/// The zone's naming policy, when this host has a resolver installed.
+fn naming() -> Option<Naming> {
+    match settings::load_active(&crate::home_dir().join("dns")) {
+        Ok(naming) => Some(naming.unwrap_or_default()),
+        Err(error) => {
+            eprintln!("myceliumd: resolver naming unavailable: {error}");
+            None
+        }
+    }
 }
 
 fn endpoint(transport: &str, host: String, port: u16) -> String {
@@ -492,5 +548,101 @@ mod tests {
             .value
             .endpoints
             .contains("tcp://[2001:db8::10]:9443"));
+    }
+
+    fn lease_catalog(names: &[&str]) -> ServiceCatalog {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "observations": [{
+                "schema_version": 1,
+                "service_id": "service/n1/application/files",
+                "observed_at": 100,
+                "expires_at": 200,
+                "provenance": {"provider": APPLICATION_OWNER_LEASE, "observer": "n1"},
+                "confidence": "strong",
+                "value": {
+                    "kind": "files",
+                    "names": names,
+                    "endpoints": ["http://100.108.9.93:8803"],
+                    "attributes": {"node_id": "n1"}
+                }
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn published_names_are_the_zone_s_and_its_alias_overrides_the_lease() {
+        let naming = Naming {
+            service_aliases: BTreeMap::from([("files".to_owned(), "docs".to_owned())]),
+            suffix: "myc".to_owned(),
+            ..Naming::default()
+        };
+
+        let mut catalog = lease_catalog(&["files"]);
+        publish_names(&mut catalog, Some(&naming));
+        assert_eq!(
+            catalog.observations[0].value.names,
+            vec!["docs.myc".to_owned()]
+        );
+
+        // Without an override the owner's own label is used.
+        let mut catalog = lease_catalog(&["files"]);
+        publish_names(&mut catalog, Some(&Naming::default()));
+        assert_eq!(
+            catalog.observations[0].value.names,
+            vec!["files.myc".to_owned()]
+        );
+
+        // A host with no readable policy publishes no names rather than names it
+        // may not answer.
+        let mut catalog = lease_catalog(&["files"]);
+        publish_names(&mut catalog, None);
+        assert!(catalog.observations[0].value.names.is_empty());
+    }
+
+    #[test]
+    fn a_leased_service_is_published_under_its_zone_name_and_claimable() {
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "observations": [{
+                "schema_version": 1,
+                "service_id": "service/n1/application/files",
+                "observed_at": 100,
+                "expires_at": 200,
+                "provenance": {"provider": "application", "observer": "n1"},
+                "confidence": "strong",
+                "value": {
+                    "kind": "files",
+                    "names": ["files"],
+                    "endpoints": ["http://100.108.9.93:8803"],
+                    "attributes": {"node_id": "n1"}
+                }
+            }]
+        });
+        let observations =
+            crate::local_services::observe(&serde_json::to_vec(&document).unwrap(), "n1", 100)
+                .unwrap();
+        let mut topology = mycelium_core::Topology::default();
+        topology.observe_all(observations);
+
+        let naming = Naming {
+            suffix: "myc".to_owned(),
+            ..Naming::default()
+        };
+        let catalog = project_with_naming(&topology, Some(&naming));
+        let claims = mycelium_dns_policy::service_names::claimed_services(&catalog, 100).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].names, vec!["files.myc".to_owned()]);
+    }
+
+    #[test]
+    fn an_invalid_declared_label_is_dropped_not_published() {
+        let mut catalog = lease_catalog(&["Files", "files"]);
+        publish_names(&mut catalog, Some(&Naming::default()));
+        assert_eq!(
+            catalog.observations[0].value.names,
+            vec!["files.myc".to_owned()]
+        );
     }
 }

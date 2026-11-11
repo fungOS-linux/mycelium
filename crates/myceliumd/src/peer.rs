@@ -34,6 +34,8 @@ const HARDWARE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DIGEST_INTERVAL: Duration = Duration::from_secs(15);
 const DEFAULT_ARTIFACT_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A seed session must last this long before it resets the reconnect backoff.
+const BACKOFF_RESET_SESSION: Duration = Duration::from_secs(30);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_OBSERVATIONS_PER_MESSAGE: usize = 64;
 const MAX_OBSERVATION_MESSAGE_BYTES: usize = 900 * 1024;
@@ -217,6 +219,8 @@ impl Mesh {
             process_leaders: Vec::new(),
             ssh_listening,
             established_ssh_sessions: 0,
+            power: mycelium_peer_protocol::PowerSource::Unknown,
+            link: mycelium_peer_protocol::LinkKind::Unknown,
             platform_metrics: BTreeMap::new(),
         }))
         .await
@@ -262,14 +266,30 @@ impl Mesh {
         let require_transport_binding = std::env::var("MYCELIUM_REQUIRE_TRANSPORT_BINDING")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
         let observations = match std::fs::read_to_string(crate::peer_observations_path()) {
-            Ok(text) => validated_observations(
-                serde_json::from_str::<Vec<SignedEnvelope>>(&text)?,
-                &hello.node_id,
-                allowed_origins.as_ref(),
-                &authority_roots,
-                &trusted_access_keys,
-                &trusted_release_keys,
-            ),
+            Ok(text) => match serde_json::from_str::<Vec<SignedEnvelope>>(&text) {
+                Ok(values) => validated_observations(
+                    values,
+                    &hello.node_id,
+                    allowed_origins.as_ref(),
+                    &authority_roots,
+                    &trusted_access_keys,
+                    &trusted_release_keys,
+                ),
+                Err(error) => {
+                    // Peer observations are a cache: every entry is recoverable
+                    // from its owner. Quarantine the unreadable file instead of
+                    // refusing to boot, which would take every local service
+                    // down with it and hide the real error behind a restart loop.
+                    let path = crate::peer_observations_path();
+                    let quarantine = path.with_extension(format!("json.corrupt-{}", now()));
+                    std::fs::rename(&path, &quarantine)?;
+                    eprintln!(
+                        "myceliumd: quarantined unreadable peer observations at {}: {error}",
+                        quarantine.display()
+                    );
+                    BTreeMap::new()
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(error) => return Err(error.into()),
         };
@@ -1319,10 +1339,25 @@ impl Mesh {
 
     async fn dial_forever(self: Arc<Self>, seed: String, connector: TlsConnector) {
         let mut delay = Duration::from_secs(1);
+        let mut reported: Option<String> = None;
         loop {
+            let started = std::time::Instant::now();
             match self.dial(&seed, connector.clone()).await {
-                Ok(()) => delay = Duration::from_secs(1),
-                Err(error) => eprintln!("myceliumd: peer seed {seed}: {error}"),
+                // A session that closes immediately is not evidence of health:
+                // reset the backoff only after a connection was actually useful.
+                Ok(()) if started.elapsed() >= BACKOFF_RESET_SESSION => {
+                    delay = Duration::from_secs(1);
+                    reported = None;
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    // One line per distinct failure, not one per retry.
+                    let message = format!("myceliumd: peer seed {seed}: {error}");
+                    if reported.as_deref() != Some(message.as_str()) {
+                        eprintln!("{message}");
+                        reported = Some(message);
+                    }
+                }
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(60));
@@ -2445,8 +2480,16 @@ fn accept_artifact_chunk(
 }
 
 fn persist_observations(values: &[SignedEnvelope]) -> Result<(), AnyError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = crate::peer_observations_path();
-    let temp = path.with_extension("json.tmp");
+    // The rename is atomic, the write is not: a second writer must never land in
+    // this one's temporary file, or the published document holds both.
+    let temp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&temp, serde_json::to_vec_pretty(values)?)?;
     std::fs::rename(temp, path)?;
     Ok(())
@@ -2548,12 +2591,19 @@ fn add_gateway_usage(health: &mut HostHealth) {
         return;
     };
     match gateway_usage_metrics(&bytes, now()) {
-        Ok(metrics) => health.platform_metrics.extend(metrics),
+        Ok(Some(metrics)) => health.platform_metrics.extend(metrics),
+        // A gateway that is not running (or has just started) publishes nothing.
+        // Peers already drop metrics that are not fresh, so this is not an error
+        // worth repeating on every health tick.
+        Ok(None) => {}
         Err(error) => eprintln!("gateway usage: {}: {error}", path.display()),
     }
 }
 
-fn gateway_usage_metrics(bytes: &[u8], now: u64) -> Result<BTreeMap<String, String>, String> {
+fn gateway_usage_metrics(
+    bytes: &[u8],
+    now: u64,
+) -> Result<Option<BTreeMap<String, String>>, String> {
     use mycelium_peer_protocol::gateway_usage::{
         GatewayUsageMetrics, GatewayUsageSnapshot, GATEWAY_USAGE_SCHEMA_VERSION,
     };
@@ -2567,9 +2617,9 @@ fn gateway_usage_metrics(bytes: &[u8], now: u64) -> Result<BTreeMap<String, Stri
     }
     let metrics = GatewayUsageMetrics::from_snapshot(&snapshot);
     if !metrics.is_fresh(now) {
-        return Err("usage snapshot is stale".into());
+        return Ok(None);
     }
-    Ok(metrics.to_platform_metrics())
+    Ok(Some(metrics.to_platform_metrics()))
 }
 
 fn add_update_health(health: &mut HostHealth) {
@@ -2638,6 +2688,8 @@ fn collect_linux() -> Result<HostHealth, AnyError> {
         ssh_listening: ssh.lines().any(|line| local_port(line, 22)),
         established_ssh_sessions: sessions.lines().filter(|line| local_port(line, 22)).count()
             as u32,
+        power: linux_power(),
+        link: linux_link(),
         platform_metrics,
     })
 }
@@ -2687,8 +2739,120 @@ fn collect_darwin() -> Result<HostHealth, AnyError> {
             .lines()
             .filter(|line| line.contains("(ESTABLISHED)") && darwin_local_port(line, 22))
             .count() as u32,
+        power: darwin_power(),
+        link: darwin_link(),
         platform_metrics: BTreeMap::new(),
     })
+}
+
+/// Power source from sysfs.
+///
+/// A machine with no battery is mains by construction. With a battery, mains is
+/// only claimed when a supply reports itself online; anything ambiguous stays
+/// `Unknown`, because `Unknown` does not exclude a host while `Battery` does.
+#[cfg(target_os = "linux")]
+fn linux_power() -> mycelium_peer_protocol::PowerSource {
+    use mycelium_peer_protocol::PowerSource;
+    let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else {
+        return PowerSource::Unknown;
+    };
+    let mut seen = false;
+    let mut has_battery = false;
+    let mut on_mains = false;
+    for entry in entries.flatten() {
+        let kind = std::fs::read_to_string(entry.path().join("type")).unwrap_or_default();
+        match kind.trim() {
+            "Battery" => {
+                seen = true;
+                has_battery = true;
+            }
+            "Mains" | "USB" | "USB_C" => {
+                seen = true;
+                if let Ok(online) = std::fs::read_to_string(entry.path().join("online")) {
+                    on_mains |= online.trim() == "1";
+                }
+            }
+            _ => {}
+        }
+    }
+    match (seen, has_battery, on_mains) {
+        (false, _, _) => PowerSource::Unknown,
+        (true, false, _) => PowerSource::Mains,
+        (true, true, true) => PowerSource::Mains,
+        (true, true, false) => PowerSource::Battery,
+    }
+}
+
+/// Link kind of the interface carrying the default route.
+#[cfg(target_os = "linux")]
+fn linux_link() -> mycelium_peer_protocol::LinkKind {
+    use mycelium_peer_protocol::LinkKind;
+    let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let Some(interface) = route.lines().skip(1).find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let name = fields.next()?;
+        let destination = fields.next()?;
+        (destination == "00000000").then(|| name.to_owned())
+    }) else {
+        return LinkKind::Unknown;
+    };
+    let base = format!("/sys/class/net/{interface}");
+    if std::path::Path::new(&format!("{base}/wireless")).exists() {
+        LinkKind::Wireless
+    } else if std::path::Path::new(&base).exists() {
+        LinkKind::Wired
+    } else {
+        LinkKind::Unknown
+    }
+}
+
+/// Power source as reported by the power management daemon.
+#[cfg(target_os = "macos")]
+fn darwin_power() -> mycelium_peer_protocol::PowerSource {
+    use mycelium_peer_protocol::PowerSource;
+    let Ok(battery) = output("/usr/bin/pmset", &["-g", "batt"]) else {
+        return PowerSource::Unknown;
+    };
+    if battery.contains("AC Power") {
+        PowerSource::Mains
+    } else if battery.contains("Battery Power") {
+        PowerSource::Battery
+    } else {
+        PowerSource::Unknown
+    }
+}
+
+/// Link kind of the interface carrying the default route.
+#[cfg(target_os = "macos")]
+fn darwin_link() -> mycelium_peer_protocol::LinkKind {
+    use mycelium_peer_protocol::LinkKind;
+    let Ok(route) = output("/sbin/route", &["-n", "get", "default"]) else {
+        return LinkKind::Unknown;
+    };
+    let Some(interface) = route
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("interface:").map(str::trim))
+    else {
+        return LinkKind::Unknown;
+    };
+    // A Thunderbolt or USB adapter reports as "Ethernet" and is still wired.
+    let ports = output("/usr/sbin/networksetup", &["-listallhardwareports"]).unwrap_or_default();
+    let mut port = None;
+    let mut lines = ports.lines();
+    while let Some(line) = lines.next() {
+        if let Some(name) = line.trim().strip_prefix("Hardware Port:") {
+            let device = lines.next().unwrap_or_default().trim();
+            if device == format!("Device: {interface}") {
+                port = Some(name.trim().to_owned());
+                break;
+            }
+        }
+    }
+    match port.as_deref() {
+        Some("Wi-Fi") | Some("AirPort") => LinkKind::Wireless,
+        Some(_) => LinkKind::Wired,
+        None => LinkKind::Unknown,
+    }
 }
 
 fn output(command: &str, args: &[&str]) -> Result<String, AnyError> {
@@ -2864,7 +3028,9 @@ mod tests {
 
     #[test]
     fn fresh_gateway_usage_is_gossiped_and_stale_usage_is_dropped() {
-        let metrics = gateway_usage_metrics(&usage_document(1_000, 1), 1_060).unwrap();
+        let metrics = gateway_usage_metrics(&usage_document(1_000, 1), 1_060)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             metrics
                 .get("mycelium_ai.completion_tokens")
@@ -2877,12 +3043,14 @@ mod tests {
                 .map(String::as_str),
             Some("4")
         );
-        // A stopped gateway must not report yesterday's traffic as current.
+        // A stopped gateway must not report yesterday's traffic as current, and
+        // being stopped is a state rather than an error to log on every tick.
         assert!(gateway_usage_metrics(
             &usage_document(1_000, 1),
             1_000 + mycelium_peer_protocol::gateway_usage::GATEWAY_USAGE_MAX_AGE_SECONDS + 1
         )
-        .is_err());
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -3046,16 +3214,7 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "mycelium-{name}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        crate::test_dir(name)
     }
 
     fn oidc_grant(principal: &str) -> AccessStatement {

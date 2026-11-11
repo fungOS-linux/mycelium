@@ -734,6 +734,8 @@ fn observation(
         &service_id,
         Service {
             kind: KIND.to_owned(),
+            // The tunnel is addressed by endpoint id, not by a DNS name.
+            names: Vec::new(),
             endpoints: BTreeSet::from([format!("iroh://{endpoint_id}")]),
             protocols: BTreeSet::from(["quic".to_owned()]),
             formats: BTreeSet::new(),

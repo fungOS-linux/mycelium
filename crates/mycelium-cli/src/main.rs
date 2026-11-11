@@ -226,6 +226,8 @@ usage:
   mycelium access ssh host-policy status
   mycelium access ssh host-policy reconcile (--dry-run | --write)
   mycelium access ssh host-policy install-timer --write
+  mycelium access ssh directory [--principal ID] [--from PATH] [--all] [--json]
+  mycelium access ssh directory collect --target SSH-HOST... [--site SITE] --path FILE --write
   mycelium access oidc verify --issuer URL --audience ID --token-env VAR [--json]
   mycelium access oidc ssh-issue --issuer URL --audience ID --token-env VAR --public-key PATH --ca PRIVATE-KEY --path CERT [--grant ID] [--ttl 8h] --write [--json]
   mycelium access oidc gateway --listen 127.0.0.1:8787 --issuer URL --audience ID --client-id ID --client-secret-env VAR --callback-url HTTPS-URL --ca PRIVATE-KEY [--invite-store PATH] --write
@@ -1032,7 +1034,9 @@ async fn access(args: &[String]) -> Result<Vec<String>, ClientError> {
             let _ = std::fs::remove_file(path);
             return result.map(|value| vec![value.to_string()]);
         }
-        let state = if args.get(1).is_some_and(|value| value == "host-apply") {
+        let directory_collect = args.get(1).is_some_and(|value| value == "directory")
+            && args.get(2).is_some_and(|value| value == "collect");
+        let state = if args.get(1).is_some_and(|value| value == "host-apply") || directory_collect {
             serde_json::json!({})
         } else {
             let mut client = connect().await?;
@@ -3502,6 +3506,9 @@ fn render_service_catalog(catalog: &fpl_resource_observation::ServiceCatalog) ->
             "  {} kind={} node={} state={} confidence={:?}",
             observation.service_id.0, observation.value.kind, node, state, observation.confidence
         ));
+        for name in &observation.value.names {
+            lines.push(format!("    name {name}"));
+        }
         for endpoint in &observation.value.endpoints {
             lines.push(format!("    {endpoint}"));
         }

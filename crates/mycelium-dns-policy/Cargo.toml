@@ -7,6 +7,8 @@ description = "Site DNS projection and namespace ownership policy"
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
+fpl-resource-observation.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

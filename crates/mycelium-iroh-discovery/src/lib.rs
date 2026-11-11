@@ -247,6 +247,7 @@ pub fn project(ad: &ServiceAdvertisement) -> Result<Option<ServiceObservation>, 
         confidence: Confidence::Derived,
         value: Service {
             kind: "iroh".into(),
+            names: Vec::new(),
             endpoints: BTreeSet::from([format!("iroh://{}", endpoint.endpoint_id)]),
             protocols: BTreeSet::from(["iroh".into(), "quic".into()]),
             formats: BTreeSet::new(),
