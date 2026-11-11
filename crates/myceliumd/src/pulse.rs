@@ -14,7 +14,8 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,8 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
 
 use crate::peer::Mesh;
+
+type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 mod cron;
 
@@ -51,10 +54,16 @@ pub enum SystemAction {
     /// Check this node's own certificate and create a renewal request when it
     /// reaches two thirds of its lifetime.
     SshRenewalCheck,
+    /// Daily gateway TLS certificate check.
+    GatewayCertificate,
+    /// Daily peer mTLS certificate check.
+    PeerCertificate,
+    /// Daily trust-anchor report. Never rotates automatically.
+    CaCertificate,
 }
 
 /// System pulse config. User/desktop pulses are loaded beside this table.
-pub const SYSTEM_PULSES: [SystemPulse; 2] = [
+pub const SYSTEM_PULSES: [SystemPulse; 5] = [
     SystemPulse {
         id: "system.ssh-renewal-issuer",
         interval: Duration::from_secs(30),
@@ -64,6 +73,21 @@ pub const SYSTEM_PULSES: [SystemPulse; 2] = [
         id: "system.ssh-renewal-check",
         interval: Duration::from_secs(30 * 60),
         action: SystemAction::SshRenewalCheck,
+    },
+    SystemPulse {
+        id: "system.gateway-certificate",
+        interval: Duration::from_secs(24 * 60 * 60),
+        action: SystemAction::GatewayCertificate,
+    },
+    SystemPulse {
+        id: "system.peer-certificate",
+        interval: Duration::from_secs(24 * 60 * 60),
+        action: SystemAction::PeerCertificate,
+    },
+    SystemPulse {
+        id: "system.ca-certificate",
+        interval: Duration::from_secs(24 * 60 * 60),
+        action: SystemAction::CaCertificate,
     },
 ];
 
@@ -133,6 +157,17 @@ pub(crate) async fn list_all() -> PulseList {
                     SystemAction::SshRenewalCheck => {
                         "check the node SSH certificate and renew at two thirds of its lifetime"
                             .to_owned()
+                    }
+                    SystemAction::GatewayCertificate => {
+                        "check the gateway TLS leaf and report its renewal window; reissue needs the local CA key"
+                            .to_owned()
+                    }
+                    SystemAction::PeerCertificate => {
+                        "check the peer mTLS certificate and report its renewal window; renewal needs the mesh CA"
+                            .to_owned()
+                    }
+                    SystemAction::CaCertificate => {
+                        "report trust-anchor validity; CA rotation is a staged operation".to_owned()
                     }
                 },
             })
@@ -300,6 +335,74 @@ impl Store {
     }
 }
 
+async fn check_certificate_pulse(
+    id: &str,
+    path: &Path,
+    renew_before_secs: u64,
+) -> Result<(), AnyError> {
+    let path = path.to_owned();
+    let at = now_ms();
+    let (outcome, detail) = tokio::task::spawn_blocking(move || {
+        if !path.is_file() {
+            return (
+                "missing".to_owned(),
+                format!("{} is not present", path.display()),
+            );
+        }
+        let check = Command::new("openssl")
+            .args([
+                "x509",
+                "-in",
+                &path.display().to_string(),
+                "-noout",
+                "-checkend",
+                &renew_before_secs.to_string(),
+            ])
+            .status();
+        let dates = Command::new("openssl")
+            .args([
+                "x509",
+                "-in",
+                &path.display().to_string(),
+                "-noout",
+                "-enddate",
+            ])
+            .output();
+        let dates = dates
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .unwrap_or_else(|| "enddate unavailable".into());
+        match check {
+            Ok(status) if status.success() => ("ok".to_owned(), dates),
+            Ok(status) if status.code() == Some(1) => ("due".to_owned(), dates),
+            Ok(status) => (
+                "unknown".to_owned(),
+                format!("openssl exited {status}: {dates}"),
+            ),
+            Err(error) => ("unknown".to_owned(), format!("openssl: {error}")),
+        }
+    })
+    .await?;
+    if outcome == "due" {
+        eprintln!("myceliumd: pulse {id}: certificate is inside its renewal window ({detail})");
+    }
+    let run = PulseRun {
+        id: format!("{id}-{at}"),
+        pulse_id: id.to_owned(),
+        scheduled_at_ms: at,
+        fired_at_ms: at,
+        finished_at_ms: now_ms(),
+        outcome,
+        detail,
+    };
+    store()
+        .lock()
+        .await
+        .record_run(run)
+        .map_err(|error| -> AnyError { std::io::Error::other(error).into() })
+}
+
 fn validate(pulse: &UserPulse) -> Result<(), String> {
     if pulse.id.len() > 128 {
         return Err("pulse id is longer than 128 bytes".into());
@@ -384,6 +487,30 @@ pub(crate) async fn run_system(mesh: Arc<Mesh>) {
             let result = match pulse.action {
                 SystemAction::SshRenewalIssuer => mesh.serve_ssh_renewal().await,
                 SystemAction::SshRenewalCheck => mesh.renew_ssh_credentials().await,
+                SystemAction::GatewayCertificate => {
+                    check_certificate_pulse(
+                        pulse.id,
+                        &crate::home_dir().join("gateway/server.pem"),
+                        90 * 24 * 60 * 60,
+                    )
+                    .await
+                }
+                SystemAction::PeerCertificate => {
+                    check_certificate_pulse(
+                        pulse.id,
+                        &crate::home_dir().join("pki/node.pem"),
+                        90 * 24 * 60 * 60,
+                    )
+                    .await
+                }
+                SystemAction::CaCertificate => {
+                    check_certificate_pulse(
+                        pulse.id,
+                        &crate::home_dir().join("pki/ca.pem"),
+                        180 * 24 * 60 * 60,
+                    )
+                    .await
+                }
             };
             if let Err(error) = result {
                 eprintln!("myceliumd: pulse {}: {error}", pulse.id);
