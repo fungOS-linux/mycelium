@@ -270,6 +270,13 @@ impl ResolverConfig {
         for server in &self.upstreams {
             config.push_str(&format!("server={}#{}\n", server.ip(), server.port()));
         }
+        // A localhost-only resolver is the bootstrap for local capability
+        // gateways: an unknown `.myc` name means "use the local gateway", while
+        // explicit host records stay more specific. A LAN or fleet resolver must
+        // never hand its own loopback to a client.
+        if self.mode == ResolverMode::LocalhostOnly {
+            config.push_str(&format!("address=/.{}/127.0.0.1\n", self.suffix));
+        }
         // The forwarder is the only default upstream when it is configured.
         if let Some(doh) = &self.doh {
             config.push_str(&format!(
@@ -479,6 +486,25 @@ mod tests {
         value["mode"] = serde_json::json!("fleet");
         let parsed: ResolverConfig = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.mode, ResolverMode::Fleet);
+    }
+
+    #[test]
+    fn localhost_only_bootstraps_unknown_names_to_the_local_gateway() {
+        let text = config().render(Vec::new()).unwrap();
+        assert!(text.contains("address=/.myc/127.0.0.1\n"), "{text}");
+
+        // A resolver that serves other machines must not answer with its own
+        // loopback, and the fleet resolver answers a real address.
+        let mut lan = config();
+        lan.mode = ResolverMode::LanServing;
+        lan.listen = vec!["192.0.2.10:1053".parse().unwrap()];
+        assert!(!lan.render(Vec::new()).unwrap().contains("address=/.myc/"));
+
+        let mut fleet = config();
+        fleet.mode = ResolverMode::Fleet;
+        fleet.listen = vec!["127.0.0.1:53".parse().unwrap()];
+        fleet.service_address = Some("fd42:6d79:6365::/48".parse().unwrap());
+        assert!(!fleet.render(Vec::new()).unwrap().contains("address=/.myc/"));
     }
 
     fn config() -> ResolverConfig {
