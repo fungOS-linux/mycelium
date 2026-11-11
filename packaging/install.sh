@@ -109,8 +109,10 @@ case "$MODE" in
         fi
         ;;
     new)
-        say "install: starting a new principal on this node"
-        "$bindir/mycelium" setup --system-service || die "principal setup failed"
+        # Creating a principal means minting an authority CA, and there is no
+        # command for that today: `setup` requires a claim and `mycelium
+        # authority` only lists. Failing loudly beats a flag that half works.
+        die '--new-principal is not available yet: this node cannot mint its own authority CA. Join an existing fleet with --join, or run mycelium authority list to see what this node already trusts.'
         ;;
 esac
 
