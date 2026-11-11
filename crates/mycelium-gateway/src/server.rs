@@ -75,14 +75,14 @@ pub async fn run_with_tls(
     reload_secs: u64,
     tls: Option<(PathBuf, PathBuf)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_options(listen, config_path, token_file, reload_secs, tls, None).await
+    run_with_options(vec![listen], config_path, token_file, reload_secs, tls, None).await
 }
 
 /// `usage_path` is where token counters are persisted for `myceliumd` to
 /// gossip. Without it the gateway still meters and serves `/.mycelium/usage`,
 /// but nothing survives a restart and nothing leaves the machine.
 pub async fn run_with_options(
-    listen: SocketAddr,
+    listeners: Vec<SocketAddr>,
     config_path: Option<PathBuf>,
     token_file: Option<PathBuf>,
     reload_secs: u64,
@@ -164,17 +164,44 @@ pub async fn run_with_options(
         spawn_reload(path, table, initial_mtime, reload_secs);
     }
 
-    let listener = TcpListener::bind(listen).await?;
+    // Bind every address before serving any of them. A gateway that came up on
+    // one of several configured addresses would answer its own health check and
+    // serve half the mesh, which is the failure this whole change exists to
+    // remove.
+    let mut bound = Vec::with_capacity(listeners.len());
+    for address in &listeners {
+        bound.push((*address, TcpListener::bind(address).await?));
+    }
     let app = routes(state);
-    if let Some((cert, key)) = tls {
-        let config = tls_config(&cert, &key)?;
-        eprintln!("mycelium-gateway: listening on https://{listen}; routing by Host");
-        serve_tls(listener, app, config).await?;
-    } else {
-        eprintln!("mycelium-gateway: listening on http://{listen}; routing by Host");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+    let mut tasks = tokio::task::JoinSet::new();
+    for (address, listener) in bound {
+        let app = app.clone();
+        let tls = tls.clone();
+        tasks.spawn(async move {
+            match tls {
+                Some((cert, key)) => {
+                    let config = tls_config(&cert, &key).map_err(|error| error.to_string())?;
+                    eprintln!("mycelium-gateway: listening on https://{address}; routing by Host");
+                    serve_tls(listener, app, config)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                None => {
+                    eprintln!("mycelium-gateway: listening on http://{address}; routing by Host");
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(shutdown_signal())
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            }
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(error) => return Err(format!("listener task failed: {error}").into()),
+        }
     }
     // Final write so a restart continues from the counters it stopped at.
     if let Err(error) = usage.persist() {
