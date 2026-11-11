@@ -182,9 +182,12 @@ pub fn project_service_names(
     Ok(names)
 }
 
-/// Alias policy fills the names a published catalog left empty. A lease that
-/// publishes its own names needs no alias: naming is the Spore's decision and
-/// the operator's aliases only cover Spores that make none.
+/// Alias policy fills the names a published catalog left empty.
+///
+/// The daemon publishes names from the installed policy, and its aliases win
+/// over a declared label. This stage is for aliases only the adapter can
+/// evaluate (the resolver's Lua plugins): it must never overwrite a name the
+/// daemon published or the owner declared, only name a lease that has none.
 fn with_fallback_names(
     catalog: &ServiceCatalog,
     aliases: &BTreeMap<String, String>,
@@ -220,12 +223,12 @@ fn with_fallback_names(
 /// Returns the projected records and the earliest lease expiry among them, so a
 /// caller can shorten whatever freshness bound it already keeps.
 pub fn project_service_records(
-    naming: &Policy,
+    policy: &Policy,
     hosts: &[DnsRecord],
     catalog: &ServiceCatalog,
     now: u64,
 ) -> Result<(Vec<DnsRecord>, Option<u64>), String> {
-    let published = with_fallback_names(catalog, &naming.service_aliases, &naming.suffix)?;
+    let published = with_fallback_names(catalog, &policy.service_aliases, &policy.suffix)?;
     let service_hosts = hosts
         .iter()
         .map(|record| ServiceHost {
@@ -235,8 +238,8 @@ pub fn project_service_records(
         })
         .collect::<Vec<_>>();
     let projected = project_service_names(
-        &naming.service_index_peers,
-        &naming.suffix,
+        &policy.service_index_peers,
+        &policy.suffix,
         &service_hosts,
         &published,
         now,

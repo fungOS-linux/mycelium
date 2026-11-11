@@ -80,17 +80,17 @@ pub(super) fn project(
     now: u64,
     mut deadline: u64,
 ) -> Result<(Vec<DnsRecord>, u64), String> {
-    // The naming policy as the resolver installs it, handed to the rule that
-    // every other adapter uses. This adapter contributes no naming logic of its
-    // own: it renders the records the rule produced.
-    let naming = Policy {
+    // The installed policy, in the same shape every other adapter reads,
+    // handed to the rule that owns naming. This adapter contributes no naming
+    // logic of its own: it renders the records the rule produced.
+    let policy = Policy {
         service_aliases: aliases(settings)?,
         service_index_peers: settings.service_index_peers.clone(),
         reachable_prefixes: settings.reachable_prefixes.clone(),
         suffix: settings.resolver.suffix.clone(),
         site: settings.resolver.site.clone(),
     };
-    let (services, expiry) = project_service_records(&naming, &records, catalog, now)?;
+    let (services, expiry) = project_service_records(&policy, &records, catalog, now)?;
     records.extend(services);
     if let Some(expiry) = expiry {
         deadline = deadline.min(expiry);
