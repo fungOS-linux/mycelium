@@ -5,6 +5,7 @@
 //! explicit `--write`, and `--dry-run` always shows the plan instead of
 //! applying it.
 
+mod ca;
 mod completions;
 mod dns;
 mod doctor;
@@ -21,6 +22,7 @@ mod packaged;
 mod pair;
 #[cfg(feature = "iroh-sync")]
 mod pair_iroh;
+mod pulse;
 mod setup;
 mod skills;
 mod ssh_access;
@@ -67,6 +69,8 @@ fn main() {
         }
         Some("_self-check") => Ok(vec![self_check()]),
         Some("completions") => completions::command(&args[1..], USAGE),
+        Some("ca") => ca::command(&args[1..]),
+        Some("pulse") => rt_block(pulse::command(&args[1..])),
         Some(other) => rt_block(run(other, &args[1..])),
         None => Ok(usage()),
     };
@@ -121,6 +125,16 @@ usage:
   mycelium setup --packaged --claim-file PATH | --packaged --repair
   mycelium gateway status [--json]
   mycelium gateway usage [--json] [--fleet]
+  mycelium ca backup --key PATH [--bundle FILE] [--shares DIR] [--threshold N] [--share-count N] [--phrase-out FILE] --write
+  mycelium ca restore --bundle FILE --out PATH --phrase-file FILE [--force] --write
+  mycelium ca restore --bundle FILE --out PATH --share FILE --share FILE --share FILE [--force] --write
+  mycelium ca verify --bundle FILE --phrase-file FILE
+  mycelium ca split --phrase-file FILE [--out DIR] [--threshold N] [--share-count N] --write
+  mycelium pulse list [--json]
+  mycelium pulse add --schedule CRON --command CMD [--id ID] [--disabled] --write
+  mycelium pulse remove ID --write
+  mycelium pulse toggle ID --write
+  mycelium pulse runs [ID] [--limit N] [--json]
   mycelium gateway install [--write|--dry-run] [--trust-cert] [--routes PATH] [--cert PATH --key PATH] [--gateway-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]
   mycelium gateway uninstall [--write|--dry-run]
   mycelium doctor [--json] [--fix] [--trust-cert]
@@ -2527,6 +2541,11 @@ fn update_policy_command(args: &[String]) -> Result<Vec<String>, ClientError> {
 }
 
 async fn update_auto_run() -> Result<Vec<String>, ClientError> {
+    // A development binary is not a release-channel downgrade target. The
+    // timer still runs, but it must not replace the build under test.
+    if std::env::var_os("MYCELIUM_UPDATE_DEV").is_some() {
+        return Ok(vec!["development mode: automatic updates skipped".into()]);
+    }
     myceliumd::software_apt::require_native_executable(
         &std::env::current_exe().map_err(ClientError::Io)?,
     )
@@ -2944,7 +2963,7 @@ fn build_update_report(
     });
     let spores = serde_json::json!({
         "supported": false,
-        "reason": "Spore Store is not implemented; see mycelium-6sm2"
+        "reason": "Spore updates use the store channel; no source configured"
     });
     if json {
         return UpdateReport {

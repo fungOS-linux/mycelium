@@ -915,6 +915,40 @@ impl Daemon {
                 "socket": crate::socket_path().display().to_string(),
             }))
             .map_err(json_err),
+            Request::PulseList => to_value(crate::pulse::list_all().await).map_err(json_err),
+            Request::PulsePut { pulse, write } => {
+                if !write {
+                    return Err(MyceliumError::WritesNotPermitted(
+                        "pulse put requires --write".into(),
+                    ));
+                }
+                let saved = crate::pulse::store()
+                    .lock()
+                    .await
+                    .put(pulse)
+                    .map_err(MyceliumError::Validation)?;
+                to_value(saved).map_err(json_err)
+            }
+            Request::PulseRemove { id, write } => {
+                if !write {
+                    return Err(MyceliumError::WritesNotPermitted(
+                        "pulse remove requires --write".into(),
+                    ));
+                }
+                let removed = crate::pulse::store()
+                    .lock()
+                    .await
+                    .remove(&id)
+                    .map_err(MyceliumError::Validation)?;
+                to_value(serde_json::json!({ "id": id, "removed": removed })).map_err(json_err)
+            }
+            Request::PulseRuns { id, limit } => to_value(
+                crate::pulse::store()
+                    .lock()
+                    .await
+                    .runs(id.as_deref(), limit.unwrap_or(50)),
+            )
+            .map_err(json_err),
             Request::Drivers => to_value(self.drivers.iter().map(|d| d.name()).collect::<Vec<_>>())
                 .map_err(json_err),
             Request::DeviceAdd {

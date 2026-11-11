@@ -74,6 +74,10 @@ impl NewCredential {
         Self::new(CredentialKind::OtpSecret, secret)
     }
 
+    pub fn pgp_key(secret: impl Into<SecretBytes>) -> Self {
+        Self::new(CredentialKind::PgpKey, secret)
+    }
+
     pub fn with_purpose(mut self, purpose: Purpose) -> Self {
         self.purposes.insert(purpose);
         self

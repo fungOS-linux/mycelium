@@ -1,7 +1,7 @@
 # Geode connectors: passkeys, 2FA, OAuth2/OIDC, Composio
 
 Status: **implemented connectors** (`geode-passkey`, `geode-otp`,
-`geode-oauth`) plus reference conventions for Composio and fpl-auth.
+`geode-oauth`, `geode-pgp`) plus reference conventions for Composio and fpl-auth.
 
 ## Model
 
@@ -12,6 +12,7 @@ geode           opaque storage, purpose allowlist, leases, expiry, audit
 geode-passkey   WebAuthn assertion/registration from a software ES256 key
 geode-otp       TOTP/HOTP codes from a shared secret
 geode-oauth     PKCE, refresh, device authorization, discovery; token vault
+geode-pgp       detached OpenPGP signatures from a geode-owned private key
 ```
 
 Connectors are ordinary Cargo crates selected at build time. There is no
@@ -38,6 +39,7 @@ geode://mail/<account>/imap              password / app password
 geode://oauth/<provider>/{access,refresh,id}   TokenSlots::for_account
 geode://auth/<account>/passkey-<id>      PKCS#8 P-256 private key
 geode://auth/<account>/totp              OTP shared secret (raw bytes)
+geode://principal/<actor>/pgp            armored OpenPGP private key
 geode://composio/<project>/api-key       COMPOSIO_API_KEY
 geode://composio/<user>/consumer-key     ck_... (Composio For You)
 ```
@@ -58,6 +60,8 @@ Purposes used by the connectors:
 | `oauth2.refresh` | OAuth connector only | refresh token, one refresh call |
 | `oauth2.id` | session validator | ID token |
 | `mail.connect` / `mail.submit` | mail adapter | password / app password |
+| `spore.package.sign` | package signer | detached package/entry signature |
+| `store.delegation.sign` | store operator | publisher key delegation |
 
 ## `geode-passkey`
 
@@ -80,6 +84,28 @@ Limits, stated plainly:
 - A software key is exportable: geode can lease the PKCS#8 bytes. It is not a
   non-exportable Secure Enclave key and must not be described as one.
 - TPM/Keychain sealing protects a copied disk, not a compromised running daemon.
+
+## `geode-pgp`
+
+A detached OpenPGP signer over a key geode owns. The key is an armored private
+key stored as `CredentialKind::PgpKey`; the connector leases it for a short
+signing operation, imports it into an ephemeral GnuPG home, signs, and drops
+both. The caller receives only the signature.
+
+- The key must be unprotected. Geode's encrypted backend is the at-rest
+  boundary; a passphrase-protected key would need a second secret and is not in
+  this slice.
+- `Purpose::spore_package_sign()` (`spore.package.sign`) and
+  `Purpose::store_delegation_sign()` (`store.delegation.sign`) are the two
+  purposes this connector is meant for. The purpose is the grant.
+- `sign_detached` returns an armored signature; `public_key_armored` returns the
+  public key for a delegation or keyring.
+- This is a software signer. It does not make the key non-exportable; hardware
+  signing is a separate interface.
+- The crate also ships a `geode-pgp` CLI: `sign`, `public-key`, `fingerprint`,
+  and `verify`. It leases from a running `geoded`, so a tool or host process does
+  not need the store key file. `soil:creds` uses it for `sign-pgp` and
+  `verify-pgp`.
 
 ## `geode-otp` (2FA)
 

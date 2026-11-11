@@ -32,9 +32,6 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 const SECURITY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const HARDWARE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DIGEST_INTERVAL: Duration = Duration::from_secs(15);
-// Requests have a five-minute acceptance window. A fifteen-minute worker
-// interval can miss every request forever when peers' phases are offset.
-const SSH_RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_ARTIFACT_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -299,18 +296,9 @@ impl Mesh {
     pub async fn start(self: &Arc<Self>) -> Result<(), AnyError> {
         self.publish(PeerEvent::Hello(self.hello.clone())).await?;
         self.refresh_local_hello().await?;
-        let renewal_mesh = self.clone();
+        let pulse_mesh = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(
-                renewal_mesh.key.to_bytes()[0] as u64 % 30,
-            ))
-            .await;
-            loop {
-                if let Err(error) = renewal_mesh.renew_ssh_credentials().await {
-                    eprintln!("myceliumd: gossiped SSH renewal: {error}");
-                }
-                tokio::time::sleep(SSH_RENEWAL_INTERVAL).await;
-            }
+            crate::pulse::run_system(pulse_mesh).await;
         });
         let collector = self.clone();
         tokio::spawn(async move {
@@ -658,6 +646,12 @@ impl Mesh {
         .await
     }
 
+    /// First byte of the node key, used to derive a stable startup offset for
+    /// system pulses. The scheduler must not read the key for any other reason.
+    pub(crate) fn pulse_seed(&self) -> u64 {
+        self.key.to_bytes()[0] as u64
+    }
+
     /// A single worker owns renewal state. Requests are one retained slot per
     /// peer; responses are one bounded batch per issuer, independent of the
     /// current direct/relay transport and connection count.
@@ -717,6 +711,35 @@ impl Mesh {
                 }
             }
         }
+        self.issue_ssh_responses(at, &snapshot).await
+    }
+
+    /// The issuer half of SSH renewal. This must run inside the five-minute
+    /// request acceptance window, so it is a fast system pulse of its own; the
+    /// certificate check that creates a new request runs much less often.
+    pub async fn serve_ssh_renewal(&self) -> Result<(), AnyError> {
+        let at = now();
+        let snapshot: Vec<_> = self
+            .observations
+            .lock()
+            .await
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.event,
+                    PeerEvent::SshCredentialRequest(_) | PeerEvent::SshCredentialResponses(_)
+                )
+            })
+            .cloned()
+            .collect();
+        self.issue_ssh_responses(at, &snapshot).await
+    }
+
+    async fn issue_ssh_responses(
+        &self,
+        at: u64,
+        snapshot: &[SignedEnvelope],
+    ) -> Result<(), AnyError> {
         if !crate::home_dir().join("ssh/user_ca").is_file() {
             return Ok(());
         }

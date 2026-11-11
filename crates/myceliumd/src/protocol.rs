@@ -6,6 +6,24 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
     Hello,
+    /// List daemon-owned pulses, including system pulses where applicable.
+    PulseList,
+    PulsePut {
+        pulse: crate::pulse::UserPulse,
+        #[serde(default)]
+        write: bool,
+    },
+    PulseRemove {
+        id: String,
+        #[serde(default)]
+        write: bool,
+    },
+    PulseRuns {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     NodeObserve,
     NodeRefresh {
         write: bool,

@@ -212,6 +212,25 @@ Binding `:443` directly in the gateway would require a privileged supervisor and
 is not the intended deployment. Use the socket-activated forwarder so the
 listener and the process holding TLS keys have different privileges.
 
+For `:80`, run `mycelium-http-redirect` as the socket-activated agent on the
+`HTTP` socket. It answers every request with `301 Moved Permanently` to the same
+`https://` URL and never proxies a request body:
+
+```xml
+<key>Sockets</key><dict><key>HTTP</key><dict>
+  <key>SockNodeName</key><string>127.0.0.1</string>
+  <key>SockServiceName</key><integer>80</integer>
+  <key>SockFamily</key><string>IPv4</string>
+  <key>SockType</key><string>stream</string>
+  <key>SockProtocol</key><string>TCP</string>
+</dict></dict>
+```
+
+Point its `ProgramArguments` at `mycelium-http-redirect`; it activates the
+socket named `HTTP` and needs no privileged listener of its own. This listener
+is intentionally TLS-only in the other direction: a plaintext request either
+moves to HTTPS or fails, and no request is forwarded over plaintext.
+
 Use a bearer token for local callers:
 
 ```sh
@@ -237,11 +256,12 @@ non-streaming completion responses are buffered (bounded at 32 MiB) to read thei
 traffic is not proxied yet. `x-forwarded-proto` reports `https` on the TLS
 listener.
 
-The gateway binds one address. Binding `:80` or `:443` belongs to the
+The gateway binds one address. Binding `:443` belongs to the
 Spore/Confluence ingress layer: the service manager owns the privileged socket,
 `mycelium-https-forwarder` moves raw bytes, and the gateway terminates TLS on a
-loopback port. This keeps the privileged listener free of certificates and
-request authorization.
+loopback port. `:80` is a redirect-only listener (`mycelium-http-redirect`), so
+it never carries a request body or a credential. This keeps both privileged
+listeners free of certificates and request authorization.
 
 ## Current scope
 

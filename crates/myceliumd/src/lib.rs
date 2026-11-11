@@ -25,6 +25,7 @@ mod execution;
 mod hardware;
 pub mod iroh_tun;
 pub mod peer;
+pub mod pulse;
 #[cfg(feature = "iroh-sync")]
 pub use iroh as iroh_transport;
 pub mod local_services;
