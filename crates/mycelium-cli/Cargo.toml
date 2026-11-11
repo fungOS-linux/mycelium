@@ -35,6 +35,12 @@ axum = "0.8"
 rand_core.workspace = true
 sha2.workspace = true
 rcgen = "0.13"
+argon2 = "0.5"
+bip39 = "3"
+hex = "0.4"
+ring = "0.17"
+sharks = "0.5"
+zeroize = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 
 [dev-dependencies]

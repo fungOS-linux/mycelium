@@ -5,6 +5,7 @@
 //! explicit `--write`, and `--dry-run` always shows the plan instead of
 //! applying it.
 
+mod ca;
 mod completions;
 mod dns;
 mod doctor;
@@ -67,6 +68,7 @@ fn main() {
         }
         Some("_self-check") => Ok(vec![self_check()]),
         Some("completions") => completions::command(&args[1..], USAGE),
+        Some("ca") => ca::command(&args[1..]),
         Some("pulse") => rt_block(pulse::command(&args[1..])),
         Some(other) => rt_block(run(other, &args[1..])),
         None => Ok(usage()),
@@ -122,6 +124,11 @@ usage:
   mycelium setup --packaged --claim-file PATH | --packaged --repair
   mycelium gateway status [--json]
   mycelium gateway usage [--json] [--fleet]
+  mycelium ca backup --key PATH [--bundle FILE] [--shares DIR] [--threshold N] [--share-count N] [--phrase-out FILE] --write
+  mycelium ca restore --bundle FILE --out PATH --phrase-file FILE [--force] --write
+  mycelium ca restore --bundle FILE --out PATH --share FILE --share FILE --share FILE [--force] --write
+  mycelium ca verify --bundle FILE --phrase-file FILE
+  mycelium ca split --phrase-file FILE [--out DIR] [--threshold N] [--share-count N] --write
   mycelium pulse list [--json]
   mycelium pulse add --schedule CRON --command CMD [--id ID] [--disabled] --write
   mycelium pulse remove ID --write
