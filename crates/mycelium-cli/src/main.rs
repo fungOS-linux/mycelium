@@ -2529,6 +2529,11 @@ fn update_policy_command(args: &[String]) -> Result<Vec<String>, ClientError> {
 }
 
 async fn update_auto_run() -> Result<Vec<String>, ClientError> {
+    // A development binary is not a release-channel downgrade target. The
+    // timer still runs, but it must not replace the build under test.
+    if std::env::var_os("MYCELIUM_UPDATE_DEV").is_some() {
+        return Ok(vec!["development mode: automatic updates skipped".into()]);
+    }
     myceliumd::software_apt::require_native_executable(
         &std::env::current_exe().map_err(ClientError::Io)?,
     )
