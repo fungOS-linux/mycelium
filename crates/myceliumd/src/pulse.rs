@@ -45,15 +45,27 @@ pub struct SystemPulse {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemAction {
-    SshRenewal,
+    /// Answer peer renewal requests and republish responses. This is a fast
+    /// loop because the request acceptance window is five minutes.
+    SshRenewalIssuer,
+    /// Check this node's own certificate and create a renewal request when it
+    /// reaches two thirds of its lifetime.
+    SshRenewalCheck,
 }
 
 /// System pulse config. User/desktop pulses are loaded beside this table.
-pub const SYSTEM_PULSES: [SystemPulse; 1] = [SystemPulse {
-    id: "system.ssh-renewal",
-    interval: Duration::from_secs(30),
-    action: SystemAction::SshRenewal,
-}];
+pub const SYSTEM_PULSES: [SystemPulse; 2] = [
+    SystemPulse {
+        id: "system.ssh-renewal-issuer",
+        interval: Duration::from_secs(30),
+        action: SystemAction::SshRenewalIssuer,
+    },
+    SystemPulse {
+        id: "system.ssh-renewal-check",
+        interval: Duration::from_secs(30 * 60),
+        action: SystemAction::SshRenewalCheck,
+    },
+];
 
 /// A user-created pulse. The schedule is five-field cron; the command is run
 /// with `/bin/sh -c` under a 60-second timeout.
@@ -115,8 +127,12 @@ pub(crate) async fn list_all() -> PulseList {
                 id: pulse.id.to_owned(),
                 interval_secs: pulse.interval.as_secs(),
                 description: match pulse.action {
-                    SystemAction::SshRenewal => {
-                        "renew the node SSH certificate before it expires".to_owned()
+                    SystemAction::SshRenewalIssuer => {
+                        "answer peer SSH renewal requests inside the five-minute window".to_owned()
+                    }
+                    SystemAction::SshRenewalCheck => {
+                        "check the node SSH certificate and renew at two thirds of its lifetime"
+                            .to_owned()
                     }
                 },
             })
@@ -354,15 +370,25 @@ pub(crate) async fn run_system(mesh: Arc<Mesh>) {
             pulse.id, pulse.interval
         );
     }
-    let mut next_ssh = Instant::now() + startup_offset(seed, &SYSTEM_PULSES[0]);
+    let mut next: Vec<Instant> = SYSTEM_PULSES
+        .iter()
+        .map(|pulse| Instant::now() + startup_offset(seed, pulse))
+        .collect();
 
     loop {
         let now = Instant::now();
-        if now >= next_ssh {
-            if let Err(error) = mesh.renew_ssh_credentials().await {
-                eprintln!("myceliumd: pulse system.ssh-renewal: {error}");
+        for (index, pulse) in SYSTEM_PULSES.iter().enumerate() {
+            if now < next[index] {
+                continue;
             }
-            next_ssh = now + SYSTEM_PULSES[0].interval;
+            let result = match pulse.action {
+                SystemAction::SshRenewalIssuer => mesh.serve_ssh_renewal().await,
+                SystemAction::SshRenewalCheck => mesh.renew_ssh_credentials().await,
+            };
+            if let Err(error) = result {
+                eprintln!("myceliumd: pulse {}: {error}", pulse.id);
+            }
+            next[index] = now + pulse.interval;
         }
 
         let due = {
@@ -444,7 +470,9 @@ fn truncate(mut detail: String) -> String {
 /// The node-derived startup offset for a pulse. A pure function: the scheduler
 /// is testable without a `Mesh`, a clock or a runtime.
 pub(crate) fn startup_offset(seed: u64, pulse: &SystemPulse) -> Duration {
-    let window = pulse.interval.as_secs().max(1);
+    // A 30-minute interval must not mean a 30-minute first check. Five minutes
+    // is enough to spread a fleet without delaying a due certificate.
+    let window = pulse.interval.as_secs().min(300).max(1);
     Duration::from_secs(seed % window)
 }
 
@@ -476,11 +504,16 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn ssh_renewal_is_a_system_pulse() {
-        assert!(SYSTEM_PULSES
-            .iter()
-            .any(|pulse| pulse.id == "system.ssh-renewal"
-                && pulse.action == SystemAction::SshRenewal));
+    fn ssh_renewal_is_split_into_issuer_and_check() {
+        assert!(SYSTEM_PULSES.iter().any(|pulse| {
+            pulse.id == "system.ssh-renewal-issuer"
+                && pulse.action == SystemAction::SshRenewalIssuer
+        }));
+        assert!(SYSTEM_PULSES.iter().any(|pulse| {
+            pulse.id == "system.ssh-renewal-check"
+                && pulse.interval == Duration::from_secs(30 * 60)
+                && pulse.action == SystemAction::SshRenewalCheck
+        }));
     }
 
     #[test]
@@ -490,6 +523,8 @@ mod tests {
         assert_eq!(startup_offset(31, &pulse), Duration::from_secs(1));
         assert_eq!(startup_offset(255, &pulse), Duration::from_secs(255 % 30));
         assert!(startup_offset(u64::MAX, &pulse) < pulse.interval);
+        let slow = SYSTEM_PULSES[1];
+        assert!(startup_offset(u64::MAX, &slow) < Duration::from_secs(300));
     }
 
     #[test]

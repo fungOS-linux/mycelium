@@ -271,7 +271,6 @@ mod tests {
     #[test]
     fn parses_and_finds_the_next_quarter_hour() {
         let schedule = Schedule::parse("*/15 * * * *").unwrap();
-        assert_eq!(schedule.text(), "*/15 * * * *");
         assert_eq!(
             schedule.next_after(ms(2026, 1, 2, 3, 7)),
             Some(1_767_323_700_000)

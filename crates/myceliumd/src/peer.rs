@@ -711,6 +711,35 @@ impl Mesh {
                 }
             }
         }
+        self.issue_ssh_responses(at, &snapshot).await
+    }
+
+    /// The issuer half of SSH renewal. This must run inside the five-minute
+    /// request acceptance window, so it is a fast system pulse of its own; the
+    /// certificate check that creates a new request runs much less often.
+    pub async fn serve_ssh_renewal(&self) -> Result<(), AnyError> {
+        let at = now();
+        let snapshot: Vec<_> = self
+            .observations
+            .lock()
+            .await
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.event,
+                    PeerEvent::SshCredentialRequest(_) | PeerEvent::SshCredentialResponses(_)
+                )
+            })
+            .cloned()
+            .collect();
+        self.issue_ssh_responses(at, &snapshot).await
+    }
+
+    async fn issue_ssh_responses(
+        &self,
+        at: u64,
+        snapshot: &[SignedEnvelope],
+    ) -> Result<(), AnyError> {
         if !crate::home_dir().join("ssh/user_ca").is_file() {
             return Ok(());
         }
