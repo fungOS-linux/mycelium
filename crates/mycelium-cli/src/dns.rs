@@ -8,6 +8,13 @@ use mycelium_peer_protocol::WireGuardBinding;
 use myceliumd::protocol::Request;
 use std::path::{Path, PathBuf};
 
+/// IPv6 unique-local address (`fc00::/7`). Mycelium's overlay lives here, and
+/// an address in this range belongs to the node by identity rather than by
+/// whatever network it happens to be attached to.
+fn is_unique_local(address: IpAddr) -> bool {
+    matches!(address, IpAddr::V6(v6) if (v6.segments()[0] & 0xfe00) == 0xfc00)
+}
+
 pub(crate) fn derive_records(
     topology: &Topology,
     bindings: &[WireGuardBinding],
@@ -39,6 +46,9 @@ pub(crate) fn derive_records(
                 .or_else(|| node.hostnames.iter().next())
                 .map(|value| dns_label(value))
                 .filter(|value| !value.is_empty())
+                // Every machine has a `localhost` hostname, so it can never
+                // name a node: it would collide across the whole fleet.
+                .filter(|value| !value.eq_ignore_ascii_case("localhost"))
             else {
                 continue;
             };
@@ -47,14 +57,24 @@ pub(crate) fn derive_records(
                 .ips
                 .keys()
                 .copied()
-                .filter(|address| prefixes.iter().any(|prefix| prefix.contains(*address)))
+                // The overlay's own address space is always valid for a .myc
+                // name. Those addresses are derived from the node identity, so
+                // they are stable across networks and restarts, which is the
+                // property a DNS record needs. Binding prefixes cover
+                // everything else, and must not be allowed to hide the overlay
+                // address the name is actually for.
+                .filter(|address| {
+                    is_unique_local(*address)
+                        || prefixes.iter().any(|prefix| prefix.contains(*address))
+                })
             {
                 let name = format!("{label}.{site}.{suffix}");
-                if let Some(owner) = names.insert(name.clone(), node.id.clone()) {
-                    if owner != node.id {
-                        return Err(format!("DNS name `{name}` has competing node owners"));
-                    }
-                }
+                // Several node records can describe one machine — one per
+                // overlay network — so the same name legitimately arrives from
+                // more than one id. The invariant that matters is that a name
+                // resolves to one address, which the check below enforces;
+                // rejecting a shared owner would fail on healthy topologies.
+                names.entry(name.clone()).or_insert_with(|| node.id.clone());
                 if let Some(previous) = addresses.insert((name.clone(), address.is_ipv4()), address)
                 {
                     if previous != address {

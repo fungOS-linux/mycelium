@@ -84,12 +84,14 @@ pub fn plan(
         {
             return Err("invalid DNS record identity or address".into());
         }
-        if owners
-            .insert(record.name.clone(), record.node.clone())
-            .is_some_and(|node| node != record.node)
-        {
-            return Err("DNS name has competing node owners".into());
-        }
+        // One machine can appear as several node records — one per overlay
+        // network — so the same name legitimately arrives from more than one
+        // id. A name resolving to one address is the invariant that matters,
+        // and it is enforced where records are derived; rejecting a shared
+        // owner fails on healthy multi-overlay topologies.
+        owners
+            .entry(record.name.clone())
+            .or_insert_with(|| record.node.clone());
         if !within(&record.name, &suffix)
             || delegations.iter().any(|d| within(&record.name, &d.zone))
         {
@@ -97,6 +99,11 @@ pub fn plan(
         }
     }
     records.sort();
+    // Two node records for one machine — one per overlay network — produce
+    // identical name+address pairs that differ only in the node id. Collapse
+    // them: the resolver cares about the name and the address, not which
+    // record won.
+    records.dedup_by(|a, b| a.name == b.name && a.address == b.address);
     records.dedup();
     delegations.sort_by(|a, b| a.zone.cmp(&b.zone));
     let mut dnsmasq = format!(
