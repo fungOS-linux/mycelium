@@ -729,10 +729,47 @@ mod tests {
             derive_records(&topology, &[binding.clone()], "mycelium")
                 .unwrap()
                 .len(),
-            2
+            2,
+            "one name, both families"
         );
+        // Several node records can describe one machine -- one per overlay
+        // network -- so the same name arriving from more than one id is normal
+        // as long as it resolves to one address.
+        let mut same_machine = topology.nodes["camera"].clone();
+        same_machine.id = "camera-on-another-overlay".into();
+        topology.nodes.insert(same_machine.id.clone(), same_machine);
+        let shared = derive_records(&topology, &[binding.clone()], "mycelium").unwrap();
+        let addresses = shared
+            .iter()
+            .filter(|record| record.name == "front-camera.home.mycelium")
+            .map(|record| record.address)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            addresses,
+            [
+                "192.168.10.30".parse().unwrap(),
+                "2001:db8::30".parse().unwrap()
+            ]
+            .into_iter()
+            .collect(),
+            "another owner of the same machine must not add an address"
+        );
+
+        // The invariant that does matter: one name, two addresses, is refused
+        // rather than silently resolved to whichever node was visited last.
         let mut competing = topology.nodes["camera"].clone();
         competing.id = "other-camera".into();
+        competing.ips.clear();
+        let other = "192.168.10.31".parse().unwrap();
+        competing.ips.insert(
+            other,
+            IpRecord {
+                addr: other,
+                prefix: Some(24),
+                vlan: None,
+                origins: BTreeSet::new(),
+            },
+        );
         topology.nodes.insert(competing.id.clone(), competing);
         assert!(derive_records(&topology, &[binding], "mycelium").is_err());
     }
