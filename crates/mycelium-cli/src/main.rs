@@ -2958,7 +2958,7 @@ fn build_update_report(
     });
     let spores = serde_json::json!({
         "supported": false,
-        "reason": "Spore Store is not implemented; see mycelium-6sm2"
+        "reason": "Spore updates use the store channel; no source configured"
     });
     if json {
         return UpdateReport {

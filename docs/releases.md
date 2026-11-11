@@ -67,7 +67,7 @@ update report (channel=canary):
     fungos-edge-clean-01 0.1.37 -> 0.2.4
   unknown:
     fpl-beachhead-2 (release unrecorded)
-  spores: no catalog (Spore Store is not implemented; see mycelium-6sm2)
+  spores: no catalog (Spore updates use the store channel; no source configured)
 ```
 
 The JSON shape is the stable contract for an updater Spore:
@@ -101,7 +101,7 @@ The JSON shape is the stable contract for an updater Spore:
   ],
   "spores": {
     "supported": false,
-    "reason": "Spore Store is not implemented; see mycelium-6sm2"
+    "reason": "Spore updates use the store channel; no source configured"
   }
 }
 ```
@@ -114,10 +114,12 @@ rather than causing a false failure.
 
 An updater Spore should be a read-only renderer over the `update report --json`
 contract, not an update authority. It can show fleet propagation, per-target
-lag, staged/active state, and eventually Spore versions. Two prerequisites are
-still missing: the Spore Store/S3 signed-manifest path (`mycelium-6sm2`) and a
-narrow Mycelium read capability exposed to Soil. Until then, the CLI report is
-the supported surface and the JSON shape is the interface to build against.
+lag, staged/active state, and eventually Spore versions. Two prerequisites
+remain: a signed Spore catalog (`soil-store`; see its `docs/spore-store.md`) and
+a narrow Mycelium read capability exposed to Soil. Spore packages travel as
+CIDs on the store channel and are not applied by `mycelium update`. Until then,
+the CLI report is the supported surface and the JSON shape is the interface to
+build against.
 
 ## Signing and notarization
 
@@ -139,6 +141,8 @@ publishing its manifest. `mycelium doctor` surfaces this on macOS with
   implemented.
 - A binary built outside the signed release path has no matching digest, so
   doctor reports its release as `unrecorded` rather than guessing.
-- Spore distribution is a separate subsystem. Per `docs/soil-capabilities.md`
-  (E.6), the Spore Store is a later slice and S3 signed manifests/generations
-  must land before fetching Spores from peers or a shared store.
+- Spore distribution is a separate channel. `soil-store` builds the signed CID
+  catalog and `soil-spore` defines the package; the host install capability
+  (`soil:spore.install`) is still the gate before fetching or applying Spores
+  from peers or a shared store. `mycelium update` never treats a Spore as a
+  host binary.
