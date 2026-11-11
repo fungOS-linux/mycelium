@@ -1263,8 +1263,28 @@ fn retain(
     )
 }
 async fn supervise(settings: &Settings) -> Result<(), String> {
-    if settings.resolver.mode != ResolverMode::LocalhostOnly {
-        return Err("supervisor currently activates localhost-only".into());
+    match settings.resolver.mode {
+        ResolverMode::LocalhostOnly => {}
+        ResolverMode::Fleet => {
+            // The loopback alias is not persistent, so the fleet resolver owns it
+            // here, where it actually starts. Running as root is the whole point
+            // of the fleet job; a non-root supervisor cannot serve port 53.
+            let service = settings
+                .resolver
+                .service_address
+                .ok_or("fleet resolver mode requires resolver.service_address")?;
+            service_address::ensure(&service).map_err(|error| {
+                format!(
+                    "fleet DNS service address {} could not be installed ({error}); run `mycelium dns resolver system-install` as root",
+                    service.address()
+                )
+            })?;
+        }
+        other => {
+            return Err(format!(
+                "supervisor does not activate resolver mode {other:?}"
+            ))
+        }
     }
     let directory = state_dir()?;
     // A leftover dnsmasq from a previous supervisor keeps the port, and then

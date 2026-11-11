@@ -11,6 +11,9 @@ pub enum ResolverMode {
     Off,
     LocalhostOnly,
     LanServing,
+    /// The fleet resolver: binds `<prefix>::53` so every node answers the same
+    /// address locally. Requires a service address and port 53.
+    Fleet,
 }
 
 /// A DoH endpoint the local resolver forwards non-`.myc` names to.
@@ -121,6 +124,11 @@ impl ResolverConfig {
         additional_sites: &[String],
         blocks: &Blocklist,
     ) -> Result<String, String> {
+        // A fleet resolver without an address would serve a localhost listener
+        // while claiming to be the fleet's resolver.
+        if self.mode == ResolverMode::Fleet && self.service_address.is_none() {
+            return Err("fleet resolver mode requires resolver.service_address".into());
+        }
         let mut sites = std::collections::BTreeSet::new();
         if additional_sites.len() > 32 {
             return Err("too many additional DNS sites".into());
@@ -451,6 +459,26 @@ mod tests {
         assert!(config.render(Vec::new()).is_err());
         config.listen = vec!["[fd42:6d79:6365::53]:53".parse().unwrap()];
         assert!(config.render(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn fleet_mode_requires_a_service_address_and_answers_it_on_port_53() {
+        let mut config = config();
+        config.mode = ResolverMode::Fleet;
+        assert!(
+            config.render(Vec::new()).is_err(),
+            "fleet mode without an address is a localhost listener with a title"
+        );
+
+        config.listen = vec!["127.0.0.1:53".parse().unwrap()];
+        config.service_address = Some("fd42:6d79:6365::/48".parse().unwrap());
+        let rendered = config.render(Vec::new()).unwrap();
+        assert!(rendered.contains("listen-address=fd42:6d79:6365::53"));
+
+        let mut value = serde_json::to_value(&config).unwrap();
+        value["mode"] = serde_json::json!("fleet");
+        let parsed: ResolverConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.mode, ResolverMode::Fleet);
     }
 
     fn config() -> ResolverConfig {
