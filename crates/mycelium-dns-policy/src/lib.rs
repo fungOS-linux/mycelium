@@ -286,7 +286,7 @@ mod tests {
         }
     }
     #[test]
-    fn deterministic_dual_stack_names_but_competing_owners_fail() {
+    fn deterministic_dual_stack_names_and_one_address_per_name() {
         let r = record();
         let mut v6 = r.clone();
         v6.address = "2001:db8::12".parse().unwrap();
@@ -299,9 +299,14 @@ mod tests {
         .unwrap();
         let b = plan("lab", "mesh.example.net", vec![r.clone(), v6], vec![]).unwrap();
         assert_eq!(a.dnsmasq, b.dnsmasq);
+        // Two node records for one machine -- one per overlay network -- differ
+        // only in the node id, and the resolver cares about name and address.
+        // They collapse to one line; the "one address per name" invariant is
+        // enforced where records are derived, not here.
         let mut other = r.clone();
         other.node = "another-peer".into();
-        assert!(plan("lab", "mesh.example.net", vec![r, other], vec![]).is_err());
+        let deduped = plan("lab", "mesh.example.net", vec![r, other], vec![]).unwrap();
+        assert_eq!(deduped.dnsmasq.matches("host-record=").count(), 1);
     }
     #[test]
     fn ipv6_resolver_port_and_unknown_fields() {
