@@ -88,6 +88,14 @@ pub enum Request {
     Resources,
     /// Provider-neutral recognized services projected from topology facts.
     Services,
+    /// The L3 tunnel this daemon owns: process, identity, learned routes, and
+    /// whether its claim is currently being published.
+    IrohTunStatus,
+    /// Bounce the tunnel without restarting the daemon.
+    IrohTunRestart {
+        #[serde(default)]
+        write: bool,
+    },
     DiscoveryScopeList,
     DiscoveryScopeSet {
         observer: String,

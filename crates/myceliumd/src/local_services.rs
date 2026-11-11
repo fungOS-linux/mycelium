@@ -1,6 +1,8 @@
 //! Generic application-owned leases carried by existing signed topology gossip.
 //! No application protocol, Unibus dependency, proxying, or permission issuance.
-use fpl_resource_observation::{ServiceCatalog, ServiceObservation, SCHEMA_VERSION};
+use fpl_resource_observation::{
+    Confidence, Provenance, Service, ServiceCatalog, ServiceId, ServiceObservation, SCHEMA_VERSION,
+};
 use mycelium_core::{Observation, Origin, ServiceAdvertisement};
 use std::{collections::BTreeSet, io::Read, path::Path};
 
@@ -107,6 +109,52 @@ pub fn observe(bytes: &[u8], node: &str, now: u64) -> Result<Vec<Observation>, S
     }
     Ok(observations)
 }
+/// Build the lease the daemon publishes for a service it owns itself.
+///
+/// Deliberately the same document, validation and projection as an
+/// application-owned lease: a daemon-owned service and an application-owned one
+/// must not be able to disagree about what a well-formed observation is.
+pub fn lease(
+    node: &str,
+    service_id: &str,
+    value: Service,
+    observed_at: u64,
+    expires_at: u64,
+) -> Result<Observation, String> {
+    let observation = ServiceObservation {
+        schema_version: SCHEMA_VERSION,
+        service_id: ServiceId(service_id.to_owned()),
+        observed_at,
+        expires_at,
+        provenance: Provenance {
+            provider: "mycelium-daemon".into(),
+            observer: node.into(),
+            source_id: None,
+        },
+        confidence: Confidence::Strong,
+        value,
+    };
+    validate(&observation, node)?;
+    let encoded = serde_json::to_string(&observation).map_err(|e| e.to_string())?;
+    Ok(Observation::ServiceAdvertisement {
+        advertisement: ServiceAdvertisement {
+            instance: service_id.to_owned(),
+            service_type: SERVICE_TYPE.into(),
+            domain: format!("{node}.mycelium"),
+            target: Some(node.into()),
+            addresses: BTreeSet::new(),
+            port: None,
+            txt: BTreeSet::from([format!("observation={encoded}")]),
+            interface: None,
+            ttl: Some((expires_at - observed_at) as u32),
+            first_seen: observed_at,
+            last_seen: observed_at,
+            origins: BTreeSet::from([node.into()]),
+        },
+        origin: Origin::new(node, "daemon-service-lease"),
+    })
+}
+
 pub fn project(ad: &ServiceAdvertisement) -> Result<Option<ServiceObservation>, String> {
     if ad.service_type != SERVICE_TYPE {
         return Ok(None);

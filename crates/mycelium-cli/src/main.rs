@@ -13,6 +13,7 @@ mod gateway;
 mod host_access;
 mod host_supervisor;
 mod invite;
+mod iroh_tun;
 mod node;
 mod oidc;
 mod oidc_gateway;
@@ -161,6 +162,9 @@ usage:
   mycelium peers [--json]
   mycelium resources [show ID | watch [--once]] [--kind KIND] [--node NODE] [--json]
   mycelium services [show ID | watch [--once]] [--kind KIND] [--node NODE] [--json]
+  mycelium iroh-tun status [--json]
+  mycelium iroh-tun config [--tun IFACE] [--overlay CIDR]... [--mtu N] [--refresh-secs N]
+                            [--listen IP:PORT] [--enabled true|false] --write
   mycelium debug hardware [PEER] [--json]
   mycelium releases list [--json]
   mycelium releases keygen --path PATH --write [--json]
@@ -679,6 +683,7 @@ async fn run(cmd: &str, args: &[String]) -> Result<Vec<String>, ClientError> {
         }
         "resources" => resources(args).await,
         "services" => services(args).await,
+        "iroh-tun" => iroh_tun::run(args).await.map_err(access_error),
         "debug" if args.first().is_some_and(|argument| argument == "hardware") => {
             hardware(&args[1..]).await
         }

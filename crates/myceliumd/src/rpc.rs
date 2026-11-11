@@ -148,6 +148,9 @@ pub struct Daemon {
     networks: Mutex<BTreeMap<String, LogicalNetwork>>,
     network_bindings: Mutex<BTreeMap<String, NetworkBinding>>,
     dhcp_scopes: Mutex<BTreeMap<String, DhcpScopeIntent>>,
+    /// The L3 tunnel this daemon owns: its process, its key, and the observation
+    /// that says the node is on the overlay.
+    pub iroh_tun: Arc<crate::iroh_tun::Supervisor>,
     pub mesh: Arc<crate::peer::Mesh>,
 }
 
@@ -330,6 +333,7 @@ impl Daemon {
             networks: Mutex::new(networks),
             network_bindings: Mutex::new(network_bindings),
             dhcp_scopes: Mutex::new(dhcp_scopes),
+            iroh_tun: Arc::new(crate::iroh_tun::Supervisor::new()),
             mesh,
         };
         Ok(me)
@@ -510,6 +514,45 @@ impl Daemon {
 
     async fn converged_resources(&self) -> fpl_resource_observation::ResourceCatalog {
         crate::resources::project(self.mesh.hardware_snapshots().await)
+    }
+
+    /// Keep the tunnel alive and renew its claim.
+    ///
+    /// The observation is a lease, so it is republished well inside its own
+    /// expiry: a daemon that stops renewing stops being on the overlay, and peers
+    /// drop the route without anyone having to send a retraction.
+    async fn supervise_iroh_tun(self: Arc<Self>) {
+        const PUBLISH_EVERY_SECS: u64 = 30;
+        let node = self.mesh.node_id().to_owned();
+        let mut tick = tokio::time::interval(crate::iroh_tun::tick_interval());
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut published_at: Option<u64> = None;
+        loop {
+            tick.tick().await;
+            let now = unix_now();
+            let Some(observation) = self.iroh_tun.tick(&node, now).await else {
+                published_at = None;
+                continue;
+            };
+            if published_at.is_some_and(|at| now.saturating_sub(at) < PUBLISH_EVERY_SECS) {
+                continue;
+            }
+            let snapshot = {
+                let mut topology = self.topology.lock().await;
+                topology.observe_all([observation]);
+                topology.clone()
+            };
+            if let Err(error) = self.persist_topology().await {
+                eprintln!("myceliumd: persist iroh-tun observation: {error}");
+            }
+            match self.mesh.publish_topology(&snapshot).await {
+                Ok(()) => published_at = Some(now),
+                Err(error) => {
+                    eprintln!("myceliumd: publish iroh-tun observation: {error}");
+                    published_at = None;
+                }
+            }
+        }
     }
 
     fn recognize_advertisements(
@@ -1246,6 +1289,20 @@ impl Daemon {
             Request::Services => {
                 let topology = self.converged_topology().await?;
                 to_value(crate::services::project(&topology)).map_err(json_err)
+            }
+            Request::IrohTunStatus => {
+                to_value(self.iroh_tun.report(self.mesh.node_id(), unix_now()).await)
+                    .map_err(json_err)
+            }
+            Request::IrohTunRestart { write } => {
+                if !write {
+                    return Err(MyceliumError::WritesNotPermitted(
+                        "restarting the tunnel needs --write".into(),
+                    ));
+                }
+                self.iroh_tun.restart().await;
+                to_value(self.iroh_tun.report(self.mesh.node_id(), unix_now()).await)
+                    .map_err(json_err)
             }
             Request::DiscoveryScopeList => {
                 let scopes = self
@@ -2648,6 +2705,9 @@ impl Daemon {
             Request::Shutdown => {
                 self.persist().await?;
                 self.persist_topology().await?;
+                // The tunnel is this daemon's child. Leaving it behind would
+                // hold the tun device, and the next daemon could not open it.
+                self.iroh_tun.stop().await;
                 let home = crate::home_dir();
                 let _ = std::fs::remove_file(crate::pid_path());
                 let _ = std::fs::remove_file(home.join("myceliumd.sock"));
@@ -3220,6 +3280,8 @@ pub async fn serve() -> std::io::Result<()> {
         .start()
         .await
         .map_err(|error| std::io::Error::other(format!("peer mesh failed: {error}")))?;
+    let tunnel = daemon.clone();
+    tokio::spawn(async move { tunnel.supervise_iroh_tun().await });
     eprintln!(
         "myceliumd {} listening on {}",
         crate::VERSION,
@@ -3438,6 +3500,7 @@ mod tests {
             saved: Mutex::new(BTreeMap::new()),
             credential_rules: Mutex::new(BTreeMap::new()),
             discovery_scopes: Mutex::new(BTreeMap::new()),
+            iroh_tun: Arc::new(crate::iroh_tun::Supervisor::new()),
             allocations: Mutex::new(BTreeMap::new()),
             networks: Mutex::new(BTreeMap::new()),
             network_bindings: Mutex::new(BTreeMap::new()),
