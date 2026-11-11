@@ -14,7 +14,7 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .enable_all()
         .build()?;
     runtime.block_on(mycelium_gateway::server::run_with_options(
-        config.listen,
+        vec![config.listen],
         config.routes,
         config.token_file,
         config.reload_secs,
