@@ -140,6 +140,16 @@ impl Purpose {
     pub fn mcp_invoke() -> Self {
         Self("mcp.invoke".into())
     }
+
+    /// Sign a Spore package, its lock, or its catalog entry.
+    pub fn spore_package_sign() -> Self {
+        Self("spore.package.sign".into())
+    }
+
+    /// Sign a store operator's delegation of a publisher key.
+    pub fn store_delegation_sign() -> Self {
+        Self("store.delegation.sign".into())
+    }
 }
 
 impl fmt::Display for Purpose {
@@ -185,6 +195,7 @@ pub enum CredentialKind {
     OtpSecret,
     Passkey,
     Certificate,
+    PgpKey,
 }
 
 impl CredentialKind {
@@ -198,6 +209,7 @@ impl CredentialKind {
             Self::OtpSecret => "otp_secret",
             Self::Passkey => "passkey",
             Self::Certificate => "certificate",
+            Self::PgpKey => "pgp_key",
         }
     }
 }

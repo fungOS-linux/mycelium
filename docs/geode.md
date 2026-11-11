@@ -25,7 +25,7 @@ Opaque secret bytes plus minimal non-secret metadata:
 
 - `kind` — descriptive only: `opaque`, `api_key`, `oauth2_access_token`,
   `oauth2_refresh_token`, `oauth2_id_token`, `otp_secret`, `passkey`,
-  `certificate`. Protocol behaviour still lives in connectors.
+  `certificate`, `pgp_key`. Protocol behaviour still lives in connectors.
 - `label` — optional operator-facing name, bounded and control-character free.
 - `created_at`, `rotated_at`, `last_used_at` — epoch seconds.
 - `expires_at` — absolute credential expiry, distinct from a lease's expiry.
@@ -38,8 +38,8 @@ leak, not a feature. If geode ever becomes a vault, a field-by-field metadata
 review comes first.
 
 Credentials are grouped into **optional connector crates** rather than a runtime
-plugin ABI: `geode-passkey`, `geode-otp`, and `geode-oauth` today, with Composio
-and fpl-auth handled as reference conventions. See
+plugin ABI: `geode-passkey`, `geode-otp`, `geode-oauth`, and `geode-pgp` today,
+with Composio and fpl-auth handled as reference conventions. See
 [geode connectors](geode-connectors.md).
 
 ## Invariants enforced by the store, not the backend
