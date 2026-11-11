@@ -8,24 +8,28 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         return Err("--packaged requires the installed owner-built Mycelium Debian package".into());
     }
     let system_service = packaged || args.iter().any(|argument| argument == "--system-service");
-    let local_gateway = args.iter().any(|argument| argument == "--local-gateway");
+    // A peer is only useful if its services are reachable: an enrolled node with
+    // no gateway answers no .myc name and reaches nothing on the mesh. So the
+    // local gateway is part of enrollment, not a follow-up step. Packaged
+    // installs own their units; --no-local-gateway opts out.
+    let local_gateway = !packaged && !args.iter().any(|argument| argument == "--no-local-gateway");
     let trust_gateway = args.iter().any(|argument| argument == "--trust-cert");
     if trust_gateway && !local_gateway {
-        return Err("--trust-cert requires --local-gateway".into());
-    }
-    if local_gateway && packaged {
-        return Err("--local-gateway is not available in the packaged system installation".into());
+        return Err("--trust-cert requires a local gateway".into());
     }
     let home = value(args, "--path").map(expand_home).unwrap_or_else(|| {
-        if packaged { PathBuf::from(crate::packaged::HOME) } else { myceliumd::home_dir() }
+        if packaged {
+            PathBuf::from(crate::packaged::HOME)
+        } else {
+            myceliumd::home_dir()
+        }
     });
-    if packaged { crate::packaged::validate(&home, system_service)?; }
+    if packaged {
+        crate::packaged::validate(&home, system_service)?;
+    }
     if args.iter().any(|argument| argument == "--repair") {
-        let mut lines = crate::enroll::repair_peer_service(
-            &home,
-            value(args, "--site"),
-            system_service,
-        )?;
+        let mut lines =
+            crate::enroll::repair_peer_service(&home, value(args, "--site"), system_service)?;
         lines.extend(install_local_gateway(local_gateway, &home, trust_gateway).await?);
         // DNS is optional by design, so a resolver that cannot start is
         // reported here rather than turning a good peer repair into a failure.
@@ -39,10 +43,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     if value(args, "--claim").is_some() && claim_path.is_some() {
         return Err("setup accepts only one of --claim or --claim-file".into());
     }
-    let claim_from_file = claim_path
-        .as_deref()
-        .map(read_claim_file)
-        .transpose()?;
+    let claim_from_file = claim_path.as_deref().map(read_claim_file).transpose()?;
     let claim = value(args, "--claim").or(claim_from_file.as_deref());
     let embedded = claim
         .map(crate::invite::decode_pair_claim)
@@ -156,7 +157,10 @@ fn read_claim_file(path: &Path) -> Result<String, String> {
     let metadata = fs::metadata(path)
         .map_err(|error| format!("read claim metadata {}: {error}", path.display()))?;
     if !metadata.is_file() {
-        return Err(format!("claim file is not a regular file: {}", path.display()));
+        return Err(format!(
+            "claim file is not a regular file: {}",
+            path.display()
+        ));
     }
     #[cfg(unix)]
     {
@@ -201,9 +205,12 @@ async fn setup_peer(
         crate::packaged::validate_new_peer(&home, system_service)?;
         crate::packaged::private_home(&home)?;
     }
-    if claim.0.starts_with("iroh-pair:") && (home.join("iroh-sync.json").exists()
-        || home.join("pki/node-key.pem").exists()) {
-        return Err("refusing new-peer enrollment over an existing peer identity/configuration".into());
+    if claim.0.starts_with("iroh-pair:")
+        && (home.join("iroh-sync.json").exists() || home.join("pki/node-key.pem").exists())
+    {
+        return Err(
+            "refusing new-peer enrollment over an existing peer identity/configuration".into(),
+        );
     }
     let staging = home.join("enrollment-staging");
     fs::create_dir_all(&staging)
@@ -237,7 +244,11 @@ async fn setup_peer(
             "extendedKeyUsage=serverAuth,clientAuth",
         ],
     )?;
-    let ssh_dir = if packaged { home.join("ssh") } else { user_home()?.join(".ssh") };
+    let ssh_dir = if packaged {
+        home.join("ssh")
+    } else {
+        user_home()?.join(".ssh")
+    };
     let ssh_key = ssh_dir.join("id_ed25519");
     let ssh_public = PathBuf::from(format!("{}.pub", ssh_key.display()));
     if !ssh_key.is_file() || !ssh_public.is_file() {
