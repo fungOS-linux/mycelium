@@ -113,17 +113,48 @@ matters here rather than being a side quest.
   side must verify that signature and must not accept an unsigned actor header
   from any other source.
 
+## Ingress policy
+
+A published name has two independent properties. Both default to the narrow
+value, so a name is private and unauthenticated-by-omission until its owner says
+otherwise:
+
+| | `auth = none` | `auth = optional` | `auth = required` |
+|---|---|---|---|
+| **public** | static content; no identity | guests allowed, identity when signed in (store, rooms) | SSO required (home) |
+| **overlay** | fleet only | fleet only, identity when present | fleet only + SSO |
+
+- `visibility` is `overlay` unless the lease asks for `public`; `auth` is `none`
+  unless the lease asks for more. A public name still needs an edge route, and a
+  zone may tighten a name (public to overlay, none to optional to required) but
+  never loosen one.
+- `optional` never rejects. The edge guarantees `soil:principal` is always
+  present — `oidc:<issuer>#<subject>` when a session exists, `anon:<opaque>`
+  otherwise — and strips any inbound copy of that header first, so an upstream may
+  trust it. Feature elevation ("more if signed in") is the application's job.
+- Guests get a stable `anon:` identity from an `HttpOnly; Secure; SameSite=Lax`
+  cookie minted on first visit. Stable enough for rate limits and carts, and not
+  a login.
+- `required` reuses the Vouch redirect; an anonymous request never reaches the
+  upstream.
+- Audience and group checks are deliberately out of scope here: whether a
+  principal may use a name is a Mycelium grant / OIDC ACL question, not an edge
+  question. For now `required` means "any principal from the configured issuer".
+- The overlay DNS address (`<prefix>::53`) is never published publicly. A public
+  AAAA for a ULA only invites queries nobody can answer.
+
 ## Order of work
 
 The edge does not have to be built before it is useful. The local loopback
 gateway is already an edge; everything else is an outer ring.
 
-1. **Names come from the catalog.** An application lease may claim its names in
-   a `hosts` attribute, and the gateway derives its host table from the catalog
-   instead of `~/.mycelium/gateway/routes.json`. `routes.json` stays only for
-   overrides that no service can express, such as a public fallback upstream or a
-   per-route token. Until this lands, every node needs a hand-edited route file,
-   which is the opposite of anycast.
+1. **Names come from the catalog.** A lease publishes its labels in
+   `value.names`; the daemon composes them with the zone suffix and every consumer
+   reads that one projection, so the gateway derives its host table from the
+   catalog instead of `~/.mycelium/gateway/routes.json`. `routes.json` stays only
+   for overrides that no service can express, such as a public fallback upstream
+   or a per-route token. Until this lands, every node needs a hand-edited route
+   file, which is the opposite of anycast.
 2. **Principal.** Palisade already answers who: vouch, mTLS or bearer, one
    per-location choice. What is missing is turning its assertion into Soil's
    `oidc:<issuer>#<subject>` and refusing an unsigned actor header. This is
