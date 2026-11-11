@@ -1651,7 +1651,12 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
             "dns supports `zone`, read-only `plan`, `resolver` and `blocklist`",
         ));
     }
-    let mut suffix = "mycelium";
+    // `.myc` is the namespace. `mycelium` was a placeholder that outlived the
+    // naming decision and silently published records under a name nothing
+    // resolves — including the AAAA records for the overlay's own addresses.
+    // A node's certificate carries the suffix it actually belongs to; `--suffix`
+    // overrides this for looking at another site's namespace.
+    let mut suffix = "myc";
     let mut site = None;
     let mut delegation_file = None;
     let mut json = false;
