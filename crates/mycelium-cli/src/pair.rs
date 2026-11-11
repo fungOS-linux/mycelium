@@ -69,9 +69,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     // Without a relay the claim carries only direct addrs, and redemption
     // times out with nothing to explain why. Opt out with --no-public-relays
     // only when both ends are known to share a reachable network.
-    let public_relays = !args
-        .iter()
-        .any(|argument| argument == "--no-public-relays");
+    let public_relays = !args.iter().any(|argument| argument == "--no-public-relays");
     create_args.retain(|argument| argument != "--no-public-relays");
     if value(args, "--invite-store").is_none() {
         create_args.extend([

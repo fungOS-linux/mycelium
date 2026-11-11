@@ -23,6 +23,7 @@ pub mod credential_map;
 pub mod credential_provider;
 mod execution;
 mod hardware;
+pub mod iroh_tun;
 pub mod peer;
 pub mod pulse;
 #[cfg(feature = "iroh-sync")]

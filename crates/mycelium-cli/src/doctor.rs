@@ -39,6 +39,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
 
     let mut checks = Vec::new();
     let mut fix_lines = Vec::new();
+    let mut catalog: Option<Value> = None;
     if fix {
         match crate::gateway::install_default(&home, trust).await {
             Ok(lines) => fix_lines.extend(lines),
@@ -93,12 +94,37 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
                     status,
                     format!("{fresh} fresh endpoint observation(s), {total} total"),
                 );
+                catalog = Some(services);
             }
             Err(error) => add(
                 &mut checks,
                 "services",
                 "warn",
                 format!("catalog unavailable: {error}"),
+            ),
+        }
+    }
+
+    if let Some(client) = client.as_mut() {
+        match daemon_call(client, &Request::IrohTunStatus).await {
+            Ok(mut status) => {
+                if fix {
+                    match restart_tunnel(client, &status).await {
+                        Ok(Some((line, refreshed))) => {
+                            fix_lines.push(line);
+                            status = refreshed;
+                        }
+                        Ok(None) => {}
+                        Err(error) => add(&mut checks, "iroh-tun fix", "fail", error),
+                    }
+                }
+                iroh_tun_checks(&mut checks, &status, catalog.as_ref());
+            }
+            Err(error) => add(
+                &mut checks,
+                "iroh-tun",
+                "warn",
+                format!("status unavailable: {error}"),
             ),
         }
     }
@@ -338,6 +364,157 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
     );
 }
 
+/// The two questions the design says doctor must answer without `ifconfig`:
+/// is the kind published, and does the tunnel have a route?
+///
+/// `ifconfig` only proves a device exists. A device with no peers looks exactly
+/// like a healthy one from the outside, which is how the overlay stayed
+/// undiscoverable while appearing to run.
+fn iroh_tun_checks(checks: &mut Vec<Value>, status: &Value, catalog: Option<&Value>) {
+    if let Some(error) = status["config_error"].as_str() {
+        add(checks, "iroh-tun config", "fail", error.to_owned());
+        return;
+    }
+    if !status["enabled"].as_bool().unwrap_or(false) {
+        add(
+            checks,
+            "iroh-tun",
+            "warn",
+            format!(
+                "not configured ({}); enable with `mycelium iroh-tun config --tun IFACE --overlay CIDR --write`",
+                status["config"].as_str().unwrap_or("iroh-tun.json")
+            ),
+        );
+        return;
+    }
+    let node = status["node"].as_str().unwrap_or_default();
+    let now = now_secs();
+    let published = catalog
+        .and_then(|catalog| catalog["observations"].as_array())
+        .is_some_and(|observations| {
+            observations.iter().any(|observation| {
+                observation["value"]["kind"].as_str() == Some("iroh-tun")
+                    && observation["value"]["attributes"]["node_id"].as_str() == Some(node)
+                    && observation["expires_at"].as_u64().unwrap_or(0) > now
+            })
+        });
+    let running = status["running"].as_bool().unwrap_or(false);
+    let publishing = status["publishing"].as_bool().unwrap_or(false);
+    let routes = status["routes"].as_array().map_or(0, Vec::len);
+    let prefixes = status["overlay"].as_array().map_or(0, Vec::len);
+    let tun = status["tun"].as_str().unwrap_or("tun");
+    add(
+        checks,
+        "iroh-tun publish",
+        if published { "ok" } else { "fail" },
+        if published {
+            format!("{node} publishes kind iroh-tun for {prefixes} prefix(es)")
+        } else if publishing {
+            "the tunnel is up; the daemon publishes it on its next renewal".into()
+        } else {
+            "the catalog has no fresh iroh-tun observation for this node".into()
+        },
+    );
+    let (status_word, detail) = if running && publishing {
+        (
+            if routes > 0 { "ok" } else { "warn" },
+            format!(
+                "{tun} up, {routes} peer prefix(es) learned, status {}s old",
+                status["status_age_secs"]
+            ),
+        )
+    } else if running {
+        (
+            "fail",
+            format!(
+                "{tun} is alive but not reporting: {} (log: {})",
+                first_line(status, &["last_error", "last_exit"]),
+                status["log"].as_str().unwrap_or("?")
+            ),
+        )
+    } else {
+        (
+            "fail",
+            format!(
+                "not running: {} (log: {})",
+                first_line(status, &["last_exit", "last_error"]),
+                status["log"].as_str().unwrap_or("?")
+            ),
+        )
+    };
+    add(checks, "iroh-tun tunnel", status_word, detail);
+    if routes == 0 && running && publishing {
+        // Not a failure: the first node in a fleet has no peers to learn from
+        // and has to run before a second node can exist.
+        add(
+            checks,
+            "iroh-tun peers",
+            "warn",
+            "no peers yet; expected for the first node on an overlay".into(),
+        );
+    }
+}
+
+fn first_line(status: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| status[*key].as_str())
+        .unwrap_or("no status document")
+        .to_owned()
+}
+
+/// `--fix` repairs only what needs no invention: a tunnel that is configured and
+/// not working gets bounced. It never writes configuration or picks an interface.
+///
+/// It waits for the result. A repair command that prints "fixed" next to a
+/// failing check is worse than no repair at all, because it teaches the operator
+/// to ignore both lines.
+async fn restart_tunnel(
+    client: &mut Client,
+    status: &Value,
+) -> Result<Option<(String, Value)>, String> {
+    if !status["enabled"].as_bool().unwrap_or(false) {
+        return Ok(None);
+    }
+    if status["running"].as_bool().unwrap_or(false)
+        && status["publishing"].as_bool().unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    daemon_call(client, &Request::IrohTunRestart { write: true })
+        .await
+        .map_err(|error| error.to_string())?;
+    // The supervisor ticks on its own cadence; give it one full tick plus the
+    // child's first status write before deciding the bounce worked.
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    let mut latest = daemon_call(client, &Request::IrohTunStatus)
+        .await
+        .map_err(|error| error.to_string())?;
+    while std::time::Instant::now() < deadline {
+        if latest["publishing"].as_bool().unwrap_or(false) {
+            return Ok(Some((
+                "iroh-tun: bounced the tunnel; it is publishing".into(),
+                latest,
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        latest = daemon_call(client, &Request::IrohTunStatus)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let reason = first_line(&latest, &["last_error", "last_exit"]);
+    Ok(Some((
+        format!("iroh-tun: bounced the tunnel, still not publishing: {reason}"),
+        latest,
+    )))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn add(checks: &mut Vec<Value>, name: &str, status: &'static str, detail: String) {
     checks.push(json!({"name": name, "status": status, "detail": detail}));
 }
@@ -504,10 +681,7 @@ async fn daemon_call(
 }
 
 fn service_count(value: &Value) -> (usize, usize) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = now_secs();
     let observations = value
         .get("observations")
         .and_then(Value::as_array)

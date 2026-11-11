@@ -131,9 +131,16 @@ async fn start_gateway(
     )
     .unwrap();
     let handle = tokio::spawn(async move {
-        server::run_with_options(address, Some(route_path), None, 0, None, Some(usage_path))
-            .await
-            .expect("gateway should run");
+        server::run_with_options(
+            vec![address],
+            Some(route_path),
+            None,
+            0,
+            None,
+            Some(usage_path),
+        )
+        .await
+        .expect("gateway should run");
     });
     (address, handle)
 }

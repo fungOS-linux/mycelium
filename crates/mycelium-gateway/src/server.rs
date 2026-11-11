@@ -75,7 +75,15 @@ pub async fn run_with_tls(
     reload_secs: u64,
     tls: Option<(PathBuf, PathBuf)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_options(vec![listen], config_path, token_file, reload_secs, tls, None).await
+    run_with_options(
+        vec![listen],
+        config_path,
+        token_file,
+        reload_secs,
+        tls,
+        None,
+    )
+    .await
 }
 
 /// `usage_path` is where token counters are persisted for `myceliumd` to
