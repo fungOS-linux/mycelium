@@ -44,6 +44,19 @@ pub struct SystemPulse {
     pub id: &'static str,
     pub interval: Duration,
     pub action: SystemAction,
+    pub startup: Startup,
+}
+
+/// How a pulse's first fire is scheduled after the daemon starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Startup {
+    /// Spread the first fire across the fleet so a restart is not a herd. The
+    /// offset is node-derived and bounded to five minutes.
+    Jittered,
+    /// Fire as soon as the daemon is up. Work that may already be due — an
+    /// expired credential, a peer waiting for an answer — must not wait for
+    /// the spread window, because the interval can be half an hour long.
+    Immediate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,26 +81,31 @@ pub const SYSTEM_PULSES: [SystemPulse; 5] = [
         id: "system.ssh-renewal-issuer",
         interval: Duration::from_secs(30),
         action: SystemAction::SshRenewalIssuer,
+        startup: Startup::Immediate,
     },
     SystemPulse {
         id: "system.ssh-renewal-check",
         interval: Duration::from_secs(30 * 60),
         action: SystemAction::SshRenewalCheck,
+        startup: Startup::Immediate,
     },
     SystemPulse {
         id: "system.gateway-certificate",
         interval: Duration::from_secs(24 * 60 * 60),
         action: SystemAction::GatewayCertificate,
+        startup: Startup::Jittered,
     },
     SystemPulse {
         id: "system.peer-certificate",
         interval: Duration::from_secs(24 * 60 * 60),
         action: SystemAction::PeerCertificate,
+        startup: Startup::Jittered,
     },
     SystemPulse {
         id: "system.ca-certificate",
         interval: Duration::from_secs(24 * 60 * 60),
         action: SystemAction::CaCertificate,
+        startup: Startup::Jittered,
     },
 ];
 
@@ -596,11 +614,17 @@ fn truncate(mut detail: String) -> String {
 
 /// The node-derived startup offset for a pulse. A pure function: the scheduler
 /// is testable without a `Mesh`, a clock or a runtime.
+///
+/// Only jittered pulses are spread. A pulse whose work may already be due fires
+/// at zero, because its interval can be half an hour and there is no second
+/// chance until then.
 pub(crate) fn startup_offset(seed: u64, pulse: &SystemPulse) -> Duration {
-    // A 30-minute interval must not mean a 30-minute first check. Five minutes
-    // is enough to spread a fleet without delaying a due certificate.
-    let window = pulse.interval.as_secs().min(300).max(1);
-    Duration::from_secs(seed % window)
+    match pulse.startup {
+        Startup::Immediate => Duration::ZERO,
+        // A 30-minute interval must not mean a 30-minute first check. Five
+        // minutes is enough to spread a fleet across a restart.
+        Startup::Jittered => Duration::from_secs(seed % pulse.interval.as_secs().min(300).max(1)),
+    }
 }
 
 /// A stable 0..60s offset so two nodes do not fire the same user pulse on the
@@ -627,7 +651,7 @@ fn default_true() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{jitter_ms, startup_offset, SystemAction, SYSTEM_PULSES};
+    use super::{jitter_ms, startup_offset, Startup, SystemAction, SYSTEM_PULSES};
     use std::time::Duration;
 
     #[test]
@@ -643,15 +667,38 @@ mod tests {
         }));
     }
 
+    /// An expired credential is already due when the daemon starts, and the
+    /// check only runs again in half an hour: the first fire cannot be jittered.
+    #[test]
+    fn renewal_pulses_fire_at_startup() {
+        for pulse in SYSTEM_PULSES.iter().filter(|pulse| {
+            matches!(
+                pulse.action,
+                SystemAction::SshRenewalIssuer | SystemAction::SshRenewalCheck
+            )
+        }) {
+            assert_eq!(pulse.startup, Startup::Immediate, "{}", pulse.id);
+            assert_eq!(
+                startup_offset(u64::MAX, pulse),
+                Duration::ZERO,
+                "{}",
+                pulse.id
+            );
+        }
+    }
+
     #[test]
     fn startup_offset_is_bounded_and_node_derived() {
-        let pulse = SYSTEM_PULSES[0];
+        let pulse = *SYSTEM_PULSES
+            .iter()
+            .find(|pulse| pulse.action == SystemAction::GatewayCertificate)
+            .unwrap();
+        assert_eq!(pulse.startup, Startup::Jittered);
         assert_eq!(startup_offset(0, &pulse), Duration::ZERO);
-        assert_eq!(startup_offset(31, &pulse), Duration::from_secs(1));
-        assert_eq!(startup_offset(255, &pulse), Duration::from_secs(255 % 30));
+        assert_eq!(startup_offset(31, &pulse), Duration::from_secs(31));
+        assert_eq!(startup_offset(255, &pulse), Duration::from_secs(255));
+        assert!(startup_offset(u64::MAX, &pulse) < Duration::from_secs(300));
         assert!(startup_offset(u64::MAX, &pulse) < pulse.interval);
-        let slow = SYSTEM_PULSES[1];
-        assert!(startup_offset(u64::MAX, &slow) < Duration::from_secs(300));
     }
 
     #[test]
