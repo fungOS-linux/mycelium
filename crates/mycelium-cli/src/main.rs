@@ -20,6 +20,7 @@ mod packaged;
 mod pair;
 #[cfg(feature = "iroh-sync")]
 mod pair_iroh;
+mod pulse;
 mod setup;
 mod skills;
 mod ssh_access;
@@ -66,6 +67,7 @@ fn main() {
         }
         Some("_self-check") => Ok(vec![self_check()]),
         Some("completions") => completions::command(&args[1..], USAGE),
+        Some("pulse") => rt_block(pulse::command(&args[1..])),
         Some(other) => rt_block(run(other, &args[1..])),
         None => Ok(usage()),
     };
@@ -120,6 +122,11 @@ usage:
   mycelium setup --packaged --claim-file PATH | --packaged --repair
   mycelium gateway status [--json]
   mycelium gateway usage [--json] [--fleet]
+  mycelium pulse list [--json]
+  mycelium pulse add --schedule CRON --command CMD [--id ID] [--disabled] --write
+  mycelium pulse remove ID --write
+  mycelium pulse toggle ID --write
+  mycelium pulse runs [ID] [--limit N] [--json]
   mycelium gateway install [--write|--dry-run] [--trust-cert] [--routes PATH] [--cert PATH --key PATH] [--gateway-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]
   mycelium gateway uninstall [--write|--dry-run]
   mycelium doctor [--json] [--fix] [--trust-cert]
