@@ -238,28 +238,45 @@ pub fn renewal_request(
     }
     let material =
         fs::read_to_string(public_key).map_err(|error| format!("read SSH public key: {error}"))?;
+    if let Some(request) = pending(key, now)? {
+        if request.public_key == material {
+            return Ok(Some(request));
+        }
+    }
     let request_id = format!(
         "{}-{now}",
         &mycelium_peer_protocol::encode_hex(key.verifying_key().as_bytes())[..16]
     );
-    let pending = home.join("ssh/renewal-pending.json");
-    if let Ok(bytes) = fs::read(&pending) {
-        let request: SshRenewalRequest =
-            serde_json::from_slice(&bytes).map_err(|e| format!("invalid pending renewal: {e}"))?;
-        if now >= request.requested_at
-            && now - request.requested_at < 240
-            && request.node_id == mycelium_peer_protocol::encode_hex(key.verifying_key().as_bytes())
-            && request.public_key == material
-        {
-            request.verify()?;
-            return Ok(Some(request));
-        }
-    }
     let request = SshRenewalRequest::sign(request_id, now, material, key)?;
     atomic_write(
-        &pending,
+        &home.join("ssh/renewal-pending.json"),
         &serde_json::to_vec(&request).map_err(|e| e.to_string())?,
     )?;
+    Ok(Some(request))
+}
+
+/// The request this node is still waiting on, if any.
+///
+/// A response is installed only when it answers this request, so a late
+/// response to a superseded request cannot replace a newer certificate. The
+/// window matches the issuer's five-minute acceptance window: past it the
+/// request can no longer be answered and must be re-signed.
+pub fn pending(
+    key: &ed25519_dalek::SigningKey,
+    now: u64,
+) -> Result<Option<SshRenewalRequest>, String> {
+    let path = crate::home_dir().join("ssh/renewal-pending.json");
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(None);
+    };
+    let request: SshRenewalRequest =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid pending renewal: {e}"))?;
+    let node_id = mycelium_peer_protocol::encode_hex(key.verifying_key().as_bytes());
+    if now < request.requested_at || now - request.requested_at >= 240 || request.node_id != node_id
+    {
+        return Ok(None);
+    }
+    request.verify()?;
     Ok(Some(request))
 }
 

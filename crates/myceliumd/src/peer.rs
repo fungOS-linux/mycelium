@@ -668,6 +668,9 @@ impl Mesh {
                     .await?;
             }
         }
+        // Catch-up for a response that arrived before this process started: the
+        // live path is `merge`, which installs on arrival.
+        self.install_pending_ssh_renewal(at).await?;
         let snapshot: Vec<_> = self
             .observations
             .lock()
@@ -681,37 +684,60 @@ impl Mesh {
             })
             .cloned()
             .collect();
-        if let Some(request) = &pending {
-            for envelope in &snapshot {
-                let PeerEvent::SshCredentialResponses(deliveries) = &envelope.event else {
-                    continue;
-                };
-                for delivery in deliveries.iter().filter(|d| {
-                    d.node_id == self.hello.node_id
-                        && d.response.request_id == request.request_id
-                        && d.response.certificate.is_some()
-                }) {
-                    let response = delivery.response.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        crate::ssh_renewal::install(&response, at)
-                    })
-                    .await?
-                    {
-                        Ok(()) => {
-                            eprintln!(
-                                "myceliumd: installed CA-verified renewed SSH certificate from {}",
-                                envelope.origin
-                            );
-                            break;
-                        }
-                        Err(error) => {
-                            eprintln!("myceliumd: reject gossiped SSH credential: {error}")
-                        }
+        self.issue_ssh_responses(at, &snapshot).await
+    }
+
+    /// Install the response to the request this node is waiting on, if a
+    /// gossiped response answers it. Returns whether a certificate was
+    /// installed.
+    ///
+    /// This runs when a response is merged, not only on the renewal pulse: the
+    /// pulse is half an hour apart, and the request it answers is only accepted
+    /// for five minutes.
+    async fn install_pending_ssh_renewal(&self, at: u64) -> Result<bool, AnyError> {
+        let key = self.key.clone();
+        let Some(request) =
+            tokio::task::spawn_blocking(move || crate::ssh_renewal::pending(&key, at)).await??
+        else {
+            return Ok(false);
+        };
+        let snapshot: Vec<_> = self
+            .observations
+            .lock()
+            .await
+            .values()
+            .filter(|e| matches!(e.event, PeerEvent::SshCredentialResponses(_)))
+            .cloned()
+            .collect();
+        for envelope in &snapshot {
+            let PeerEvent::SshCredentialResponses(deliveries) = &envelope.event else {
+                continue;
+            };
+            for delivery in deliveries.iter().filter(|d| {
+                d.node_id == self.hello.node_id
+                    && d.response.request_id == request.request_id
+                    && d.response.certificate.is_some()
+            }) {
+                let response = delivery.response.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::ssh_renewal::install(&response, at)
+                })
+                .await?
+                {
+                    Ok(()) => {
+                        eprintln!(
+                            "myceliumd: installed CA-verified renewed SSH certificate from {}",
+                            envelope.origin
+                        );
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        eprintln!("myceliumd: reject gossiped SSH credential: {error}")
                     }
                 }
             }
         }
-        self.issue_ssh_responses(at, &snapshot).await
+        Ok(false)
     }
 
     /// The issuer half of SSH renewal. This must run inside the five-minute
@@ -1212,6 +1238,7 @@ impl Mesh {
 
     async fn merge(&self, incoming: Vec<SignedEnvelope>) -> Result<(), AnyError> {
         let mut changed = false;
+        let mut credential_response = false;
         let mut observations = self.observations.lock().await;
         let mut incoming = incoming;
         incoming.sort_by_key(|envelope| !matches!(envelope.event, PeerEvent::Authority(_)));
@@ -1246,6 +1273,8 @@ impl Mesh {
                 .map(|current| envelope.sequence > current.sequence)
                 .unwrap_or(true);
             if replace {
+                credential_response |=
+                    matches!(envelope.event, PeerEvent::SshCredentialResponses(_));
                 observations.insert(key, envelope);
                 changed = true;
             }
@@ -1254,6 +1283,12 @@ impl Mesh {
         drop(observations);
         if let Some(values) = values {
             tokio::task::spawn_blocking(move || persist_observations(&values)).await??;
+        }
+        // A renewal response is installed when it arrives. Waiting for the
+        // half-hourly check would let it age out of the five-minute window it
+        // was signed inside.
+        if credential_response {
+            self.install_pending_ssh_renewal(now()).await?;
         }
         Ok(())
     }
