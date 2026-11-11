@@ -1,14 +1,12 @@
 //! DNS aliases from application-owned leases, never scanned listeners or ACLs.
 use super::Settings;
 use fpl_resource_observation::ServiceCatalog;
-use mycelium_dns_policy::service_names::{
-    project_service_names, ServiceHost, APPLICATION_OWNER_LEASE,
-};
+use mycelium_dns_policy::service_names::project_service_records;
+use mycelium_dns_policy::settings::Policy;
 use mycelium_dns_policy::{canonical_domain, DnsRecord};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
-    net::IpAddr,
 };
 
 /// Explicit local plugin files supply labels, never records or authority.
@@ -75,27 +73,6 @@ pub(super) fn validate_aliases(aliases: &BTreeMap<String, String>) -> Result<(),
     Ok(())
 }
 
-/// Alias plugins are local policy the daemon cannot evaluate, so the DNS adapter
-/// fills the names a published catalog left empty. A published name wins.
-fn with_fallback_names(
-    catalog: &ServiceCatalog,
-    aliases: &BTreeMap<String, String>,
-    suffix: &str,
-) -> ServiceCatalog {
-    let mut catalog = catalog.clone();
-    for observation in &mut catalog.observations {
-        if observation.provenance.provider != APPLICATION_OWNER_LEASE
-            || !observation.value.names.is_empty()
-        {
-            continue;
-        }
-        if let Some(label) = aliases.get(&observation.value.kind) {
-            observation.value.names = vec![format!("{label}.{suffix}")];
-        }
-    }
-    catalog
-}
-
 pub(super) fn project(
     settings: &Settings,
     mut records: Vec<DnsRecord>,
@@ -103,37 +80,20 @@ pub(super) fn project(
     now: u64,
     mut deadline: u64,
 ) -> Result<(Vec<DnsRecord>, u64), String> {
-    let originals = records.clone();
-    let hosts = originals
-        .iter()
-        .map(|record| ServiceHost {
-            name: record.name.clone(),
-            address: record.address,
-            node: record.node.clone(),
-        })
-        .collect::<Vec<_>>();
-    // The naming rule is shared with the gateway; this is only the DNS half.
-    let published = with_fallback_names(catalog, &aliases(settings)?, &settings.resolver.suffix);
-    let projected = project_service_names(
-        &settings.service_index_peers,
-        &settings.resolver.suffix,
-        &hosts,
-        &published,
-        now,
-    )?;
-    let mut entrances: BTreeMap<(String, IpAddr), String> = BTreeMap::new();
-    for entry in projected {
-        // One entrance per name/address: DNS cannot choose a port or URL.
-        if entrances
-            .insert((entry.name.clone(), entry.address), entry.endpoint.clone())
-            .is_some_and(|old| old != entry.endpoint)
-        {
-            return Err("ambiguous service entrance; DNS cannot select ports".into());
-        }
-        let mut record = originals[entry.host].clone();
-        record.name = entry.name;
-        records.push(record);
-        deadline = deadline.min(entry.expires_at);
+    // The naming policy as the resolver installs it, handed to the rule that
+    // every other adapter uses. This adapter contributes no naming logic of its
+    // own: it renders the records the rule produced.
+    let naming = Policy {
+        service_aliases: aliases(settings)?,
+        service_index_peers: settings.service_index_peers.clone(),
+        reachable_prefixes: settings.reachable_prefixes.clone(),
+        suffix: settings.resolver.suffix.clone(),
+        site: settings.resolver.site.clone(),
+    };
+    let (services, expiry) = project_service_records(&naming, &records, catalog, now)?;
+    records.extend(services);
+    if let Some(expiry) = expiry {
+        deadline = deadline.min(expiry);
     }
     records.sort();
     records.dedup();
@@ -296,6 +256,32 @@ mod tests {
         let (records, expiry) = run(&catalog()).unwrap();
         assert_eq!(expiry, 1050);
         assert!(records.iter().any(|r| r.name == "unibus.neo.lab.myc"));
+    }
+    /// The adapter adds no naming logic: a ULA host record yields a ULA answer
+    /// for the service name, exactly as the CLI preview does.
+    #[test]
+    fn an_overlay_host_record_gives_the_service_an_overlay_answer() {
+        let mut s = crate::tests::settings();
+        s.service_aliases
+            .insert("unibus-viewer".into(), "unibus".into());
+        let host = DnsRecord {
+            name: "neo.lab.myc".into(),
+            address: "fd7a:115c:a1e0::6".parse().unwrap(),
+            site: "lab".into(),
+            node: "neo".into(),
+        };
+        let mut services = catalog();
+        services.observations[0].value.endpoints =
+            BTreeSet::from(["https://[fd7a:115c:a1e0::6]:8444".into()]);
+        let (records, _) = project(&s, vec![host], &services, 1000, 1200).unwrap();
+        let projected = records
+            .iter()
+            .find(|record| record.name == "unibus.neo.lab.myc")
+            .expect("the service answers with its host record's name");
+        assert_eq!(
+            projected.address,
+            "fd7a:115c:a1e0::6".parse::<std::net::IpAddr>().unwrap()
+        );
     }
     #[test]
     fn root_index_requires_explicit_owner_and_fresh_matching_lease() {

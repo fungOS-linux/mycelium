@@ -1,9 +1,9 @@
 //! Resolver settings are a contract, not a path each consumer rediscovers.
 //!
 //! The dnsmasq driver writes this file after every successful apply; anything
-//! that needs the machine's naming policy reads it from here. The location and
-//! the naming half of the document live in one place so the writer and its
-//! readers cannot drift apart.
+//! that needs the machine's installed policy reads it from here. The location and
+//! the fields consumers act on live in one place so the writer and its readers
+//! cannot drift apart.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -18,25 +18,31 @@ pub fn active_settings_path(directory: &Path) -> PathBuf {
     directory.join(ACTIVE_SETTINGS_FILE)
 }
 
-/// The naming policy an apply left behind. Only the fields consumers act on are
-/// projected out of the driver's larger settings document.
+/// The policy an apply left behind. Only the fields consumers act on are
+/// projected out of the driver's larger settings document: which names the zone
+/// answers, in which namespace, and for which address scopes.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(from = "Raw")]
-pub struct Naming {
+pub struct Policy {
     /// Opt-in `service kind -> DNS label`.
     pub service_aliases: BTreeMap<String, String>,
     /// Index owner per kind. Not every reader uses this yet; it belongs to the
     /// same opt-in table, so it is read once, here.
     pub service_index_peers: BTreeMap<String, String>,
+    /// The scopes the resolver publishes host records for. Readers that preview
+    /// the zone must apply the same scopes the resolver applies, or the preview
+    /// and the live answer disagree about which address a name has.
+    pub reachable_prefixes: Vec<String>,
     pub suffix: String,
     pub site: String,
 }
 
-impl Default for Naming {
+impl Default for Policy {
     fn default() -> Self {
         Self {
             service_aliases: BTreeMap::new(),
             service_index_peers: BTreeMap::new(),
+            reachable_prefixes: Vec::new(),
             suffix: "myc".to_owned(),
             site: String::new(),
         }
@@ -44,14 +50,14 @@ impl Default for Naming {
 }
 
 /// No file means this host runs no resolver, which is a normal state.
-pub fn load_active(directory: &Path) -> Result<Option<Naming>, String> {
+pub fn load_active(directory: &Path) -> Result<Option<Policy>, String> {
     let path = active_settings_path(directory);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("read {}: {error}", path.display())),
     };
-    let naming = serde_json::from_slice::<Naming>(&bytes)
+    let naming = serde_json::from_slice::<Policy>(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
     if !crate::service_names::valid_label(&naming.suffix) {
         return Err(format!(
@@ -80,6 +86,8 @@ struct Raw {
     #[serde(default)]
     service_index_peers: BTreeMap<String, String>,
     #[serde(default)]
+    reachable_prefixes: Vec<String>,
+    #[serde(default)]
     resolver: RawResolver,
 }
 
@@ -91,11 +99,12 @@ struct RawResolver {
     site: String,
 }
 
-impl From<Raw> for Naming {
+impl From<Raw> for Policy {
     fn from(raw: Raw) -> Self {
         Self {
             service_aliases: raw.service_aliases,
             service_index_peers: raw.service_index_peers,
+            reachable_prefixes: raw.reachable_prefixes,
             suffix: raw.resolver.suffix,
             site: raw.resolver.site,
         }
@@ -118,6 +127,7 @@ mod tests {
             serde_json::json!({
                 "resolver": {"suffix": "myc", "site": "wagar-house", "listen": []},
                 "dnsmasq": "/usr/bin/dnsmasq",
+                "reachable_prefixes": ["192.168.10.0/24"],
                 "service_aliases": {"files": "files"},
                 "service_index_peers": {"files": "n1"}
             }),
@@ -133,6 +143,10 @@ mod tests {
         );
         assert_eq!(naming.suffix, "myc");
         assert_eq!(naming.site, "wagar-house");
+        assert_eq!(
+            naming.reachable_prefixes,
+            vec!["192.168.10.0/24".to_owned()]
+        );
     }
 
     #[test]

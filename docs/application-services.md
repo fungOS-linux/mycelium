@@ -40,6 +40,28 @@ Conflicts are not resolved silently:
 - The same name on different nodes is the anycast case, not a conflict: each node
   answers `label.host.suffix`, and the zone names one apex observer for `label.suffix`.
 
+## Zone addresses
+
+A service name resolves to the address of the host record it is projected onto, not
+an address of its own. `project_service_records` in `mycelium-dns-policy` is the only
+place that turns claims into records; the dnsmasq resolver and `mycelium dns zone`
+both call it, and both build their host records with the one publishable-address rule
+(`mycelium_dns_policy::addresses`): the overlay's address space always publishes, and
+every other address must sit inside a scope the installed policy declares reachable.
+An overlay host record therefore gives a service an overlay answer without either
+adapter special-casing address families.
+
+Both adapters read the same installed policy (`active-settings.json`): suffix, alias
+table, apex owners and reachable scopes. They observe different inputs — the resolver
+publishes fresh authenticated peers, `dns zone` previews the daemon's topology — so the
+node set can differ, but the rules and the address scopes do not.
+
+`dns zone --zone overlay` publishes `node.suffix` from
+`TopoNode::overlay_ips("mycelium0")`. That zone is empty until the daemon records
+binding addresses: its wireguard-binding observation currently carries no addresses
+(`Observation::OverlaySelf { ips: Vec::new() }`), so the overlay half is wired and
+tested but has no live source yet.
+
 ## Manual runbook
 
 1. Have the local application atomically publish the shared catalog to its dedicated

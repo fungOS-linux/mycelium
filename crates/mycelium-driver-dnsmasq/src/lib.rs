@@ -5,7 +5,8 @@ use mycelium_core::{
     ActionRisk, CapResult, CapSpec, Device, DeviceId, DeviceKind, DeviceMeta, ExecContext,
     MyceliumError, Params,
 };
-use mycelium_dns_policy::resolver::{usable_address, ResolverConfig, ResolverMode};
+use mycelium_dns_policy::addresses::publishable_address;
+use mycelium_dns_policy::resolver::{ResolverConfig, ResolverMode};
 use mycelium_dns_policy::{canonical_domain, DnsRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -287,31 +288,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
-fn in_prefix(address: IpAddr, prefix: &str) -> bool {
-    let Some((network, length)) = mycelium_core::parse_cidr(prefix) else {
-        return false;
-    };
-    match (network, address) {
-        (IpAddr::V4(n), IpAddr::V4(a)) => {
-            let mask = if length == 0 {
-                0
-            } else {
-                u32::MAX << (32 - length)
-            };
-            u32::from(n) & mask == u32::from(a) & mask
-        }
-        (IpAddr::V6(n), IpAddr::V6(a)) => {
-            let mask = if length == 0 {
-                0
-            } else {
-                u128::MAX << (128 - length)
-            };
-            u128::from(n) & mask == u128::from(a) & mask
-        }
-        _ => false,
-    }
-}
-
 /// Adapt the daemon's JSON peer view, already subject to fleet authentication.
 /// Expired identities cannot squat a name after re-enrollment. Competing live
 /// owners fail closed instead of arbitrarily choosing an identity.
@@ -375,12 +351,7 @@ pub fn peer_records(
             let Some(address) = address.as_str().and_then(|a| a.parse::<IpAddr>().ok()) else {
                 continue;
             };
-            if !usable_address(address)
-                || !settings
-                    .reachable_prefixes
-                    .iter()
-                    .any(|p| in_prefix(address, p))
-            {
+            if !publishable_address(address, &settings.reachable_prefixes) {
                 continue;
             }
             if owners
@@ -447,9 +418,6 @@ async fn observation(settings: &Settings) -> Result<(Vec<DnsRecord>, u64), Strin
         .map(|seen| seen.saturating_add(settings.expiry_seconds))
         .min()
         .unwrap_or(timestamp + settings.expiry_seconds);
-    if service_dns::aliases(settings)?.is_empty() {
-        return Ok((records, deadline));
-    }
     Ok(with_service_observation(
         settings,
         records,
@@ -462,7 +430,12 @@ async fn observation(settings: &Settings) -> Result<(Vec<DnsRecord>, u64), Strin
 async fn service_observation(settings: &Settings) -> Result<ServiceCatalog, String> {
     let mut command = tokio::process::Command::new(&settings.mycelium);
     command.args(["services", "--json"]).kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+    // Projecting the whole catalog takes ~10s cold, and this call now runs on
+    // every refresh: a lease that publishes its own name must not need an alias
+    // to be observed. The gateway's discovery uses the same 25s bound for the
+    // same command; a shorter one would silently degrade a cold resolver to
+    // host-only records.
+    let output = tokio::time::timeout(Duration::from_secs(25), command.output())
         .await
         .map_err(|_| "service observation timed out")?
         .map_err(|e| e.to_string())?;
@@ -1228,11 +1201,7 @@ impl Retained {
             || self.expires_at > timestamp.saturating_add(settings.expiry_seconds)
             || self.records.iter().any(|r| {
                 !settings.admits_site(&r.site)
-                    || !usable_address(r.address)
-                    || !settings
-                        .reachable_prefixes
-                        .iter()
-                        .any(|p| in_prefix(r.address, p))
+                    || !publishable_address(r.address, &settings.reachable_prefixes)
             })
         {
             return Err("retained DNS snapshot expired or outside current policy".into());
@@ -1718,6 +1687,27 @@ mod tests {
     #[test]
     fn competing_live_identity_fails_closed() {
         assert!(peer_records(&settings(), &json!([peer("a", 999), peer("b", 999)]), 1000).is_err());
+    }
+    /// The resolver publishes the overlay address of every peer without an
+    /// operator-declared scope: it belongs to the node by identity. Other
+    /// addresses still need the scope, so this is not "publish everything".
+    #[test]
+    fn overlay_addresses_publish_without_a_declared_scope() {
+        let mut remote = peer("neo", 999);
+        remote["hello"]["interfaces"] = json!([{
+            "addresses": ["fd7a:115c:a1e0::6", "10.9.9.9", "fe80::1"]
+        }]);
+        let records = peer_records(&settings(), &json!([remote]), 1000).unwrap();
+        let addresses = records
+            .iter()
+            .map(|record| record.address.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            addresses,
+            BTreeSet::from(["fd7a:115c:a1e0::6".to_owned()]),
+            "only the overlay address publishes; the LAN address needs its scope and link-local never publishes"
+        );
+        assert_eq!(records[0].name, "gpu.lab.myc");
     }
     #[test]
     fn settings_roundtrip_and_invalid_refresh() {

@@ -5,7 +5,7 @@ use fpl_resource_observation::{
 };
 use mycelium_core::{ServiceRecord, Topology};
 use mycelium_dns_policy::service_names::{valid_label, APPLICATION_OWNER_LEASE};
-use mycelium_dns_policy::settings::{self, Naming};
+use mycelium_dns_policy::settings::{self, Policy};
 
 const SERVICE_TTL_SECONDS: u64 = 15 * 60;
 
@@ -15,7 +15,7 @@ pub fn project(topology: &Topology) -> ServiceCatalog {
 
 /// Project with an explicit naming policy. Publication is the only place labels
 /// become names, so callers that need determinism supply the policy themselves.
-pub fn project_with_naming(topology: &Topology, naming: Option<&Naming>) -> ServiceCatalog {
+pub fn project_with_naming(topology: &Topology, naming: Option<&Policy>) -> ServiceCatalog {
     let mut catalog = ServiceCatalog {
         schema_version: SCHEMA_VERSION,
         ..ServiceCatalog::default()
@@ -160,7 +160,7 @@ pub fn project_with_naming(topology: &Topology, naming: Option<&Naming>) -> Serv
 /// The owner declares labels in its lease; the zone's alias table overrides them,
 /// so a desktop can rename what it installed. Published names are composed with
 /// the zone's suffix, which is why no consumer needs the zone's policy.
-fn publish_names(catalog: &mut ServiceCatalog, naming: Option<&Naming>) {
+fn publish_names(catalog: &mut ServiceCatalog, naming: Option<&Policy>) {
     for observation in &mut catalog.observations {
         if observation.provenance.provider != APPLICATION_OWNER_LEASE {
             continue;
@@ -191,7 +191,7 @@ fn publish_names(catalog: &mut ServiceCatalog, naming: Option<&Naming>) {
 }
 
 /// The zone's naming policy, when this host has a resolver installed.
-fn naming() -> Option<Naming> {
+fn naming() -> Option<Policy> {
     match settings::load_active(&crate::home_dir().join("dns")) {
         Ok(naming) => Some(naming.unwrap_or_default()),
         Err(error) => {
@@ -573,10 +573,10 @@ mod tests {
 
     #[test]
     fn published_names_are_the_zone_s_and_its_alias_overrides_the_lease() {
-        let naming = Naming {
+        let naming = Policy {
             service_aliases: BTreeMap::from([("files".to_owned(), "docs".to_owned())]),
             suffix: "myc".to_owned(),
-            ..Naming::default()
+            ..Policy::default()
         };
 
         let mut catalog = lease_catalog(&["files"]);
@@ -588,7 +588,7 @@ mod tests {
 
         // Without an override the owner's own label is used.
         let mut catalog = lease_catalog(&["files"]);
-        publish_names(&mut catalog, Some(&Naming::default()));
+        publish_names(&mut catalog, Some(&Policy::default()));
         assert_eq!(
             catalog.observations[0].value.names,
             vec!["files.myc".to_owned()]
@@ -626,9 +626,9 @@ mod tests {
         let mut topology = mycelium_core::Topology::default();
         topology.observe_all(observations);
 
-        let naming = Naming {
+        let naming = Policy {
             suffix: "myc".to_owned(),
-            ..Naming::default()
+            ..Policy::default()
         };
         let catalog = project_with_naming(&topology, Some(&naming));
         let claims = mycelium_dns_policy::service_names::claimed_services(&catalog, 100).unwrap();
@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn an_invalid_declared_label_is_dropped_not_published() {
         let mut catalog = lease_catalog(&["Files", "files"]);
-        publish_names(&mut catalog, Some(&Naming::default()));
+        publish_names(&mut catalog, Some(&Policy::default()));
         assert_eq!(
             catalog.observations[0].value.names,
             vec!["files.myc".to_owned()]

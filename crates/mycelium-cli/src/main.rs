@@ -1721,7 +1721,7 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     // resolves — including the AAAA records for the overlay's own addresses.
     // A node's certificate carries the suffix it actually belongs to; `--suffix`
     // overrides this for looking at another site's namespace.
-    let mut suffix = "myc";
+    let mut suffix_arg = None;
     let mut site = None;
     let mut zone = "lan";
     let mut delegation_file = None;
@@ -1737,9 +1737,11 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
             "--json" => json = true,
             "--dnsmasq" if action == "plan" => dnsmasq = true,
             "--suffix" => {
-                suffix = rest
-                    .next()
-                    .ok_or_else(|| err_usage("--suffix needs a domain"))?
+                suffix_arg = Some(
+                    rest.next()
+                        .ok_or_else(|| err_usage("--suffix needs a domain"))?
+                        .as_str(),
+                )
             }
             "--zone" if action == "zone" => {
                 zone = rest
@@ -1768,6 +1770,19 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     if action == "plan" && site.is_none() {
         return Err(err_usage("dns plan requires --site"));
     }
+    // Service names and the zone suffix belong to the naming policy this host
+    // installed, not to a second default here: a preview that composed its own
+    // names would disagree with the resolver it is previewing. No policy means
+    // no service names.
+    let mut naming = mycelium_dns_policy::settings::load_active(&myceliumd::home_dir().join("dns"))
+        .map_err(|error| err_usage(&error))?;
+    if let (Some(explicit), Some(naming)) = (suffix_arg, naming.as_mut()) {
+        // Looking at another namespace still uses this host's aliases and apex.
+        naming.suffix = explicit.to_owned();
+    }
+    let suffix = suffix_arg
+        .or_else(|| naming.as_ref().map(|naming| naming.suffix.as_str()))
+        .unwrap_or("myc");
     dns::canonical_domain(suffix).map_err(|e| err_usage(&e))?;
     let delegations: Vec<dns::Delegation> = if let Some(path) = delegation_file {
         use std::io::Read;
@@ -1803,13 +1818,38 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     let mut records = Vec::new();
     if matches!(zone, "lan" | "all") {
         records.extend(
-            dns::derive_records(&topology, &bindings, suffix).map_err(|error| err_usage(&error))?,
+            dns::derive_host_records(
+                &topology,
+                &bindings,
+                suffix,
+                naming
+                    .as_ref()
+                    .map(|naming| naming.reachable_prefixes.as_slice()),
+            )
+            .map_err(|error| err_usage(&error))?,
         );
     }
     if matches!(zone, "overlay" | "all") {
         records.extend(
             dns::derive_overlay_records(&topology, suffix).map_err(|error| err_usage(&error))?,
         );
+    }
+    // Service names are projected onto the host records above by the same rule
+    // the resolver applies, so a service answers with the address its host
+    // record published - including the overlay's own address.
+    if let Some(naming) = &naming {
+        let catalog = serde_json::from_value::<fpl_resource_observation::ServiceCatalog>(
+            client.call(&Request::Services).await?,
+        )
+        .map_err(|error| err_usage(&format!("invalid service catalog: {error}")))?;
+        let (services, _) = mycelium_dns_policy::service_names::project_service_records(
+            naming,
+            &records,
+            &catalog,
+            unix_now(),
+        )
+        .map_err(|error| err_usage(&error))?;
+        records.extend(services);
     }
     records.sort();
     records.dedup();

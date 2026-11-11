@@ -1,4 +1,5 @@
-//! Optional resolver policy. Naming is separate from reachability and grants.
+//! Optional resolver policy. Names, reachability scopes and grants are read
+//! from one installed document, but only naming and scope reach the zone.
 use crate::blocklist::{BlockAction, Blocklist, BlocklistSource};
 use crate::{canonical_domain, plan, Delegation, DnsRecord, FleetDnsAddress};
 use serde::{Deserialize, Serialize};

@@ -2,39 +2,37 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use mycelium_core::topology::{Topology, MYCELIUM_OVERLAY_NETWORK};
+use mycelium_dns_policy::addresses::publishable_address;
 pub(crate) use mycelium_dns_policy::{canonical_domain, plan, Delegation, DnsRecord};
 use mycelium_dns_policy::{BlockAction, Blocklist, BlocklistSource};
 use mycelium_peer_protocol::WireGuardBinding;
 use myceliumd::protocol::Request;
 use std::path::{Path, PathBuf};
 
-/// IPv6 unique-local address (`fc00::/7`). Mycelium's overlay lives here, and
-/// an address in this range belongs to the node by identity rather than by
-/// whatever network it happens to be attached to.
-fn is_unique_local(address: IpAddr) -> bool {
-    matches!(address, IpAddr::V6(v6) if (v6.segments()[0] & 0xfe00) == 0xfc00)
-}
-
-pub(crate) fn derive_records(
+/// The zone's host records: `node.site.<suffix>` for every publishable address
+/// a signed site route reaches.
+///
+/// Service names are deliberately not derived here. They come from the one
+/// naming rule (`mycelium_dns_policy::service_names`) applied to these records,
+/// so a preview and the resolver cannot disagree about what a claim answers to.
+///
+/// `reachable_prefixes` is the installed resolver's declared scope. When it is
+/// absent this host runs no resolver, and a binding's advertised prefixes are
+/// the only reachability statement available.
+pub(crate) fn derive_host_records(
     topology: &Topology,
     bindings: &[WireGuardBinding],
     suffix: &str,
+    reachable_prefixes: Option<&[String]>,
 ) -> Result<Vec<DnsRecord>, String> {
     let suffix = canonical_domain(suffix)?;
     let mut records = BTreeSet::new();
-    let mut names = BTreeMap::<String, String>::new();
-    let mut addresses = BTreeMap::<(String, bool), IpAddr>::new();
-    // Service names are not node names: many nodes may publish the same kind,
-    // so a competing owner is normal here. Resolved by preference (this site
-    // first, then the smallest owner id for determinism) rather than by the
-    // error a node name would raise for two machines claiming one name.
-    let mut service = BTreeMap::<(String, bool), (IpAddr, String, bool, String)>::new();
+    // One name may resolve to several addresses: a machine is multi-homed, and
+    // one node record per overlay network describes the same machine more than
+    // once. What must never happen is two *different* machines answering to one
+    // name, so ownership is tracked per node id and compared at the end.
+    let mut owners = BTreeMap::<String, BTreeMap<String, BTreeSet<IpAddr>>>::new();
     for binding in bindings {
-        let prefixes = binding
-            .advertised_prefixes
-            .iter()
-            .map(|prefix| parse_prefix(prefix))
-            .collect::<Result<Vec<_>, _>>()?;
         for node in topology.nodes.values() {
             if !node.sites.is_empty() && !node.sites.contains(&binding.site) {
                 continue;
@@ -53,36 +51,24 @@ pub(crate) fn derive_records(
                 continue;
             };
             let site = dns_label(&binding.site);
+            let scope = reachable_prefixes.unwrap_or(&binding.advertised_prefixes);
             for address in node
                 .ips
                 .keys()
                 .copied()
-                // The overlay's own address space is always valid for a .myc
-                // name. Those addresses are derived from the node identity, so
-                // they are stable across networks and restarts, which is the
-                // property a DNS record needs. Binding prefixes cover
-                // everything else, and must not be allowed to hide the overlay
-                // address the name is actually for.
-                .filter(|address| {
-                    is_unique_local(*address)
-                        || prefixes.iter().any(|prefix| prefix.contains(*address))
-                })
+                // One rule decides which addresses are publishable, so the
+                // resolver and this preview cannot disagree about a machine:
+                // the overlay address always publishes, everything else needs
+                // the scope the operator declared reachable.
+                .filter(|address| publishable_address(*address, scope))
             {
                 let name = format!("{label}.{site}.{suffix}");
-                // Several node records can describe one machine — one per
-                // overlay network — so the same name legitimately arrives from
-                // more than one id. The invariant that matters is that a name
-                // resolves to one address, which the check below enforces;
-                // rejecting a shared owner would fail on healthy topologies.
-                names.entry(name.clone()).or_insert_with(|| node.id.clone());
-                if let Some(previous) = addresses.insert((name.clone(), address.is_ipv4()), address)
-                {
-                    if previous != address {
-                        return Err(format!(
-                            "DNS name `{name}` maps to both {previous} and {address}"
-                        ));
-                    }
-                }
+                owners
+                    .entry(name.clone())
+                    .or_default()
+                    .entry(node.id.clone())
+                    .or_default()
+                    .insert(address);
                 records.insert(DnsRecord {
                     name,
                     address,
@@ -91,106 +77,31 @@ pub(crate) fn derive_records(
                 });
             }
         }
-
-        // An application lease carries its kind and endpoints, so a published
-        // service earns an apex name: `unibus.<suffix>` points at a hub, not at
-        // a machine. A name resolves to an address, not a port, so an endpoint
-        // is reduced to its host - and both families come free, because the
-        // record already carries an IpAddr.
-        for advertisement in topology.advertisements.values() {
-            if advertisement.service_type != "_application-owner._tcp" {
-                continue;
-            }
-            let Some(encoded) = advertisement
-                .txt
-                .iter()
-                .find_map(|value| value.strip_prefix("observation="))
-            else {
-                continue;
-            };
-            let Ok(observation) = serde_json::from_str::<serde_json::Value>(encoded) else {
-                continue;
-            };
-            let Some(kind) = observation["value"]["kind"].as_str() else {
-                continue;
-            };
-            if !service_label(kind) {
-                continue;
-            }
-            let Some(endpoint) = observation["value"]["endpoints"]
-                .as_array()
-                .and_then(|endpoints| endpoints.first())
-                .and_then(|endpoint| endpoint.as_str())
-            else {
-                continue;
-            };
-            let Some(address) = endpoint_address(endpoint) else {
-                continue;
-            };
-            // `plan` refuses a loopback, unspecified or multicast record and
-            // fails the whole site when it sees one. A lease that names such an
-            // endpoint is a service only this node can dial, so it earns no
-            // name - and, crucially, cannot take the site's DNS down with it.
-            if address.is_unspecified() || address.is_loopback() || address.is_multicast() {
-                continue;
-            }
-            let Some(owner) = advertisement.target.clone() else {
-                continue;
-            };
-            let in_site = topology
-                .nodes
-                .get(&owner)
-                .is_none_or(|node| node.sites.is_empty() || node.sites.contains(&binding.site));
-            let key = (format!("{kind}.{suffix}"), address.is_ipv4());
-            let candidate = (address, owner, in_site, binding.site.clone());
-            match service.get(&key) {
-                // The incumbent already answers for this site; keep it.
-                Some((_, _, true, _)) if !in_site => {}
-                // Neither is local: pick deterministically instead of by order.
-                Some((_, existing, false, _)) if !in_site && existing < &candidate.1 => {}
-                _ => {
-                    service.insert(key, candidate);
+    }
+    for (name, nodes) in &owners {
+        let sets = nodes.values().collect::<Vec<_>>();
+        for (index, left) in sets.iter().enumerate() {
+            // Node ids multiply per overlay network, but their address sets
+            // overlap when they describe one machine. Disjoint sets are two
+            // machines and a name cannot belong to both.
+            for right in &sets[index + 1..] {
+                if left.is_disjoint(right) {
+                    return Err(format!(
+                        "DNS name `{name}` is claimed by different machines"
+                    ));
                 }
             }
         }
     }
-
-    for ((name, family), (address, owner, _, site)) in service {
-        names.insert(name.clone(), owner.clone());
-        addresses.insert((name.clone(), family), address);
-        records.insert(DnsRecord {
-            name,
-            address,
-            // A service name is still a site's name: `plan` keeps only records
-            // for the site it is planning, so an empty site here silently
-            // dropped every one of them.
-            site,
-            node: owner,
-        });
+    // One machine described by several node records yields the same name and
+    // address more than once; the zone cares about the pair, not the id.
+    let mut unique = BTreeMap::<(String, IpAddr), DnsRecord>::new();
+    for record in records {
+        unique
+            .entry((record.name.clone(), record.address))
+            .or_insert(record);
     }
-    Ok(records.into_iter().collect())
-}
-
-/// Whether a service kind is a name a fleet should resolve.
-///
-/// The rule is the shape of the kind, not a curated list: `confluence` and
-/// `unibus` are names, while `redis/tcp/6379` is a fact about one node's port.
-/// A list would have to be edited every time a Spore declares a new kind, and
-/// it would be edited in Mycelium - by whoever remembers to - rather than in
-/// the Spore that owns the name.
-fn service_label(kind: &str) -> bool {
-    !kind.is_empty()
-        && kind.len() <= 63
-        && kind.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-        })
-}
-
-/// `tcp://10.0.0.1:18890` -> 10.0.0.1.
-fn endpoint_address(endpoint: &str) -> Option<IpAddr> {
-    let rest = endpoint.split_once("://")?.1;
-    let host = rest.rsplit_once(':').map(|(host, _)| host).unwrap_or(rest);
-    host.trim_matches(['[', ']']).parse().ok()
+    Ok(unique.into_values().collect())
 }
 
 /// Derive the overlay zone: `node.<suffix>` -> the node's overlay address.
@@ -240,52 +151,6 @@ pub(crate) fn derive_overlay_records(
         }
     }
     Ok(records.into_iter().collect())
-}
-
-#[derive(Clone, Copy)]
-struct Prefix {
-    address: IpAddr,
-    length: u8,
-}
-
-impl Prefix {
-    fn contains(self, candidate: IpAddr) -> bool {
-        match (self.address, candidate) {
-            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
-                let mask = if self.length == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - self.length)
-                };
-                u32::from(network) & mask == u32::from(candidate) & mask
-            }
-            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
-                let mask = if self.length == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - self.length)
-                };
-                u128::from(network) & mask == u128::from(candidate) & mask
-            }
-            _ => false,
-        }
-    }
-}
-
-fn parse_prefix(value: &str) -> Result<Prefix, String> {
-    let (address, length) = value
-        .split_once('/')
-        .ok_or_else(|| format!("invalid routed prefix `{value}`"))?;
-    let address = address
-        .parse::<IpAddr>()
-        .map_err(|_| format!("invalid routed prefix `{value}`"))?;
-    let length = length
-        .parse::<u8>()
-        .map_err(|_| format!("invalid routed prefix `{value}`"))?;
-    if length > if address.is_ipv4() { 32 } else { 128 } {
-        return Err(format!("invalid routed prefix `{value}`"));
-    }
-    Ok(Prefix { address, length })
 }
 
 fn dns_label(value: &str) -> String {
@@ -617,51 +482,47 @@ mod tests {
     use super::*;
     use mycelium_core::topology::{IpRecord, TopoNode};
 
-    /// A one-node fleet whose only interesting fact is the lease it publishes.
-    fn hub_publishing(kind: &str, endpoint: &str) -> Topology {
-        use mycelium_core::{Observation, Origin, ServiceAdvertisement};
-
+    /// The resolver publishes what the operator declared reachable; a binding's
+    /// advertised prefixes are only the fallback on a host with no resolver.
+    #[test]
+    fn the_installed_scope_replaces_the_bindings_advertised_prefixes() {
         let mut topology = Topology::empty();
-        let hub = TopoNode {
-            id: "hub-cell".into(),
-            hostnames: BTreeSet::from(["hub".into()]),
+        let mut node = TopoNode {
+            id: "neo".into(),
+            hostnames: BTreeSet::from(["neo".into()]),
             sites: BTreeSet::from(["home".into()]),
             ..TopoNode::default()
         };
-        topology.nodes.insert(hub.id.clone(), hub);
-
-        // Exactly the document `myceliumd` projects into the advertisement.
-        let lease = serde_json::json!({
-            "schema_version": 1,
-            "service_id": format!("service/hub-cell/application/{kind}"),
-            "observed_at": 100,
-            "expires_at": 160,
-            "provenance": {"provider": "application", "observer": "hub-cell"},
-            "confidence": "strong",
-            "value": {
-                "kind": kind,
-                "endpoints": [endpoint],
-                "attributes": {"node_id": "hub-cell"}
-            }
-        });
-        topology.observe_all(vec![Observation::ServiceAdvertisement {
-            advertisement: ServiceAdvertisement {
-                instance: format!("service/hub-cell/application/{kind}"),
-                service_type: "_application-owner._tcp".into(),
-                domain: "hub-cell.mycelium".into(),
-                target: Some("hub-cell".into()),
-                addresses: BTreeSet::new(),
-                port: None,
-                txt: BTreeSet::from([format!("observation={lease}")]),
-                interface: None,
-                ttl: Some(60),
-                first_seen: 100,
-                last_seen: 100,
-                origins: BTreeSet::from(["hub-cell".into()]),
-            },
-            origin: Origin::new("hub-cell", "application-owner-lease"),
-        }]);
-        topology
+        for address in ["192.168.10.30", "192.168.2.3"] {
+            let address = address.parse().unwrap();
+            node.ips.insert(
+                address,
+                IpRecord {
+                    addr: address,
+                    prefix: None,
+                    vlan: None,
+                    origins: BTreeSet::new(),
+                },
+            );
+        }
+        topology.nodes.insert(node.id.clone(), node);
+        let mut binding = home_binding();
+        binding.advertised_prefixes = vec!["192.168.10.0/24".into()];
+        let addresses = |scope: Option<&[String]>| {
+            derive_host_records(&topology, &[binding.clone()], "myc", scope)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.address.to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            addresses(None),
+            BTreeSet::from(["192.168.10.30".to_owned()])
+        );
+        assert_eq!(
+            addresses(Some(&["192.168.2.0/24".to_owned()])),
+            BTreeSet::from(["192.168.2.3".to_owned()])
+        );
     }
 
     fn home_binding() -> WireGuardBinding {
@@ -680,49 +541,44 @@ mod tests {
         }
     }
 
+    /// The publishable-address rule is shared with the resolver: the overlay
+    /// address always publishes, a LAN address only inside the site route's
+    /// prefix, and neither adapter gets to decide on its own.
     #[test]
-    fn a_service_observation_earns_an_apex_name() {
-        let topology = hub_publishing("unibus", "tcp://10.253.0.6:18890");
-        let records = derive_records(&topology, &[home_binding()], "myc").unwrap();
-
-        // Through the planner, not just the derivation: `plan` keeps only the
-        // records belonging to the site it is planning, and the planner is what
-        // the resolver actually applies. Testing the derivation alone would
-        // pass while every service name was silently dropped.
-        let planned = plan("home", "myc", records, Vec::new()).expect("the site plan applies");
-        let unibus = planned
-            .records
-            .iter()
-            .find(|record| record.name == "unibus.myc")
-            .expect("a published service earns an apex name");
-        assert_eq!(unibus.address.to_string(), "10.253.0.6");
-
-        // Both families, no special case: the endpoint decides.
-        let v6 = endpoint_address("tcp://[fd7a:115c:a1e0::6]:18890").expect("v6 endpoint");
-        assert!(v6.is_ipv6());
-        assert_eq!(v6.to_string(), "fd7a:115c:a1e0::6");
-        assert!(endpoint_address("not-an-endpoint").is_none());
-    }
-
-    #[test]
-    fn a_lease_no_other_node_could_dial_earns_no_name() {
-        let topology = hub_publishing("unibus", "tcp://127.0.0.1:18890");
-        let records = derive_records(&topology, &[home_binding()], "myc").unwrap();
-
-        // `plan` refuses a loopback record and fails the whole site when it
-        // meets one, so this lease must earn nothing and break nothing.
-        let planned = plan("home", "myc", records, Vec::new())
-            .expect("a lease only its own node can dial must not take the site down");
-        assert!(planned.records.is_empty(), "{:?}", planned.records);
-    }
-
-    #[test]
-    fn a_port_derived_kind_is_not_a_name() {
-        let topology = hub_publishing("redis/tcp/6379", "tcp://10.253.0.6:6379");
-        let records = derive_records(&topology, &[home_binding()], "myc").unwrap();
-        assert!(
-            records.is_empty(),
-            "a port is a fact about one node, not a fleet name: {records:?}"
+    fn the_overlay_address_publishes_without_a_declared_scope() {
+        let mut topology = Topology::empty();
+        let mut node = TopoNode {
+            id: "neo".into(),
+            hostnames: BTreeSet::from(["neo".into()]),
+            sites: BTreeSet::from(["home".into()]),
+            ..TopoNode::default()
+        };
+        for address in ["fd7a:115c:a1e0::6", "10.253.0.6", "192.168.44.9"] {
+            let address = address.parse().unwrap();
+            node.ips.insert(
+                address,
+                IpRecord {
+                    addr: address,
+                    prefix: None,
+                    vlan: None,
+                    origins: BTreeSet::new(),
+                },
+            );
+        }
+        topology.nodes.insert(node.id.clone(), node);
+        let addresses = derive_host_records(&topology, &[home_binding()], "myc", None)
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.name == "neo.home.myc")
+            .map(|record| record.address.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            addresses,
+            ["fd7a:115c:a1e0::6", "10.253.0.6"]
+                .map(String::from)
+                .into_iter()
+                .collect(),
+            "the overlay address publishes; the LAN address outside the site route does not"
         );
     }
 
@@ -759,7 +615,7 @@ mod tests {
             endpoint: None,
             advertised_prefixes: vec!["192.168.10.0/24".into()],
         };
-        let records = derive_records(&topology, &[binding.clone()], "mycelium").unwrap();
+        let records = derive_host_records(&topology, &[binding.clone()], "mycelium", None).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "front-camera.home.mycelium");
         assert_eq!(records[0].address.to_string(), "192.168.10.30");
@@ -775,7 +631,7 @@ mod tests {
         );
         binding.advertised_prefixes.push("2001:db8::/64".into());
         assert_eq!(
-            derive_records(&topology, &[binding.clone()], "mycelium")
+            derive_host_records(&topology, &[binding.clone()], "mycelium", None)
                 .unwrap()
                 .len(),
             2,
@@ -787,7 +643,7 @@ mod tests {
         let mut same_machine = topology.nodes["camera"].clone();
         same_machine.id = "camera-on-another-overlay".into();
         topology.nodes.insert(same_machine.id.clone(), same_machine);
-        let shared = derive_records(&topology, &[binding.clone()], "mycelium").unwrap();
+        let shared = derive_host_records(&topology, &[binding.clone()], "mycelium", None).unwrap();
         let addresses = shared
             .iter()
             .filter(|record| record.name == "front-camera.home.mycelium")
@@ -820,7 +676,73 @@ mod tests {
             },
         );
         topology.nodes.insert(competing.id.clone(), competing);
-        assert!(derive_records(&topology, &[binding], "mycelium").is_err());
+        assert!(derive_host_records(&topology, &[binding], "mycelium", None).is_err());
+    }
+
+    /// The CLI composition end to end: host records from the shared address
+    /// rule, then the shared naming rule. A lease endpoint on the overlay lands
+    /// on the overlay host record, so the preview and the resolver answer with
+    /// the same address for the same claim.
+    #[test]
+    fn a_lease_endpoint_on_the_overlay_lands_on_the_overlay_host_record() {
+        let mut topology = Topology::empty();
+        let mut node = TopoNode {
+            id: "neo".into(),
+            hostnames: BTreeSet::from(["neo".into()]),
+            sites: BTreeSet::from(["home".into()]),
+            ..TopoNode::default()
+        };
+        let overlay = "fd7a:115c:a1e0::6".parse().unwrap();
+        node.ips.insert(
+            overlay,
+            IpRecord {
+                addr: overlay,
+                prefix: None,
+                vlan: None,
+                origins: BTreeSet::new(),
+            },
+        );
+        topology.nodes.insert(node.id.clone(), node);
+        let hosts = derive_host_records(&topology, &[home_binding()], "myc", None).unwrap();
+        let catalog: fpl_resource_observation::ServiceCatalog =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "observations": [{
+                    "schema_version": 1,
+                    "service_id": "service/neo/application/unibus",
+                    "observed_at": 100,
+                    "expires_at": 200,
+                    "provenance": {
+                        "provider": "mycelium-application-owner-lease",
+                        "observer": "neo"
+                    },
+                    "confidence": "strong",
+                    "value": {
+                        "kind": "unibus",
+                        "names": ["unibus.myc"],
+                        "endpoints": ["https://[fd7a:115c:a1e0::6]:8444"],
+                        "attributes": {"node_id": "neo"}
+                    }
+                }]
+            }))
+            .unwrap();
+        let naming = mycelium_dns_policy::settings::Policy {
+            service_aliases: BTreeMap::new(),
+            service_index_peers: BTreeMap::new(),
+            reachable_prefixes: Vec::new(),
+            suffix: "myc".into(),
+            site: "home".into(),
+        };
+        let (services, expiry) = mycelium_dns_policy::service_names::project_service_records(
+            &naming, &hosts, &catalog, 100,
+        )
+        .unwrap();
+        assert_eq!(expiry, Some(200));
+        let projected = services
+            .iter()
+            .find(|record| record.name == "unibus.neo.home.myc")
+            .expect("the service name lands on the overlay host record");
+        assert_eq!(projected.address, overlay);
     }
 
     #[test]
@@ -845,8 +767,10 @@ mod tests {
     #[test]
     fn derives_overlay_zone_from_the_shared_overlay_space() {
         let mut topology = Topology::empty();
-        let mut node = TopoNode::default();
-        node.id = "neo".into();
+        let mut node = TopoNode {
+            id: "neo".into(),
+            ..TopoNode::default()
+        };
         node.hostnames.insert("neo".into());
         let overlay_ip = "100.64.0.7".parse().unwrap();
         let origin =
@@ -861,7 +785,7 @@ mod tests {
             },
         );
         node.overlays.insert(
-            format!("mycelium0/home/neo:wireguard-binding"),
+            "mycelium0/home/neo:wireguard-binding".to_string(),
             mycelium_core::topology::OverlayPeerRecord {
                 network: "mycelium0".into(),
                 protocol: mycelium_core::topology::MeshProtocol::WireGuard,
