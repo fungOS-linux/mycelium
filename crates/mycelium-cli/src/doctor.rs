@@ -296,6 +296,25 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
                     health.get("body").map(Value::to_string).unwrap_or_default()
                 ),
             );
+            // A listener that serves without a grant is tolerable only while it
+            // is loopback-only, because only this machine can reach it. It is
+            // the difference between "reachable" and "safely reachable", so it
+            // is reported rather than buried in the health body.
+            let auth_required = health
+                .get("body")
+                .and_then(|body| match body {
+                    Value::String(text) => serde_json::from_str::<Value>(text).ok(),
+                    other => Some(other.clone()),
+                })
+                .and_then(|body| body.get("auth_required").and_then(Value::as_bool));
+            if auth_required == Some(false) {
+                add(
+                    checks,
+                    "gateway auth",
+                    "warn",
+                    "auth_required is false: anything that can reach the listener is served without a grant; this is only safe while the listener is loopback-only".into(),
+                );
+            }
         }
         None => add(
             checks,
