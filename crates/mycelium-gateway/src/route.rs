@@ -189,22 +189,11 @@ mod tests {
     }
 
     fn index_with(entries: &[(&str, &str)]) -> ServiceIndex {
-        // (expected name, kind): the label is the name minus the `.myc` suffix,
-        // exactly as the resolver would publish it.
-        let naming = mycelium_dns_policy::settings::Naming {
-            service_aliases: entries
-                .iter()
-                .map(|(host, kind)| {
-                    let label = host.trim_end_matches(".myc").to_owned();
-                    ((*kind).to_owned(), label)
-                })
-                .collect(),
-            ..Default::default()
-        };
+        // (published name, kind): the name arrives composed by the zone.
         let observations = entries
             .iter()
             .enumerate()
-            .map(|(i, (_, kind))| {
+            .map(|(i, (name, kind))| {
                 serde_json::json!({
                     "schema_version": 1,
                     "service_id": format!("service/test/{i}"),
@@ -214,6 +203,7 @@ mod tests {
                     "confidence": "strong",
                     "value": {
                         "kind": kind,
+                        "names": [name],
                         "endpoints": ["https://127.0.0.1:9000"],
                         "attributes": {"node_id": "host"}
                     }
@@ -221,7 +211,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let catalog = serde_json::json!({"schema_version": 1, "observations": observations});
-        ServiceIndex::from_catalog("host", &catalog, 100, &naming).unwrap()
+        ServiceIndex::from_catalog("host", &catalog, 100).unwrap()
     }
 
     #[test]

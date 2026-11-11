@@ -1,6 +1,5 @@
 use fpl_resource_observation::ServiceCatalog;
 use mycelium_dns_policy::service_names::claimed_services;
-use mycelium_dns_policy::settings::Naming;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::path::Path;
@@ -50,7 +49,7 @@ impl ServiceIndex {
     /// Read the local node identity and the authenticated service catalog from
     /// the running myceliumd. This is intentionally the same CLI surface the
     /// DNS resolver uses, so the gateway and resolver see one catalog.
-    pub async fn load(bin: &Path, naming: &Naming) -> Result<Self, String> {
+    pub async fn load(bin: &Path) -> Result<Self, String> {
         let status = run_json(bin, &["node", "status", "--json"]).await?;
         let local_node = status
             .pointer("/node/hello/node_id")
@@ -59,7 +58,7 @@ impl ServiceIndex {
             .ok_or("mycelium node status has no node_id")?
             .to_owned();
         let catalog = run_json(bin, &["services", "--json"]).await?;
-        Self::from_catalog(&local_node, &catalog, now(), naming)
+        Self::from_catalog(&local_node, &catalog, now())
     }
 
     /// Build the index from one catalog. Names come from the shared rule in
@@ -69,13 +68,16 @@ impl ServiceIndex {
         local_node: &str,
         catalog: &serde_json::Value,
         now: u64,
-        naming: &Naming,
     ) -> Result<Self, String> {
         let catalog = serde_json::from_value::<ServiceCatalog>(catalog.clone())
             .map_err(|error| format!("bad service catalog: {error}"))?;
         let mut hosts = BTreeMap::new();
-        for claim in claimed_services(&naming.service_aliases, &catalog, now)? {
-            hosts.insert(format!("{}.{}", claim.label, naming.suffix), claim.kind);
+        // Names arrive already composed by the zone that published them, so a
+        // route and a DNS record cannot disagree about what a service answers to.
+        for claim in claimed_services(&catalog, now)? {
+            for name in claim.names {
+                hosts.insert(name, claim.kind.clone());
+            }
         }
         let mut by_kind: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
         let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
@@ -179,9 +181,7 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::ServiceIndex;
-    use mycelium_dns_policy::settings::Naming;
     use serde_json::json;
-    use std::collections::BTreeMap;
 
     fn observation(
         id: &str,
@@ -189,6 +189,7 @@ mod tests {
         observer: &str,
         node: &str,
         expires_at: u64,
+        names: serde_json::Value,
         endpoints: serde_json::Value,
     ) -> serde_json::Value {
         json!({
@@ -200,6 +201,7 @@ mod tests {
             "confidence": "strong",
             "value": {
                 "kind": "ai",
+                "names": names,
                 "endpoints": endpoints,
                 "attributes": {"node_id": node}
             }
@@ -216,6 +218,7 @@ mod tests {
                     "local-node",
                     "local-node",
                     200,
+                    json!([]),
                     json!(["http://127.0.0.1:4001"]),
                 ),
                 observation(
@@ -224,6 +227,7 @@ mod tests {
                     "remote-node",
                     "remote-node",
                     200,
+                    json!([]),
                     json!(["http://10.253.0.9:4001", "http://127.0.0.1:4001"]),
                 ),
                 observation(
@@ -232,23 +236,16 @@ mod tests {
                     "local-node",
                     "local-node",
                     100,
+                    json!([]),
                     json!(["http://127.0.0.1:4999"]),
                 ),
             ]
         })
     }
 
-    fn naming() -> Naming {
-        Naming {
-            service_aliases: BTreeMap::from([("ai".to_owned(), "ai".to_owned())]),
-            ..Naming::default()
-        }
-    }
-
     #[test]
     fn keeps_local_loopback_and_drops_remote_loopback() {
-        let index =
-            ServiceIndex::from_catalog("local-node", &catalog(), 150, &Naming::default()).unwrap();
+        let index = ServiceIndex::from_catalog("local-node", &catalog(), 150).unwrap();
         let candidates = index.candidates("ai");
         assert_eq!(candidates.len(), 2);
         assert!(candidates[0].local);
@@ -259,13 +256,12 @@ mod tests {
 
     #[test]
     fn expires_stale_leases() {
-        let index =
-            ServiceIndex::from_catalog("local-node", &catalog(), 201, &Naming::default()).unwrap();
+        let index = ServiceIndex::from_catalog("local-node", &catalog(), 201).unwrap();
         assert!(index.candidates("ai").is_empty());
     }
 
     #[test]
-    fn a_name_needs_an_application_lease_and_a_zone_label() {
+    fn a_name_needs_a_fresh_application_lease() {
         let application = json!({
             "schema_version": 1,
             "observations": [observation(
@@ -274,20 +270,32 @@ mod tests {
                 "local-node",
                 "local-node",
                 200,
+                json!(["ai.myc"]),
                 json!(["http://127.0.0.1:4001"]),
             )]
         });
-        let index = ServiceIndex::from_catalog("local-node", &application, 150, &naming()).unwrap();
+        let index = ServiceIndex::from_catalog("local-node", &application, 150).unwrap();
         assert_eq!(index.hosts().get("ai.myc").map(String::as_str), Some("ai"));
 
-        // The same lease without an opted-in label, and a scanned listener with
-        // one, are both nameless.
-        let unlabelled =
-            ServiceIndex::from_catalog("local-node", &application, 150, &Naming::default())
-                .unwrap();
-        assert!(unlabelled.hosts().is_empty());
-        let scanned = ServiceIndex::from_catalog("local-node", &catalog(), 150, &naming()).unwrap();
-        assert!(scanned.hosts().is_empty());
+        // A scanned listener that publishes the same name is not an owner claim.
+        let scanned = json!({
+            "schema_version": 1,
+            "observations": [observation(
+                "local",
+                "mdns",
+                "local-node",
+                "local-node",
+                200,
+                json!(["ai.myc"]),
+                json!(["http://127.0.0.1:4001"]),
+            )]
+        });
+        let index = ServiceIndex::from_catalog("local-node", &scanned, 150).unwrap();
+        assert!(index.hosts().is_empty());
+
+        // Neither is an expired one.
+        let index = ServiceIndex::from_catalog("local-node", &application, 200).unwrap();
+        assert!(index.hosts().is_empty());
     }
 
     #[test]
@@ -296,7 +304,6 @@ mod tests {
             "local-node",
             &json!({"observations": [{"expires_at": 200}]}),
             100,
-            &Naming::default(),
         )
         .is_err());
     }

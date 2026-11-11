@@ -17,6 +17,29 @@ fragments are rejected. Loopback addresses remain loopback addresses, not guesse
 remote routes. Applications must keep credentials and secrets out of attributes:
 these observations are inventory metadata carried to mesh peers, not secret storage.
 
+## Names
+
+A service asks for names with `value.names`: one to eight DNS labels (lowercase,
+1-63 characters, no dot, no leading or trailing hyphen), unique within the document.
+A manifest declares the default labels; install writes them into the lease. The label
+is a request, not an address: the zone composes it into `label.suffix` when it
+publishes the catalog, so a lease can never claim a name in another zone.
+
+The zone's `service_aliases` table (written with the resolver settings) overrides a
+declared label for that kind, which is how a desktop renames a service it installed
+without editing the owner's lease. The daemon publishes composed names in
+`mycelium services --json`; DNS and the gateway both read them, so a name never
+resolves without routing and never routes without resolving.
+
+Conflicts are not resolved silently:
+
+- Two leases in one document claiming one label is an error; the document is
+  rejected as a whole.
+- Two fresh leases on one node publishing one name is an error at the shared naming
+  rule; the consumer reports it and keeps its other names.
+- The same name on different nodes is the anycast case, not a conflict: each node
+  answers `label.host.suffix`, and the zone names one apex observer for `label.suffix`.
+
 ## Manual runbook
 
 1. Have the local application atomically publish the shared catalog to its dedicated
@@ -35,7 +58,7 @@ evidence, not an ACL, and a secure gateway does not secure a native LAN device.
 ## Verification
 
 `cargo check -p myceliumd --tests`, then `cargo test -p myceliumd local_services`.
-Tests cover bounds, credentials, identity, expiry, duplicate IDs, topology round-trip
-and service projection. An ignored interop test consumes an actual Unibus-exported
+Tests cover bounds, credentials, identity, expiry, duplicate IDs, name labels and
+conflicts, topology round-trip and service projection. An ignored interop test consumes an actual Unibus-exported
 document via `FPL_TEST_OWNER_CATALOG_FILE`; it requires that fixture explicitly and
 does not add a Unibus dependency to Mycelium.

@@ -1,7 +1,9 @@
 //! DNS aliases from application-owned leases, never scanned listeners or ACLs.
 use super::Settings;
 use fpl_resource_observation::ServiceCatalog;
-use mycelium_dns_policy::service_names::{project_service_names, ServiceHost};
+use mycelium_dns_policy::service_names::{
+    project_service_names, ServiceHost, APPLICATION_OWNER_LEASE,
+};
 use mycelium_dns_policy::{canonical_domain, DnsRecord};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -73,6 +75,27 @@ pub(super) fn validate_aliases(aliases: &BTreeMap<String, String>) -> Result<(),
     Ok(())
 }
 
+/// Alias plugins are local policy the daemon cannot evaluate, so the DNS adapter
+/// fills the names a published catalog left empty. A published name wins.
+fn with_fallback_names(
+    catalog: &ServiceCatalog,
+    aliases: &BTreeMap<String, String>,
+    suffix: &str,
+) -> ServiceCatalog {
+    let mut catalog = catalog.clone();
+    for observation in &mut catalog.observations {
+        if observation.provenance.provider != APPLICATION_OWNER_LEASE
+            || !observation.value.names.is_empty()
+        {
+            continue;
+        }
+        if let Some(label) = aliases.get(&observation.value.kind) {
+            observation.value.names = vec![format!("{label}.{suffix}")];
+        }
+    }
+    catalog
+}
+
 pub(super) fn project(
     settings: &Settings,
     mut records: Vec<DnsRecord>,
@@ -80,7 +103,6 @@ pub(super) fn project(
     now: u64,
     mut deadline: u64,
 ) -> Result<(Vec<DnsRecord>, u64), String> {
-    let aliases = aliases(settings)?;
     let originals = records.clone();
     let hosts = originals
         .iter()
@@ -91,12 +113,12 @@ pub(super) fn project(
         })
         .collect::<Vec<_>>();
     // The naming rule is shared with the gateway; this is only the DNS half.
+    let published = with_fallback_names(catalog, &aliases(settings)?, &settings.resolver.suffix);
     let projected = project_service_names(
-        &aliases,
         &settings.service_index_peers,
         &settings.resolver.suffix,
         &hosts,
-        catalog,
+        &published,
         now,
     )?;
     let mut entrances: BTreeMap<(String, IpAddr), String> = BTreeMap::new();

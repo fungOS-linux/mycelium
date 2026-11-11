@@ -2823,6 +2823,7 @@ dependencies = [
  "fpl-resource-observation",
  "iroh",
  "mycelium-core",
+ "mycelium-dns-policy",
  "mycelium-driver-darwin",
  "mycelium-driver-edgeos",
  "mycelium-driver-linux",

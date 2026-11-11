@@ -53,9 +53,20 @@ pub fn load_active(directory: &Path) -> Result<Option<Naming>, String> {
     };
     let naming = serde_json::from_slice::<Naming>(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
-    if naming.suffix.is_empty() || naming.suffix.contains('.') {
+    if !crate::service_names::valid_label(&naming.suffix) {
         return Err(format!(
             "{}: suffix is not a single DNS label",
+            path.display()
+        ));
+    }
+    if naming.service_aliases.len() > 32
+        || naming
+            .service_aliases
+            .values()
+            .any(|label| !crate::service_names::valid_label(label))
+    {
+        return Err(format!(
+            "{}: service aliases are not single DNS labels",
             path.display()
         ));
     }
@@ -138,6 +149,19 @@ mod tests {
         );
         assert!(load_active(&dir).is_err());
         write(&dir, serde_json::json!({"resolver": {"suffix": ""}}));
+        assert!(load_active(&dir).is_err());
+    }
+
+    #[test]
+    fn an_alias_that_is_not_one_label_is_rejected() {
+        let dir = tempdir();
+        write(
+            &dir,
+            serde_json::json!({
+                "resolver": {"suffix": "myc"},
+                "service_aliases": {"files": "Files"}
+            }),
+        );
         assert!(load_active(&dir).is_err());
     }
 

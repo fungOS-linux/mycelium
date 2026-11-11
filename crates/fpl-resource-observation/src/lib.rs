@@ -206,6 +206,11 @@ pub struct ResourceCatalog {
 pub struct Service {
     /// Open vocabulary such as `mcp`, `dcp`, `unibus`, `isochrone`, or `adb`.
     pub kind: String,
+    /// Names the service answers to. An owner lease carries the labels it asks
+    /// for; a published catalog carries the zone-composed names, because the
+    /// zone is what turns a label into a name.
+    #[serde(default)]
+    pub names: Vec<String>,
     #[serde(default)]
     pub endpoints: BTreeSet<String>,
     #[serde(default)]

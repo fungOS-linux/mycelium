@@ -3428,6 +3428,9 @@ fn render_service_catalog(catalog: &fpl_resource_observation::ServiceCatalog) ->
             "  {} kind={} node={} state={} confidence={:?}",
             observation.service_id.0, observation.value.kind, node, state, observation.confidence
         ));
+        for name in &observation.value.names {
+            lines.push(format!("    name {name}"));
+        }
         for endpoint in &observation.value.endpoints {
             lines.push(format!("    {endpoint}"));
         }
