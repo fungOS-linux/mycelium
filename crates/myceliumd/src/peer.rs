@@ -37,6 +37,8 @@ const DIGEST_INTERVAL: Duration = Duration::from_secs(15);
 const SSH_RENEWAL_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_ARTIFACT_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A seed session must last this long before it resets the reconnect backoff.
+const BACKOFF_RESET_SESSION: Duration = Duration::from_secs(30);
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_OBSERVATIONS_PER_MESSAGE: usize = 64;
 const MAX_OBSERVATION_MESSAGE_BYTES: usize = 900 * 1024;
@@ -267,14 +269,30 @@ impl Mesh {
         let require_transport_binding = std::env::var("MYCELIUM_REQUIRE_TRANSPORT_BINDING")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
         let observations = match std::fs::read_to_string(crate::peer_observations_path()) {
-            Ok(text) => validated_observations(
-                serde_json::from_str::<Vec<SignedEnvelope>>(&text)?,
-                &hello.node_id,
-                allowed_origins.as_ref(),
-                &authority_roots,
-                &trusted_access_keys,
-                &trusted_release_keys,
-            ),
+            Ok(text) => match serde_json::from_str::<Vec<SignedEnvelope>>(&text) {
+                Ok(values) => validated_observations(
+                    values,
+                    &hello.node_id,
+                    allowed_origins.as_ref(),
+                    &authority_roots,
+                    &trusted_access_keys,
+                    &trusted_release_keys,
+                ),
+                Err(error) => {
+                    // Peer observations are a cache: every entry is recoverable
+                    // from its owner. Quarantine the unreadable file instead of
+                    // refusing to boot, which would take every local service
+                    // down with it and hide the real error behind a restart loop.
+                    let path = crate::peer_observations_path();
+                    let quarantine = path.with_extension(format!("json.corrupt-{}", now()));
+                    std::fs::rename(&path, &quarantine)?;
+                    eprintln!(
+                        "myceliumd: quarantined unreadable peer observations at {}: {error}",
+                        quarantine.display()
+                    );
+                    BTreeMap::new()
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(error) => return Err(error.into()),
         };
@@ -1197,10 +1215,25 @@ impl Mesh {
 
     async fn dial_forever(self: Arc<Self>, seed: String, connector: TlsConnector) {
         let mut delay = Duration::from_secs(1);
+        let mut reported: Option<String> = None;
         loop {
+            let started = std::time::Instant::now();
             match self.dial(&seed, connector.clone()).await {
-                Ok(()) => delay = Duration::from_secs(1),
-                Err(error) => eprintln!("myceliumd: peer seed {seed}: {error}"),
+                // A session that closes immediately is not evidence of health:
+                // reset the backoff only after a connection was actually useful.
+                Ok(()) if started.elapsed() >= BACKOFF_RESET_SESSION => {
+                    delay = Duration::from_secs(1);
+                    reported = None;
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    // One line per distinct failure, not one per retry.
+                    let message = format!("myceliumd: peer seed {seed}: {error}");
+                    if reported.as_deref() != Some(message.as_str()) {
+                        eprintln!("{message}");
+                        reported = Some(message);
+                    }
+                }
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(60));
@@ -2298,8 +2331,16 @@ fn accept_artifact_chunk(
 }
 
 fn persist_observations(values: &[SignedEnvelope]) -> Result<(), AnyError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = crate::peer_observations_path();
-    let temp = path.with_extension("json.tmp");
+    // The rename is atomic, the write is not: a second writer must never land in
+    // this one's temporary file, or the published document holds both.
+    let temp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&temp, serde_json::to_vec_pretty(values)?)?;
     std::fs::rename(temp, path)?;
     Ok(())
@@ -2401,7 +2442,11 @@ fn add_gateway_usage(health: &mut HostHealth) {
         return;
     };
     match gateway_usage_metrics(&bytes, now()) {
-        Ok(metrics) => health.platform_metrics.extend(metrics),
+        Ok(Some(metrics)) => health.platform_metrics.extend(metrics),
+        // A gateway that is not running (or has just started) publishes nothing.
+        // Peers already drop metrics that are not fresh, so this is not an error
+        // worth repeating on every health tick.
+        Ok(None) => {}
         Err(error) => eprintln!("gateway usage: {}: {error}", path.display()),
     }
 }
@@ -2409,7 +2454,7 @@ fn add_gateway_usage(health: &mut HostHealth) {
 fn gateway_usage_metrics(
     bytes: &[u8],
     now: u64,
-) -> Result<BTreeMap<String, String>, String> {
+) -> Result<Option<BTreeMap<String, String>>, String> {
     use mycelium_peer_protocol::gateway_usage::{
         GatewayUsageMetrics, GatewayUsageSnapshot, GATEWAY_USAGE_SCHEMA_VERSION,
     };
@@ -2423,9 +2468,9 @@ fn gateway_usage_metrics(
     }
     let metrics = GatewayUsageMetrics::from_snapshot(&snapshot);
     if !metrics.is_fresh(now) {
-        return Err("usage snapshot is stale".into());
+        return Ok(None);
     }
-    Ok(metrics.to_platform_metrics())
+    Ok(Some(metrics.to_platform_metrics()))
 }
 
 fn add_update_health(health: &mut HostHealth) {
@@ -2821,7 +2866,9 @@ mod tests {
 
     #[test]
     fn fresh_gateway_usage_is_gossiped_and_stale_usage_is_dropped() {
-        let metrics = gateway_usage_metrics(&usage_document(1_000, 1), 1_060).unwrap();
+        let metrics = gateway_usage_metrics(&usage_document(1_000, 1), 1_060)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             metrics.get("mycelium_ai.completion_tokens").map(String::as_str),
             Some("12")
@@ -2830,12 +2877,14 @@ mod tests {
             metrics.get("mycelium_ai.window_completion_tokens").map(String::as_str),
             Some("4")
         );
-        // A stopped gateway must not report yesterday's traffic as current.
+        // A stopped gateway must not report yesterday's traffic as current, and
+        // being stopped is a state rather than an error to log on every tick.
         assert!(gateway_usage_metrics(
             &usage_document(1_000, 1),
             1_000 + mycelium_peer_protocol::gateway_usage::GATEWAY_USAGE_MAX_AGE_SECONDS + 1
         )
-        .is_err());
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -2958,16 +3007,7 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "mycelium-{name}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        crate::test_dir(name)
     }
 
     fn oidc_grant(principal: &str) -> AccessStatement {

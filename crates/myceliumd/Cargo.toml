@@ -22,6 +22,7 @@ path = "src/main.rs"
 iroh = { version = "=1.3.0", default-features = false, features = ["tls-aws-lc-rs"], optional = true }
 mycelium-iroh-discovery = { path = "../mycelium-iroh-discovery", optional = true }
 mycelium-core.workspace = true
+libc.workspace = true
 mycelium-dns-policy.workspace = true
 mycelium-driver-edgeos.workspace = true
 mycelium-driver-darwin.workspace = true

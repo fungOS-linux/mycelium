@@ -3158,12 +3158,48 @@ pub fn cap_result_json(
     })
 }
 
+/// Singleton claim on a state directory.
+///
+/// The socket check alone is racy: a second daemon can unlink and rebind the
+/// socket while the first is still serving, and then both write the same peer
+/// state. The kernel releases the lock when the process exits, so a crash never
+/// leaves the home unusable.
+fn claim_daemon_lock(home: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let path = home.join("daemon.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: the descriptor belongs to `file` for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("another myceliumd owns {}", home.display()),
+            ));
+        }
+    }
+    Ok(file)
+}
+
 /// Serve forever on the daemon socket. Removes a stale socket file if no
-/// live daemon owns it (pid check).
+/// live daemon owns it (singleton lock and pid check).
 pub async fn serve() -> std::io::Result<()> {
     let home = crate::home_dir();
     std::fs::create_dir_all(&home)?;
     crate::load_service_env()?;
+    let _lock = claim_daemon_lock(&home)?;
+    // Boot before touching the socket: a failed boot must not unlink a live
+    // daemon's socket and send every client looking for a new server.
+    let daemon = Arc::new(
+        Daemon::boot()
+            .await
+            .map_err(|e| std::io::Error::other(format!("boot failed: {e}")))?,
+    );
     let socket = crate::socket_path();
     if socket.exists() {
         match UnixStream::connect(&socket).await {
@@ -3188,11 +3224,6 @@ pub async fn serve() -> std::io::Result<()> {
     }
     std::fs::write(crate::pid_path(), format!("{}\n", std::process::id()))?;
 
-    let daemon = Arc::new(
-        Daemon::boot()
-            .await
-            .map_err(|e| std::io::Error::other(format!("boot failed: {e}")))?,
-    );
     let reconnect = daemon.clone();
     tokio::spawn(async move {
         reconnect
@@ -3394,6 +3425,19 @@ mod tests {
             .unwrap();
         assert!(daemon.saved.lock().await.contains_key(&id));
         assert!(daemon.inventory.devices().is_empty());
+    }
+
+    /// One state directory, one daemon. The socket check alone is racy: two
+    /// starts can both see a stale socket, and then both serve and both write
+    /// the same peer state.
+    #[test]
+    fn a_state_directory_has_one_daemon_owner() {
+        let home = crate::test_dir("daemon-lock");
+        let first = claim_daemon_lock(&home).unwrap();
+        let error = claim_daemon_lock(&home).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        drop(first);
+        claim_daemon_lock(&home).unwrap();
     }
 
     fn daemon_with_fake() -> Daemon {
@@ -3684,11 +3728,30 @@ mod tests {
         assert_eq!(plan["source"], "peer");
     }
 
+    /// `MYCELIUM_HOME` is process-global, so this flow runs in its own process:
+    /// in-process it would move the state directory for every test beside it.
+    #[test]
+    fn add_list_describe_call_scan_shutdown_flow() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rpc::tests::add_list_describe_call_scan_shutdown_flow_child",
+                "--nocapture",
+            ])
+            .env("MYCELIUM_TEST_ISOLATED_HOME", "1")
+            .env("MYCELIUM_HOME", crate::test_dir("daemon-home"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated flow failed: {status:?}");
+    }
+
     #[tokio::test]
-    async fn add_list_describe_call_scan_shutdown_flow() {
-        let home = std::env::temp_dir().join(format!("myceliumd-test-{}", std::process::id()));
+    async fn add_list_describe_call_scan_shutdown_flow_child() {
+        if std::env::var_os("MYCELIUM_TEST_ISOLATED_HOME").is_none() {
+            return;
+        }
+        let home = crate::home_dir();
         std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("MYCELIUM_HOME", &home);
 
         let d = daemon_with_fake();
 

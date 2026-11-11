@@ -579,14 +579,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_tpm_observation_does_not_claim_protection() {
-        let root = std::env::temp_dir().join(format!(
-            "mycelium-tpm-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = crate::test_dir("tpm-test");
         fs::create_dir_all(root.join("tpm0")).unwrap();
         fs::create_dir_all(root.join("tpm1")).unwrap();
         fs::create_dir_all(root.join("tpmrm0")).unwrap();

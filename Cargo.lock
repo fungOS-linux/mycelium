@@ -2822,6 +2822,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "fpl-resource-observation",
  "iroh",
+ "libc",
  "mycelium-core",
  "mycelium-dns-policy",
  "mycelium-driver-darwin",

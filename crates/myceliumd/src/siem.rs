@@ -548,11 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn jsonl_delivery_is_newline_delimited_and_structured() {
-        let path = std::env::temp_dir().join(format!(
-            "mycelium-siem-{}-{}.jsonl",
-            std::process::id(),
-            now()
-        ));
+        let path = crate::test_dir("siem").join("events.jsonl");
         let config = SinkConfig::Jsonl {
             name: "test".into(),
             path: path.clone(),

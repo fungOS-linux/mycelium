@@ -1252,8 +1252,7 @@ mod tests {
 
     #[test]
     fn activation_verifies_bytes_and_switches_current_atomically() {
-        let root =
-            std::env::temp_dir().join(format!("mycelium-software-test-{}", std::process::id()));
+        let root = crate::test_dir("software-test");
         let artifacts = root.join("artifacts");
         let software = root.join("software");
         std::fs::create_dir_all(&artifacts).unwrap();
@@ -1464,16 +1463,7 @@ mod tests {
     fn activation_fixture() -> (PathBuf, PathBuf, PathBuf, PackageManifest, PackageManifest) {
         let root = std::env::var_os("MYCELIUM_TEST_CRASH_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!(
-                    "mycelium-native-update-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                ))
-            });
+            .unwrap_or_else(|| crate::test_dir("native-update"));
         let artifacts = root.join("artifacts");
         let software = root.join("software");
         std::fs::create_dir_all(&artifacts).unwrap();
