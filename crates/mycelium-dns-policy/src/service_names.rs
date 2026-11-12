@@ -436,9 +436,9 @@ mod tests {
                 .iter()
                 .map(|(kind, node)| ((*kind).to_owned(), (*node).to_owned()))
                 .collect(),
-            reachable_prefixes: Vec::new(),
             suffix: "myc".to_owned(),
             site: "lab".to_owned(),
+            ..Policy::default()
         }
     }
 

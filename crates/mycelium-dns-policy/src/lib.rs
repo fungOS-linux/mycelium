@@ -1,5 +1,6 @@
 //! Site DNS records and delegated namespace intent, independent of discovery providers.
 pub mod addresses;
+pub mod peers;
 pub mod service_names;
 pub mod settings;
 

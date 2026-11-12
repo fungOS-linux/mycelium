@@ -42,25 +42,35 @@ Conflicts are not resolved silently:
 
 ## Zone addresses
 
-A service name resolves to the address of the host record it is projected onto, not
-an address of its own. `project_service_records` in `mycelium-dns-policy` is the only
-place that turns claims into records; the dnsmasq resolver and `mycelium dns zone`
-both call it, and both build their host records with the one publishable-address rule
-(`mycelium_dns_policy::addresses`): the overlay's address space always publishes, and
-every other address must sit inside a scope the installed policy declares reachable.
-An overlay host record therefore gives a service an overlay answer without either
-adapter special-casing address families.
+Node names come in two shapes from one peer observation:
 
-Both adapters read the same installed policy (`active-settings.json`): suffix, alias
-table, apex owners and reachable scopes. They observe different inputs — the resolver
-publishes fresh authenticated peers, `dns zone` previews the daemon's topology — so the
-node set can differ, but the rules and the address scopes do not.
+- `node.site.suffix` carries every publishable address: the path into that site
+  (LAN, WireGuard mesh, Tailscale).
+- `node.suffix` is the flat identity name and carries **AAAA only**: the address
+  the node answers at from anywhere. IPv4 is a path, not an identity, so a flat
+  IPv4 answer would name a route that only exists inside one site.
 
-`dns zone --zone overlay` publishes `node.suffix` from
-`TopoNode::overlay_ips("mycelium0")`. That zone is empty until the daemon records
-binding addresses: its wireguard-binding observation currently carries no addresses
-(`Observation::OverlaySelf { ips: Vec::new() }`), so the overlay half is wired and
-tested but has no live source yet.
+`mycelium_dns_policy::peers::host_records` is the only place the daemon's peer
+view becomes records. The dnsmasq resolver and `mycelium dns zone` both call it
+with the installed policy (suffix, admitted sites, reachable scopes, freshness,
+delegations), so the preview and the live zone are the same record set, not
+merely the same rules:
+
+```console
+$ mycelium dns zone --zone all --json      # == mycelium-dns-resolver plan records
+$ dig +short @<resolver> pris.myc AAAA
+fd7a:115c:a1e0::f034:8254
+```
+
+`publishable_address` decides which addresses a name may carry: the overlay's own
+ULA space always publishes, everything else only inside a scope the installed
+policy declares reachable (`reachable_prefixes`). `mycelium dns zone --reachable
+CIDR...` previews an ad-hoc scope on a host with no installed resolver.
+
+A service name resolves to the address of the host record it is projected onto,
+not an address of its own (`project_service_records`). Services project onto site
+records only: a flat service name would collide across sites, and a service is an
+entrance into one site.
 
 ## Manual runbook
 

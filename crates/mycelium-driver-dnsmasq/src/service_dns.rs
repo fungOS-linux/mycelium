@@ -87,6 +87,10 @@ pub(super) fn project(
         service_aliases: aliases(settings)?,
         service_index_peers: settings.service_index_peers.clone(),
         reachable_prefixes: settings.reachable_prefixes.clone(),
+        mesh_sites: settings.mesh_sites,
+        additional_sites: settings.additional_sites.clone(),
+        expiry_seconds: settings.expiry_seconds,
+        delegations: settings.resolver.delegations.clone(),
         suffix: settings.resolver.suffix.clone(),
         site: settings.resolver.site.clone(),
     };

@@ -249,9 +249,9 @@ usage:
   mycelium wireguard bindings [--json]
   mycelium egress list [--json]
   mycelium egress probe --server HOST:PORT... [--bind IP] [--port PORT] [--json]
-  mycelium dns zone [--zone lan|overlay|all] [--suffix DOMAIN] [--site SITE] [--json]
+  mycelium dns zone [--zone lan|flat|all] [--suffix DOMAIN] [--site SITE] [--reachable CIDR...] [--json]
   mycelium dns service-address --prefix CIDR [--json]
-  mycelium dns plan --site SITE [--suffix DOMAIN] [--delegations FILE] [--json|--dnsmasq]
+  mycelium dns plan --site SITE [--suffix DOMAIN] [--delegations FILE] [--reachable CIDR...] [--json|--dnsmasq]
   mycelium dns resolver init --config FILE --site SITE --suffix DOMAIN --reachable CIDR... --write [--service-address CIDR] [--doh URL [--doh-listen ADDR]]
   mycelium dns resolver plan|status --config FILE
   mycelium dns resolver apply|run|system-install|system-remove --config FILE --write [--dry-run]
@@ -1724,13 +1724,15 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     let mut suffix_arg = None;
     let mut site = None;
     let mut zone = "lan";
+    let mut reachable: Vec<String> = Vec::new();
     let mut delegation_file = None;
     let mut json = false;
     let mut dnsmasq = false;
     let mut options = std::collections::BTreeSet::new();
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
-        if !options.insert(flag.as_str()) {
+        // `--reachable` is repeated by design: it is the scope list.
+        if flag.as_str() != "--reachable" && !options.insert(flag.as_str()) {
             return Err(err_usage("duplicate DNS option"));
         }
         match flag.as_str() {
@@ -1746,7 +1748,7 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
             "--zone" if action == "zone" => {
                 zone = rest
                     .next()
-                    .ok_or_else(|| err_usage("--zone needs `lan`, `overlay`, or `all`"))?;
+                    .ok_or_else(|| err_usage("--zone needs `lan`, `flat`, or `all`"))?;
             }
             "--site" => {
                 site = Some(
@@ -1755,6 +1757,11 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
                         .as_str(),
                 )
             }
+            "--reachable" => reachable.push(
+                rest.next()
+                    .ok_or_else(|| err_usage("--reachable needs a CIDR"))?
+                    .to_string(),
+            ),
             "--delegations" if action == "plan" => {
                 delegation_file = Some(
                     rest.next()
@@ -1770,20 +1777,20 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
     if action == "plan" && site.is_none() {
         return Err(err_usage("dns plan requires --site"));
     }
-    // Service names and the zone suffix belong to the naming policy this host
-    // installed, not to a second default here: a preview that composed its own
-    // names would disagree with the resolver it is previewing. No policy means
-    // no service names.
-    let mut naming = mycelium_dns_policy::settings::load_active(&myceliumd::home_dir().join("dns"))
+    // Service names, the suffix and the address scopes belong to the policy this
+    // host installed, not to a second default here: a preview that invented its
+    // own names or scopes would disagree with the resolver it is previewing.
+    let mut policy = mycelium_dns_policy::settings::load_active(&myceliumd::home_dir().join("dns"))
         .map_err(|error| err_usage(&error))?;
-    if let (Some(explicit), Some(naming)) = (suffix_arg, naming.as_mut()) {
+    if let (Some(explicit), Some(policy)) = (suffix_arg, policy.as_mut()) {
         // Looking at another namespace still uses this host's aliases and apex.
-        naming.suffix = explicit.to_owned();
+        policy.suffix = explicit.to_owned();
     }
     let suffix = suffix_arg
-        .or_else(|| naming.as_ref().map(|naming| naming.suffix.as_str()))
-        .unwrap_or("myc");
-    dns::canonical_domain(suffix).map_err(|e| err_usage(&e))?;
+        .or_else(|| policy.as_ref().map(|policy| policy.suffix.as_str()))
+        .unwrap_or("myc")
+        .to_owned();
+    dns::canonical_domain(&suffix).map_err(|e| err_usage(&e))?;
     let delegations: Vec<dns::Delegation> = if let Some(path) = delegation_file {
         use std::io::Read;
         let mut bytes = Vec::new();
@@ -1798,64 +1805,89 @@ async fn dns_command(args: &[String]) -> Result<Vec<String>, ClientError> {
         Vec::new()
     };
     if let Some(site) = site {
-        dns::plan(site, suffix, Vec::new(), delegations.clone()).map_err(|e| err_usage(&e))?;
+        dns::plan(site, &suffix, Vec::new(), delegations.clone()).map_err(|e| err_usage(&e))?;
     }
+    // The resolver publishes from the daemon's authenticated peer view, so the
+    // preview reads the same view. Without an installed policy the preview is an
+    // explicit ad-hoc one: `--reachable` supplies the scopes it would publish.
+    let installed = policy.is_some();
+    let policy = policy.unwrap_or_else(|| mycelium_dns_policy::settings::Policy {
+        mesh_sites: true,
+        ..Default::default()
+    });
+    let scope_prefixes = if reachable.is_empty() {
+        policy.reachable_prefixes.as_slice()
+    } else {
+        reachable.as_slice()
+    };
+    if !installed && scope_prefixes.is_empty() {
+        return Err(err_usage(
+            "no installed resolver policy; pass --reachable CIDR... to preview scopes",
+        ));
+    }
+    let scope_site = site.unwrap_or(policy.site.as_str());
     let mut client = connect().await?;
-    let topology: Topology = serde_json::from_value(client.call(&Request::Topology).await?)
-        .map_err(|error| err_usage(&format!("invalid topology response: {error}")))?;
-    let mut bindings: Vec<mycelium_peer_protocol::WireGuardBinding> =
-        serde_json::from_value(client.call(&Request::WireGuardBindingList).await?)
-            .map_err(|error| err_usage(&format!("invalid WireGuard bindings: {error}")))?;
+    let peers = client
+        .call(&Request::PeerList)
+        .await
+        .map_err(|error| err_usage(&format!("invalid peer view: {error}")))?;
+    let host = mycelium_dns_policy::peers::host_records(
+        &peers,
+        &mycelium_dns_policy::peers::PeerScope {
+            suffix: &suffix,
+            site: scope_site,
+            mesh_sites: policy.mesh_sites,
+            additional_sites: &policy.additional_sites,
+            reachable_prefixes: scope_prefixes,
+            expiry_seconds: policy.expiry_seconds,
+            delegations: &policy.delegations,
+        },
+        unix_now(),
+    )
+    .map_err(|error| err_usage(&error))?;
+    let mut site_records = host.site;
+    let mut flat_records = host.flat;
     if let Some(site) = site {
-        bindings.retain(|binding| binding.site == site);
+        site_records.retain(|record| record.site == site);
+        flat_records.retain(|record| record.site == site);
     }
-    // LAN zone: `node.site.<suffix>` -> a LAN address reached through a signed
-    // site route. Overlay zone: `node.<suffix>` -> the node's
-    // transport-agnostic overlay address. `all` emits both.
-    if !matches!(zone, "lan" | "overlay" | "all") {
-        return Err(err_usage("--zone must be `lan`, `overlay`, or `all`"));
-    }
-    let mut records = Vec::new();
-    if matches!(zone, "lan" | "all") {
-        records.extend(
-            dns::derive_host_records(
-                &topology,
-                &bindings,
-                suffix,
-                naming
-                    .as_ref()
-                    .map(|naming| naming.reachable_prefixes.as_slice()),
-            )
-            .map_err(|error| err_usage(&error))?,
-        );
-    }
-    if matches!(zone, "overlay" | "all") {
-        records.extend(
-            dns::derive_overlay_records(&topology, suffix).map_err(|error| err_usage(&error))?,
-        );
-    }
-    // Service names are projected onto the host records above by the same rule
-    // the resolver applies, so a service answers with the address its host
-    // record published - including the overlay's own address.
-    if let Some(naming) = &naming {
+    // Service names are projected onto the site records by the same rule the
+    // resolver applies, so a service answers with the address its host record
+    // published. A flat service name would collide across sites, so only site
+    // records are projection targets.
+    if installed {
         let catalog = serde_json::from_value::<fpl_resource_observation::ServiceCatalog>(
             client.call(&Request::Services).await?,
         )
         .map_err(|error| err_usage(&format!("invalid service catalog: {error}")))?;
         let (services, _) = mycelium_dns_policy::service_names::project_service_records(
-            naming,
-            &records,
+            &policy,
+            &site_records,
             &catalog,
             unix_now(),
         )
         .map_err(|error| err_usage(&error))?;
-        records.extend(services);
+        site_records.extend(services);
+    }
+    // `lan` = `node.site.<suffix>` (A and AAAA paths into a site). `flat` =
+    // `node.<suffix>` (AAAA only: the address a node answers at from anywhere).
+    if !matches!(zone, "lan" | "flat" | "all") {
+        return Err(err_usage("--zone must be `lan`, `flat`, or `all`"));
+    }
+    let mut records = Vec::new();
+    // A plan renders what the resolver would publish for that site, so it always
+    // includes both families; `--zone` only narrows the `zone` preview.
+    if action == "plan" || matches!(zone, "lan" | "all") {
+        records.extend(site_records);
+    }
+    if action == "plan" || matches!(zone, "flat" | "all") {
+        records.extend(flat_records);
     }
     records.sort();
-    records.dedup();
+    records.dedup_by(|left, right| left.name == right.name && left.address == right.address);
     if action == "plan" {
         let plan =
-            dns::plan(site.unwrap(), suffix, records, delegations).map_err(|e| err_usage(&e))?;
+            dns::plan(site.unwrap(), &suffix, records, delegations).map_err(|e| err_usage(&e))?;
         if dnsmasq {
             return Ok(vec![plan.dnsmasq]);
         }

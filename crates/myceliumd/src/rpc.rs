@@ -3346,8 +3346,9 @@ impl crate::proxy::TargetResolver for MeshTargetResolver {
         let label = host
             .strip_suffix(&format!(".{suffix}"))
             .unwrap_or(host.as_str());
-        // One label only: `node.<suffix>` is the overlay zone. A site-qualified
-        // name resolves to a LAN address and never needs the proxy.
+        // One label only: `node.<suffix>` is the flat identity name. A
+        // site-qualified name resolves to a path into a site and never needs
+        // the proxy.
         if label.is_empty() || label.contains('.') {
             return None;
         }

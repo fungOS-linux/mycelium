@@ -33,6 +33,13 @@ pub struct Policy {
     /// the zone must apply the same scopes the resolver applies, or the preview
     /// and the live answer disagree about which address a name has.
     pub reachable_prefixes: Vec<String>,
+    /// Which sites' peers become records. A preview has to admit the same peers.
+    pub mesh_sites: bool,
+    pub additional_sites: Vec<String>,
+    /// The freshness bound on peer observations, in seconds.
+    pub expiry_seconds: u64,
+    /// Subtrees owned by another resolver; names under them are never published.
+    pub delegations: Vec<crate::Delegation>,
     pub suffix: String,
     pub site: String,
 }
@@ -43,6 +50,10 @@ impl Default for Policy {
             service_aliases: BTreeMap::new(),
             service_index_peers: BTreeMap::new(),
             reachable_prefixes: Vec::new(),
+            mesh_sites: false,
+            additional_sites: Vec::new(),
+            expiry_seconds: 300,
+            delegations: Vec::new(),
             suffix: "myc".to_owned(),
             site: String::new(),
         }
@@ -88,7 +99,17 @@ struct Raw {
     #[serde(default)]
     reachable_prefixes: Vec<String>,
     #[serde(default)]
+    mesh_sites: bool,
+    #[serde(default)]
+    additional_sites: Vec<String>,
+    #[serde(default = "default_expiry")]
+    expiry_seconds: u64,
+    #[serde(default)]
     resolver: RawResolver,
+}
+
+fn default_expiry() -> u64 {
+    300
 }
 
 #[derive(Default, Deserialize)]
@@ -97,6 +118,8 @@ struct RawResolver {
     suffix: String,
     #[serde(default)]
     site: String,
+    #[serde(default)]
+    delegations: Vec<crate::Delegation>,
 }
 
 impl From<Raw> for Policy {
@@ -105,6 +128,10 @@ impl From<Raw> for Policy {
             service_aliases: raw.service_aliases,
             service_index_peers: raw.service_index_peers,
             reachable_prefixes: raw.reachable_prefixes,
+            mesh_sites: raw.mesh_sites,
+            additional_sites: raw.additional_sites,
+            expiry_seconds: raw.expiry_seconds,
+            delegations: raw.resolver.delegations,
             suffix: raw.resolver.suffix,
             site: raw.resolver.site,
         }

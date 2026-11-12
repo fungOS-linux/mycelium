@@ -6,6 +6,7 @@ use mycelium_core::{
     MyceliumError, Params,
 };
 use mycelium_dns_policy::addresses::publishable_address;
+use mycelium_dns_policy::peers::{host_records, HostRecords, PeerScope};
 use mycelium_dns_policy::resolver::{ResolverConfig, ResolverMode};
 use mycelium_dns_policy::{canonical_domain, DnsRecord};
 use serde::{Deserialize, Serialize};
@@ -288,87 +289,23 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
-/// Adapt the daemon's JSON peer view, already subject to fleet authentication.
-/// Expired identities cannot squat a name after re-enrollment. Competing live
-/// owners fail closed instead of arbitrarily choosing an identity.
-pub fn peer_records(
-    settings: &Settings,
-    peers: &Value,
-    timestamp: u64,
-) -> Result<Vec<DnsRecord>, String> {
-    let peers = peers.as_array().ok_or("peers must be an array")?;
-    let suffix = canonical_domain(&settings.resolver.suffix)?;
-    let mut records = BTreeSet::new();
-    let mut owners = BTreeMap::new();
-    for peer in peers {
-        let Some(hello) = peer.get("hello") else {
-            continue;
-        };
-        let Some(peer_site) = hello["site"].as_str() else {
-            continue;
-        };
-        if !settings.admits_site(peer_site) {
-            continue;
-        }
-        let Some(seen) = peer["last_seen"].as_u64() else {
-            continue;
-        };
-        if seen > timestamp + 30 || timestamp.saturating_sub(seen) > settings.expiry_seconds {
-            continue;
-        }
-        let site = canonical_domain(peer_site)?;
-        if site != peer_site || site.contains('.') {
-            return Err("peer site must be one canonical DNS label".into());
-        }
-        let Some(node) = hello["node_id"].as_str() else {
-            continue;
-        };
-        let Some(host) = hello["hostname"].as_str() else {
-            continue;
-        };
-        let host = canonical_domain(host)?;
-        if host.contains('.') {
-            return Err("peer hostname must be one DNS label".into());
-        }
-        let name = format!("{host}.{site}.{suffix}");
-        // A configured delegation owns its subtree, even for authenticated peers.
-        if settings
-            .resolver
-            .delegations
-            .iter()
-            .any(|d| name == d.zone || name.ends_with(&format!(".{}", d.zone)))
-        {
-            continue;
-        }
-        let Some(interfaces) = hello["interfaces"].as_array() else {
-            continue;
-        };
-        for address in interfaces
-            .iter()
-            .filter_map(|i| i["addresses"].as_array())
-            .flatten()
-        {
-            let Some(address) = address.as_str().and_then(|a| a.parse::<IpAddr>().ok()) else {
-                continue;
-            };
-            if !publishable_address(address, &settings.reachable_prefixes) {
-                continue;
-            }
-            if owners
-                .insert(name.clone(), node.to_owned())
-                .is_some_and(|owner| owner != node)
-            {
-                return Err(format!("competing live owners for {name}"));
-            }
-            records.insert(DnsRecord {
-                name: name.clone(),
-                address,
-                site: peer_site.into(),
-                node: node.into(),
-            });
-        }
-    }
-    Ok(records.into_iter().collect())
+/// Adapt the daemon's JSON peer view to records, with the policy this resolver
+/// installs. The rule itself lives in `mycelium_dns_policy::peers` so the CLI
+/// preview of this zone is the same function, not a second implementation.
+fn peer_records(settings: &Settings, peers: &Value, timestamp: u64) -> Result<HostRecords, String> {
+    host_records(
+        peers,
+        &PeerScope {
+            suffix: &settings.resolver.suffix,
+            site: &settings.resolver.site,
+            mesh_sites: settings.mesh_sites,
+            additional_sites: &settings.additional_sites,
+            reachable_prefixes: &settings.reachable_prefixes,
+            expiry_seconds: settings.expiry_seconds,
+            delegations: &settings.resolver.delegations,
+        },
+        timestamp,
+    )
 }
 
 async fn observation(settings: &Settings) -> Result<(Vec<DnsRecord>, u64), String> {
@@ -400,10 +337,11 @@ async fn observation(settings: &Settings) -> Result<(Vec<DnsRecord>, u64), Strin
     }
     let peers: Value = serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
     let timestamp = now();
-    let records = peer_records(settings, &peers, timestamp)?;
-    let owners = records
+    let host = peer_records(settings, &peers, timestamp)?;
+    let owners = host
+        .site
         .iter()
-        .map(|r| r.node.as_str())
+        .map(|record| record.node.as_str())
         .collect::<BTreeSet<_>>();
     let deadline = peers
         .as_array()
@@ -418,13 +356,19 @@ async fn observation(settings: &Settings) -> Result<(Vec<DnsRecord>, u64), Strin
         .map(|seen| seen.saturating_add(settings.expiry_seconds))
         .min()
         .unwrap_or(timestamp + settings.expiry_seconds);
-    Ok(with_service_observation(
+    // Service names are projected onto site records only: a flat service name
+    // would collide across sites, and a service is a site's entrance.
+    let (mut records, deadline) = with_service_observation(
         settings,
-        records,
+        host.site,
         service_observation(settings).await,
         timestamp,
         deadline,
-    ))
+    );
+    records.extend(host.flat);
+    records.sort();
+    records.dedup_by(|left, right| left.name == right.name && left.address == right.address);
+    Ok((records, deadline))
 }
 
 async fn service_observation(settings: &Settings) -> Result<ServiceCatalog, String> {
@@ -1563,6 +1507,10 @@ mod tests {
             service_index_peers: BTreeMap::new(),
         }
     }
+    /// Same policy, merged output: most tests care about the record set.
+    fn project(s: &Settings, peers: &Value, now: u64) -> Result<Vec<DnsRecord>, String> {
+        peer_records(s, peers, now).map(HostRecords::merge)
+    }
     fn peer(node: &str, seen: u64) -> Value {
         json!({"hello":{"node_id":node,"hostname":"gpu","site":"lab","interfaces":[{"addresses":["192.0.2.12","198.51.100.1","fe80::1"]}]},"last_seen":seen})
     }
@@ -1572,11 +1520,11 @@ mod tests {
         s.mesh_sites = false;
         let mut remote = peer("remote", 999);
         remote["hello"]["site"] = json!("titan");
-        assert!(peer_records(&s, &json!([remote.clone()]), 1000)
+        assert!(project(&s, &json!([remote.clone()]), 1000)
             .unwrap()
             .is_empty());
         s.additional_sites = vec!["titan".into()];
-        let records = peer_records(&s, &json!([remote]), 1000).unwrap();
+        let records = project(&s, &json!([remote]), 1000).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].site, "titan");
         assert_eq!(records[0].name, "gpu.titan.myc");
@@ -1598,23 +1546,23 @@ mod tests {
         let s = settings();
         let mut remote = peer("remote", 999);
         remote["hello"]["site"] = json!("titan");
-        let records = peer_records(&s, &json!([remote.clone()]), 1000).unwrap();
+        let records = project(&s, &json!([remote.clone()]), 1000).unwrap();
         assert_eq!(records.len(), 1); // Unreachable and link-local IPs remain excluded.
         assert!(s
             .render(records.clone())
             .unwrap()
             .contains("host-record=gpu.titan.myc,192.0.2.12"));
-        assert!(peer_records(&s, &json!([remote.clone()]), 1400)
+        assert!(project(&s, &json!([remote.clone()]), 1400)
             .unwrap()
             .is_empty());
         let mut restricted = s.clone();
         restricted.mesh_sites = false;
-        assert!(peer_records(&restricted, &json!([remote.clone()]), 1000)
+        assert!(project(&restricted, &json!([remote.clone()]), 1000)
             .unwrap()
             .is_empty());
         assert!(restricted.render(records).is_err());
         remote["hello"]["site"] = json!("fake.site");
-        assert!(peer_records(&s, &json!([remote]), 1000).is_err());
+        assert!(project(&s, &json!([remote]), 1000).is_err());
         let mut config = serde_json::to_value(&s).unwrap();
         config.as_object_mut().unwrap().remove("mesh_sites");
         assert!(
@@ -1638,7 +1586,7 @@ mod tests {
             });
         let mut remote = peer("remote", 999);
         remote["hello"]["site"] = json!("titan");
-        assert!(peer_records(&s, &json!([remote]), 1000).unwrap().is_empty());
+        assert!(project(&s, &json!([remote]), 1000).unwrap().is_empty());
         assert!(s.render(vec![]).unwrap().contains("server=/titan.myc/"));
     }
 
@@ -1647,7 +1595,9 @@ mod tests {
         let mut s = settings();
         s.service_aliases
             .insert("mycelium-host-web".into(), "mycelium".into());
-        let hosts = peer_records(&s, &json!([peer("a", 999)]), 1000).unwrap();
+        let hosts = peer_records(&s, &json!([peer("a", 999)]), 1000)
+            .unwrap()
+            .site;
         let (records, deadline) = with_service_observation(
             &s,
             hosts.clone(),
@@ -1667,7 +1617,7 @@ mod tests {
         );
         assert_eq!(records, hosts);
         assert_eq!(deadline, 1299);
-        assert!(peer_records(&s, &json!([peer("a", 999)]), 1300)
+        assert!(project(&s, &json!([peer("a", 999)]), 1300)
             .unwrap()
             .is_empty());
     }
@@ -1679,14 +1629,15 @@ mod tests {
             &json!([peer("old", 1), peer("new", 999)]),
             1000,
         )
-        .unwrap();
+        .unwrap()
+        .site;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node, "new");
         assert_eq!(records[0].name, "gpu.lab.myc");
     }
     #[test]
     fn competing_live_identity_fails_closed() {
-        assert!(peer_records(&settings(), &json!([peer("a", 999), peer("b", 999)]), 1000).is_err());
+        assert!(project(&settings(), &json!([peer("a", 999), peer("b", 999)]), 1000).is_err());
     }
     /// The resolver publishes the overlay address of every peer without an
     /// operator-declared scope: it belongs to the node by identity. Other
@@ -1697,7 +1648,7 @@ mod tests {
         remote["hello"]["interfaces"] = json!([{
             "addresses": ["fd7a:115c:a1e0::6", "10.9.9.9", "fe80::1"]
         }]);
-        let records = peer_records(&settings(), &json!([remote]), 1000).unwrap();
+        let records = project(&settings(), &json!([remote]), 1000).unwrap();
         let addresses = records
             .iter()
             .map(|record| record.address.to_string())
@@ -1738,7 +1689,7 @@ mod tests {
     #[test]
     fn retained_records_cannot_extend_expiry_or_cross_policy() {
         let s = settings();
-        let records = peer_records(&s, &json!([peer("a", 999)]), 1000).unwrap();
+        let records = project(&s, &json!([peer("a", 999)]), 1000).unwrap();
         let mesh_sites = s.mesh_sites;
         let make = |expiry| Retained {
             mesh_sites,
