@@ -5,3 +5,6 @@ target/
 *.pid
 .mycelium/
 brag-output*/
+
+# release build output
+dist/

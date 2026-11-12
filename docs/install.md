@@ -128,6 +128,8 @@ not write files, start services, or ask for sudo.
 
 - **VPN**: an IPv6 overlay prefix. The installer detects this node's existing
   IPv6 `.myc` address when the daemon has one; otherwise pass `--overlay`.
+- **DNS**: `dnsmasq` at a known path (`/usr/sbin`, `/usr/bin`, or the Homebrew
+  paths). `mycelium dns resolver init` refuses to create a policy without it.
 - **VFS FUSE**: macFUSE on macOS, `/dev/fuse` on Linux. Without it the VFS
   binaries are installed but the mount service is skipped.
 - **Linux services**: a systemd host with a user session for the VFS, Soil, and

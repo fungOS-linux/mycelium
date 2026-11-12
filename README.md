@@ -70,6 +70,10 @@ model. `MYCELIUM_GATEWAY` can select any compatible enrollment deployment. The
 installer disables automatic updates for a local build by default; pass
 `--enable-updates` to keep them enabled.
 
+The native component inventory and the no-GitHub-Actions release path are in
+[docs/native-components.md](docs/native-components.md) and
+[docs/releasing.md](docs/releasing.md).
+
 After installation, enrollment can be repeated explicitly with
 `mycelium setup --gateway https://sso.fpl.dev`.
 
