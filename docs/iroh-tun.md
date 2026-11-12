@@ -47,6 +47,13 @@ would be worse than being down.
 }
 ```
 
+Set `"external": true` when a root-owned LaunchDaemon or systemd unit runs
+the child. In that mode this daemon still owns the key and publishes the
+observation, but it never spawns or reaps a child; it reads the fresh status
+document the privileged child writes. The installer uses this mode on macOS
+and Linux. `status` can point at a root-owned runtime directory so a
+user-created symlink cannot redirect a root write.
+
 `overlay` is what this node answers for, as peers see it: prefixes are masked,
 deduplicated and sorted, and a default route (`0.0.0.0/0`) is refused because a
 claim about every address is not a claim about one node. Empty is legal — a
@@ -97,6 +104,23 @@ mycelium doctor                   # is the kind published; does the tunnel route
 mycelium doctor --fix             # bounce a configured tunnel that is not working
 ```
 
+### Root-owned service
+
+A normal user cannot create a utun on macOS. The installer therefore writes
+`external: true` and installs a root-owned service (see
+[docs/install.md](install.md)):
+
+- the user daemon keeps the key, computes the endpoint id, and publishes the
+  `iroh-tun` observation;
+- root runs the child with the key and the same status path;
+- root executes root-owned copies of `mycelium` and `iroh-tun`, never a binary
+  from the user's home;
+- the status file lives under `/var/run/mycelium` (macOS) or `/run/mycelium`
+  (Linux), owned by root.
+
+This is not the narrow fd-passing helper described below, but it removes the
+user-level EPERM without running the whole daemon as root.
+
 `doctor` asks two questions that `ifconfig` cannot answer: whether the local node
 publishes the `iroh-tun` kind, and whether the tunnel has learned at least one
 peer prefix. A device that exists with no peers looks identical to a healthy one
@@ -107,11 +131,13 @@ exist.
 ## Not yet implemented
 
 - **Kernel route installation.** The child learns prefixes and reports them; it
-does not add routes to the host. Until that lands, an operator adds the peer
-prefixes to the tun by hand, and the status document describes the tunnel's table
-rather than the kernel's.
-- **Privilege split.** The whole process holds the tun fd. The intended shape is
-a small privileged helper that owns only the device.
+  does not add routes to the host. Until that lands, an operator adds the peer
+  prefixes to the tun by hand, and the status document describes the tunnel's
+  table rather than the kernel's. The installer starts the root-owned tunnel;
+  it does not make the overlay a routed network.
+- **Narrow privilege split.** The root service holds the tun fd and runs the
+  whole child as root. A small helper that owns only the device and passes its
+  fd remains the intended shape.
 
 The child already refuses oversize packets with a checksummed ICMP
 fragmentation-needed notice (rather than dropping them silently) and drops any

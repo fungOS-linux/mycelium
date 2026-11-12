@@ -50,21 +50,33 @@ and integration work is being migrated from this checkout's `fungOS/` directory.
 
 ## Quick start
 
-For a first-time user, the installer builds the CLI and starts browser-based
-OIDC enrollment. `MYCELIUM_GATEWAY` can select any compatible deployment.
+One installer builds the core binaries, enrolls the node, and prompts for the
+optional pieces (IPv6 VPN, VFS, Soil + `fungOS.app`, build offload, operator
+gateway). It supports macOS and systemd-based Linux; `fungOS.app` is macOS-only.
+It is safe to re-run: binaries are backed up before replacement and existing
+enrollment is repaired in place. Use `--yes` for recommended defaults.
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsS \
-  https://raw.githubusercontent.com/ajmwagar/mycelium/master/install.sh | sh
+  https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh | bash
 ```
+
+After you accept the VPN component, the installer asks for sudo before the core
+build because macOS and Linux need root to create the tunnel device. It reuses
+that authorization for the DNS resolver service; declining the VPN with
+`--no-vpn` does not remove the DNS service's root requirement. See
+[docs/install.md](docs/install.md) for the full component and root-service
+model. `MYCELIUM_GATEWAY` can select any compatible enrollment deployment. The
+installer disables automatic updates for a local build by default; pass
+`--enable-updates` to keep them enabled.
 
 After installation, enrollment can be repeated explicitly with
 `mycelium setup --gateway https://sso.fpl.dev`.
 
 On a workstation that should expose local capability names such as `ai.myc`
-and `mcp.myc`, install the loopback HTTPS gateway after enrollment. The
-`--trust-cert` flag adds the generated local CA to the login keychain so the
-browser accepts the names:
+and `mcp.myc`, the operator component installs the loopback HTTPS gateway after
+enrollment. The `--trust-cert` flag adds the generated local CA to the login
+keychain so the browser accepts the names. The same steps can be run directly:
 
 ```sh
 mycelium setup --claim "$CLAIM" --local-gateway --trust-cert
@@ -124,8 +136,8 @@ mycelium pair --name buddy --unix-user operator \
 
 # New user machine:
 curl --proto '=https' --tlsv1.2 -fsS \
-  https://raw.githubusercontent.com/ajmwagar/mycelium/master/install.sh | \
-  sh -s -- --claim MYC1-REPLACE-WITH-THE-PAIRING-CLAIM
+  https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh | \
+  bash -s -- --yes --claim MYC1-REPLACE-WITH-THE-PAIRING-CLAIM
 ```
 
 Peer membership is separate from SSH access. A peer claim creates its private
