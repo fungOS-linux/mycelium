@@ -10,11 +10,11 @@ curl -fsSL https://raw.githubusercontent.com/fungOS-linux/mycelium/master/instal
 
 Use `--yes` for the recommended defaults, or answer the component prompts. The
 prompts run in this order: IPv6 VPN (then sudo), VFS, Soil + `fungOS.app`, build
-offload, operator surface, enrollment. Every prompt can be answered up front with
-the flags below. With no terminal, pass `--yes` or every component flag; the
-installer stops rather than silently assuming defaults. A source build is the
-default until these installer and `iroh-tun` supervisor changes are in a signed
-release. The installer disables automatic updates for a local build by default
+offload, operator surface, optional geode broker, enrollment. Every prompt can be
+answered up front with the flags below. With no terminal, pass `--yes` or every
+component flag; the installer stops rather than silently assuming defaults. A
+source build is the default until these installer and `iroh-tun` supervisor
+changes are in a signed release. The installer disables automatic updates for a local build by default
 (the signed channel can otherwise replace it with an older release); pass
 `--enable-updates` to keep them enabled.
 
@@ -36,7 +36,8 @@ release. The installer disables automatic updates for a local build by default
 The Linux path assumes a systemd host. Without a user systemd session, VFS,
 Soil, and the user DNS listener still write their units, but startup can fail;
 the installer reports the component. The privileged tunnel and DNS wiring still
-use system units.
+use system units. User units start at login; run `loginctl enable-linger <user>`
+if they must start before a login session exists.
 
 ## Components
 
@@ -47,6 +48,7 @@ use system units.
 | VPN (default) | Builds `iroh-tun`, assigns an IPv6 overlay prefix, and installs a root-owned LaunchDaemon (macOS) or systemd unit (Linux). |
 | VFS (default) | Builds `fungos-vfs` and its provider/fetch/FUSE binaries, creates the content root and mount point, and installs user services when their prerequisites exist. |
 | Soil (default) | Builds the `soil` CLI, creates the fungOS data directories, installs `fungOS.app` on macOS when a bundle is supplied or present, and installs `soil-home`/`soil-store` as LaunchAgents or systemd user units when the runtime binaries are available. A failed CLI build is reported but does not block the app or runtime setup. |
+| Geode (opt-in) | Installs the `geoded` broker and a user service with a private store under `~/.geode`. Re-run with `--geode` to upgrade it; omitting the flag leaves an existing service alone. |
 | Build offload (default) | Builds `fpl-bob`, writes the sccache client configuration, and records the optional sccache-dist scheduler and remote build hosts. |
 
 ## The privileged tunnel
@@ -113,6 +115,9 @@ sudo rm -rf /usr/local/libexec/mycelium /var/run/mycelium
 # Keep the signed update channel enabled
 ./install.sh --yes --enable-updates
 
+# Enable or upgrade the optional geode broker later
+./install.sh --geode
+
 # Non-interactive claim redemption
 curl -fsSL https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh \
   | bash -s -- --yes --claim MYC1-...
@@ -130,6 +135,8 @@ not write files, start services, or ask for sudo.
   IPv6 `.myc` address when the daemon has one; otherwise pass `--overlay`.
 - **DNS**: `dnsmasq` at a known path (`/usr/sbin`, `/usr/bin`, or the Homebrew
   paths). `mycelium dns resolver init` refuses to create a policy without it.
+  The installer retires legacy `mycelium-dns-resolver` user agents before it
+  applies the current resolver; the current root service/unit is persistent.
 - **VFS FUSE**: macFUSE on macOS, `/dev/fuse` on Linux. Without it the VFS
   binaries are installed but the mount service is skipped.
 - **Linux services**: a systemd host with a user session for the VFS, Soil, and
@@ -149,6 +156,9 @@ not write files, start services, or ask for sudo.
   The app is an ad-hoc-signed development build, so Gatekeeper may reject it
   even when the bundle is complete. Linux installs the Soil runtime without the
   app.
+- **Geode**: optional. `--geode` creates `~/.geode`, starts `geoded` as a user
+  service, and leaves the key/store in that directory. The installer does not
+  remove an existing broker when the flag is omitted.
 - **bob**: the source repository may require credentials; `--bob-src` or a local
   `~/Documents/src/bob` checkout avoids a clone. Scheduler URL/token are optional
   and prompt only when the component is selected.

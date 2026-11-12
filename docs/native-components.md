@@ -15,17 +15,17 @@ should be a Spore where the runtime already provides the capability.
 | Artifact | Crate | Installer role | Required | Boundary | Notes |
 |---|---|---|---|---|---|
 | `mycelium` | `mycelium-cli` | CLI, enrollment, daemon via hidden `_serve` | yes | Unix socket, PKI, host state | Canonical user-facing binary; launchd/systemd run `mycelium _serve`. |
-| `myceliumd` | `myceliumd` | Standalone daemon binary | no | same as `_serve` | Installer ships it, but no service definition uses it. Duplicate artifact candidate. |
+| `myceliumd` | `myceliumd` | Standalone daemon binary | no | same as `_serve` | The managed service runs `mycelium _serve`, which links the `myceliumd` crate. The binary is not a separate feature; keep it as a compatibility/debug artifact until the package/service audit is complete. |
 | `mycelium-gateway` | `mycelium-gateway` | Loopback TLS/Host router for `*.myc` services | operator | loopback listener, TLS keys | Could be a hidden `mycelium` mode; separate binary keeps its dependency graph out of the CLI. |
-| `mycelium-https-forwarder` | `mycelium-cli` | Socket-activated `:443` byte forwarder | operator | privileged socket activation | Separate process by design; it holds no keys. Same binary can host a hidden mode. |
-| `mycelium-dns-resolver` | `mycelium-driver-dnsmasq` | Legacy standalone resolver runner | no | dnsmasq child, DNS socket | `mycelium dns resolver run` is the canonical path. Installer ships both. Duplicate artifact candidate. |
-| `geoded` | `geoded` | Owner-only credential lease broker | optional | Unix socket, file-backed secret store | Installer builds it but installs no service. Move behind an explicit `--geode` component or fold into a hidden CLI mode. |
+| `mycelium-https-forwarder` | `mycelium-cli` (second `[[bin]]`) | Socket-activated `:443` byte forwarder | operator | privileged socket activation | It is a binary target in the `mycelium-cli` crate, not its own crate. Keep the keyless process split; it can become `mycelium _https-forwarder`. |
+| `mycelium-dns-resolver` | `mycelium-driver-dnsmasq` | Legacy standalone resolver runner | migration only | dnsmasq child, DNS socket | `mycelium dns resolver run` is canonical. The installer now retires legacy `mycelium-dns-resolver` agents before applying the new resolver; remove the artifact after that migration has shipped. |
+| `geoded` | `geoded` | Owner-only credential lease broker | opt-in | Unix socket, file-backed secret store | Installed only with `--geode`; its user service is upgraded by re-running that flag. |
 
 ### Tunnel
 
 | Artifact | Source | Installer role | Required | Boundary | Notes |
 |---|---|---|---|---|---|
-| `iroh-tun` | `ajmwagar/iroh-tun` | L3 IPv6 tunnel child; root LaunchDaemon/systemd unit | VPN | `/dev/net/tun` or utun, iroh endpoint | Cannot be wasm: it owns an OS tunnel device. Natural candidate to move into the Mycelium workspace as `mycelium _iroh-tun` or a `mycelium-iroh-tun` crate, which removes a separate repository/release. |
+| `iroh-tun` | `ajmwagar/iroh-tun` | L3 IPv6 tunnel child; root LaunchDaemon/systemd unit | VPN | `/dev/net/tun` or utun, iroh endpoint | Stays standalone by design. Depend on it with a pinned Cargo git dependency if shared types are needed, but do not fold its process into Mycelium. |
 
 ### VFS
 
@@ -74,26 +74,25 @@ These are not built by the installer but are required by at least one component.
 
 ## Duplicates and consolidation order
 
-### 1. Drop duplicate daemon/resolver artifacts
+### 1. Keep the daemon and DNS functionality; shrink artifacts after migration
 
-`myceliumd` and `mycelium-dns-resolver` are not wired by the installer service
-definitions. The canonical entry points already exist:
+`myceliumd` is a **crate**, and `mycelium _serve` is the managed process that
+links it. The installer's launchd/systemd unit already runs `_serve`; dropping
+the standalone `myceliumd` binary does not drop gossip, enrollment, or the
+daemon. Keep the standalone binary for now as a compatibility/debug artifact
+until the package and service audit is complete.
 
-- `mycelium _serve` is what launchd/systemd start.
-- `mycelium dns resolver run` is what the DNS unit starts.
-
-Removing these two binaries from release artifacts and `install.sh` is the
-lowest-risk reduction: the source crates remain, but the release surface shrinks.
-Keep the standalone targets for one release as debugging tools if needed, then
-remove them.
+The DNS path is the same shape: `mycelium dns resolver run` is the canonical
+service entry point, while `mycelium-dns-resolver` is the legacy binary used by
+older LaunchAgents/systemd units. The installer now retires those legacy agents
+before applying the current resolver, so dropping the legacy artifact is a
+later cleanup, not a feature removal.
 
 ### 2. Fold the HTTPS forwarder into `mycelium`
 
-`mycelium-https-forwarder` is a tiny process with a security-relevant split: it
-accepts the privileged socket and has no keys. That split should remain, but it
-does not need a separate executable. Add a hidden `mycelium _https-forwarder`
-mode and point the socket units at the `mycelium` binary. The process remains
-unprivileged, keyless, and socket-activated.
+`mycelium-https-forwarder` is a second binary target in the `mycelium-cli`
+crate. Add a hidden `mycelium _https-forwarder` mode and point the socket units
+at `mycelium`; the process remains unprivileged, keyless, and socket-activated.
 
 ### 3. Decide whether the gateway is a binary or a mode
 
@@ -103,12 +102,14 @@ but grow the CLI dependency graph. This is a size/simplicity tradeoff, not a
 correctness issue. My recommendation: keep the gateway separate until the
 wasm32/Spore host story makes the gateway a capability of a smaller host.
 
-### 4. Move `iroh-tun` into the Mycelium workspace
+### 4. Keep `iroh-tun` standalone
 
-This is the highest-value consolidation after the duplicates: it removes a
-cross-repository release, a version-skew source, and one root-owned artifact.
-The root service would execute root-owned `mycelium _iroh-tun`; the user daemon
-would publish the status exactly as it does now. The process split stays.
+`iroh-tun` stays a standalone Unix process. Its tunnel device is a separate
+privileged boundary, and keeping it independent is the Unix-principal choice.
+Mycelium may depend on it through a pinned Cargo git dependency for shared
+types, but the root service continues to execute the root-owned `iroh-tun`
+binary from its own release. This avoids version skew through pinning, not
+through vendoring.
 
 ### 5. Merge VFS provider/fetch into the VFS CLI
 
@@ -153,6 +154,28 @@ The first release-script wasm32 hook should be a `wasm` artifact profile that
 builds `spores-public` for `wasm32-wasip2` and stages the resulting `.wasm`
 files beside the native archives. It should not try to turn `soil-home` or
 `soil-store` into host processes on the way.
+
+## Auto-start contract
+
+The installer must leave these managed, not merely started:
+
+- **macOS**: `dev.fpl.mycelium` LaunchAgent with `RunAtLoad` and `KeepAlive`;
+  the root DNS/tunnel jobs are LaunchDaemons. The installer verifies that the
+  LaunchAgent owns the live PID, so a CLI-started daemon cannot mask a failed
+  service.
+- **Linux**: `mycelium.service` in the user manager, enabled with `systemctl
+  --user enable`; root DNS and tunnel units are system units. The installer
+  waits for the unit to be active and the socket to appear.
+- **DNS**: the current resolver is a persistent root daemon/unit; legacy
+  `mycelium-dns-resolver` user agents are booted out and renamed before the new
+  resolver is applied.
+- **Geode**: only when `--geode` is selected; its user service is enabled and
+  restarted on upgrade.
+
+A daemon that is running but not owned by the service manager is not an
+installed service. The repair path stops the unmanaged process, unloads the
+old job, bootstraps the managed job, and verifies both the manager state and
+the socket.
 
 ## Release ownership
 

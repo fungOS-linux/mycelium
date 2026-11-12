@@ -625,7 +625,59 @@ fn write_peer_service(
     }
 }
 
+fn managed_peer_service_running(system_service: bool) -> bool {
+    if cfg!(target_os = "macos") {
+        let Ok(output) = Command::new("launchctl")
+            .args(["list", "dev.fpl.mycelium"])
+            .output()
+        else {
+            return false;
+        };
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .next()
+                .is_some_and(|pid| pid != "-")
+    } else if cfg!(target_os = "linux") {
+        let mut command = Command::new("systemctl");
+        if !system_service {
+            command.arg("--user");
+        }
+        command
+            .args(["is-active", "--quiet", "mycelium.service"])
+            .status()
+            .is_ok_and(|status| status.success())
+    } else {
+        false
+    }
+}
+
+fn stop_peer_service(system_service: bool) {
+    if cfg!(target_os = "macos") {
+        let Ok(output) = Command::new("id").arg("-u").output() else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        let domain = format!("gui/{}", String::from_utf8_lossy(&output.stdout).trim());
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("{domain}/dev.fpl.mycelium")])
+            .status();
+    } else if cfg!(target_os = "linux") {
+        let mut command = Command::new("systemctl");
+        if !system_service {
+            command.arg("--user");
+        }
+        let _ = command.args(["stop", "mycelium.service"]).status();
+    }
+}
+
 fn start_peer_service(service: &Path, home: &Path, system_service: bool) -> Result<(), String> {
+    // Unload the managed service first: a KeepAlive job would otherwise restart
+    // the daemon between `daemon stop` and `bootout`, and the new launchd job
+    // would lose the socket race it exists to win.
+    stop_peer_service(system_service);
     // A CLI-autostarted daemon has no enrolled environment and otherwise wins
     // the Unix socket race against the managed service.
     let _ = Command::new(
@@ -635,7 +687,26 @@ fn start_peer_service(service: &Path, home: &Path, system_service: bool) -> Resu
     .env("MYCELIUM_NO_AUTOSTART", "1")
     .env("MYCELIUM_HOME", home)
     .status();
-    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Do not bootstrap into a socket another process still owns. The old
+    // readiness check only proved *a* daemon was up, which let an unmanaged
+    // CLI daemon mask a failed launchd/systemd job.
+    let stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let tcp_closed = std::net::TcpStream::connect("127.0.0.1:7443").is_err();
+        let unix_closed =
+            std::os::unix::net::UnixStream::connect(home.join("myceliumd.sock")).is_err();
+        if tcp_closed && unix_closed {
+            break;
+        }
+        if std::time::Instant::now() >= stop_deadline {
+            return Err(format!(
+                "an unmanaged myceliumd still owns {}; stop it before starting the managed service",
+                home.join("myceliumd.sock").display()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     if cfg!(target_os = "macos") {
         let output = Command::new("id")
             .arg("-u")
@@ -645,9 +716,6 @@ fn start_peer_service(service: &Path, home: &Path, system_service: bool) -> Resu
             return Err("id -u failed while starting peer service".into());
         }
         let domain = format!("gui/{}", String::from_utf8_lossy(&output.stdout).trim());
-        let _ = Command::new("launchctl")
-            .args(["bootout", &format!("{domain}/dev.fpl.mycelium")])
-            .status();
         let status = Command::new("launchctl")
             .args(["bootstrap", &domain])
             .arg(service)
@@ -676,12 +744,13 @@ fn start_peer_service(service: &Path, home: &Path, system_service: bool) -> Resu
     loop {
         let socket_ready = socket.exists();
         let listener_ready = std::net::TcpStream::connect("127.0.0.1:7443").is_ok();
-        if socket_ready && listener_ready {
+        let managed_ready = managed_peer_service_running(system_service);
+        if socket_ready && listener_ready && managed_ready {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "managed peer service did not create {} and listen on 127.0.0.1:7443 within 30 seconds; inspect {}",
+                "managed peer service did not become running and create {} within 30 seconds; inspect {} and the service manager",
                 socket.display(),
                 home.join("daemon.log").display()
             ));

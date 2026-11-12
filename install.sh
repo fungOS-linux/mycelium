@@ -46,6 +46,7 @@ VFS=ask
 SOIL=ask
 BOB=ask
 OPERATOR=ask
+GEODE=ask
 TRUST_CERT=ask
 CLAIM=
 CLAIM_FILE=
@@ -101,6 +102,7 @@ Components:
   --bob / --no-bob       fpl-bob build offload (default yes)
   --operator / --no-operator
                          gateway, skills, completions, update policy (default yes)
+  --geode / --no-geode   optional geode credential broker (default no)
 
 Component inputs:
   --overlay CIDR         IPv6 prefix this node owns (detected when possible)
@@ -341,11 +343,74 @@ install_mycelium() {
     fi
 }
 
+managed_peer_service() {
+    if [ "$(uname -s)" = Darwin ]; then
+        out=$(launchctl list dev.fpl.mycelium 2>/dev/null) || return 1
+        pid=${out%% *}
+        [ -n "$pid" ] && [ "$pid" != "-" ]
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl --user is-active --quiet mycelium.service
+    else
+        return 1
+    fi
+}
+
+wait_for_unmanaged_daemon_stop() {
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if ! env MYCELIUM_HOME="$MYCELIUM_HOME" MYCELIUM_NO_AUTOSTART=1 "$MYC" daemon status 2>/dev/null | grep -q ' pid '; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+repair_peer_service() {
+    [ "$START" = 1 ] || return 0
+    if managed_peer_service && env MYCELIUM_HOME="$MYCELIUM_HOME" MYCELIUM_NO_AUTOSTART=1 "$MYC" daemon status 2>/dev/null | grep -q ' pid '; then
+        return 0
+    fi
+    say "Repairing the managed mycelium daemon service"
+    if [ "$(uname -s)" = Darwin ]; then
+        plist="$HOME/Library/LaunchAgents/dev.fpl.mycelium.plist"
+        [ -f "$plist" ] || { warn "no LaunchAgent at $plist"; return 1; }
+        run launchctl bootout "gui/$(id -u)/dev.fpl.mycelium" || true
+    elif [ -f "$HOME/.config/systemd/user/mycelium.service" ]; then
+        run systemctl --user stop mycelium.service || true
+    else
+        warn "no mycelium systemd user unit"
+        return 1
+    fi
+    run env MYCELIUM_HOME="$MYCELIUM_HOME" MYCELIUM_NO_AUTOSTART=1 "$MYC" daemon stop || true
+    if ! wait_for_unmanaged_daemon_stop; then
+        warn "an unmanaged myceliumd still owns the socket; stop it before re-running"
+        return 1
+    fi
+    if [ "$(uname -s)" = Darwin ]; then
+        run launchctl bootstrap "gui/$(id -u)" "$plist"
+    else
+        run systemctl --user daemon-reload
+        run systemctl --user enable --now mycelium.service
+    fi
+    i=0
+    while [ "$i" -lt 30 ]; do
+        if managed_peer_service && env MYCELIUM_HOME="$MYCELIUM_HOME" MYCELIUM_NO_AUTOSTART=1 "$MYC" daemon status 2>/dev/null | grep -q ' pid '; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    warn "managed mycelium service did not become ready; see $MYCELIUM_HOME/daemon.log"
+    return 1
+}
+
 setup_node() {
     MYC="$LOCAL_BIN/mycelium"
     if [ "$DRY_RUN" = 1 ]; then
         if [ "$ENROLL" = no ]; then
-            note "would skip enrollment and restart the daemon"
+            note "would skip enrollment and repair the daemon service"
         else
             note "would enroll/repair the node with $MYC setup"
         fi
@@ -355,10 +420,17 @@ setup_node() {
     if [ "$ENROLL" = no ]; then
         note "skipping enrollment (--no-enroll)"
         if [ "$START" = 1 ]; then
-            run "$MYC" daemon stop || true
-            run "$MYC" daemon start
+            if [ -f "$MYCELIUM_HOME/pki/node.pem" ] || [ -f "$MYCELIUM_HOME/node.env" ]; then
+                set -- setup --repair --path "$MYCELIUM_HOME"
+                if [ "$LOCAL_GATEWAY" = 1 ]; then set -- "$@" --local-gateway; fi
+                run "$MYC" "$@"
+            else
+                run env MYCELIUM_HOME="$MYCELIUM_HOME" MYCELIUM_NO_AUTOSTART=1 "$MYC" daemon stop || true
+                run env MYCELIUM_HOME="$MYCELIUM_HOME" "$MYC" daemon start
+                note "no enrollment found; started the daemon without a managed service"
+                return 0
+            fi
         fi
-        return 0
     elif [ -f "$MYCELIUM_HOME/pki/node.pem" ] || [ -f "$MYCELIUM_HOME/node.env" ]; then
         say "Existing enrollment found; repairing the service definition"
         set -- setup --repair --path "$MYCELIUM_HOME"
@@ -375,10 +447,34 @@ setup_node() {
         fi
         run "$MYC" "$@"
     fi
-    if [ "$START" = 1 ]; then
-        if ! "$MYC" daemon status >/dev/null 2>&1; then
-            run "$MYC" daemon start
-        fi
+    repair_peer_service
+}
+
+retire_legacy_dns_agents() {
+    if [ "$DRY_RUN" = 1 ]; then
+        note "would retire legacy mycelium-dns-resolver user agents"
+        return 0
+    fi
+    if [ "$(uname -s)" = Darwin ]; then
+        for label in dev.fpl.mycelium-dns dev.fpl.mycelium-dns-client dev.fpl.mycelium-doh; do
+            plist="$HOME/Library/LaunchAgents/$label.plist"
+            [ -f "$plist" ] || continue
+            if grep -q 'mycelium-dns-resolver' "$plist" 2>/dev/null; then
+                launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+                mv "$plist" "$plist.pre-$TS"
+                note "retired legacy DNS agent $label"
+            fi
+        done
+    else
+        for unit in mycelium-dns mycelium-dns-client mycelium-doh; do
+            path="$HOME/.config/systemd/user/$unit.service"
+            [ -f "$path" ] || continue
+            if grep -q 'mycelium-dns-resolver' "$path" 2>/dev/null; then
+                systemctl --user disable --now "$unit.service" >/dev/null 2>&1 || true
+                mv "$path" "$path.pre-$TS"
+                note "retired legacy DNS service $unit"
+            fi
+        done
     fi
 }
 
@@ -389,6 +485,7 @@ install_dns() {
         note "would apply DNS resolver settings and install the system service"
         return 0
     fi
+    retire_legacy_dns_agents
     if [ ! -f "$cfg" ]; then
         if [ -z "$REACHABLE" ]; then
             warn "no DNS resolver config at $cfg; skipping the DNS service"
@@ -745,6 +842,41 @@ EOF
     note "iroh-tun is configured on $tun with $overlay"
 }
 
+install_geode() {
+    if [ "$DRY_RUN" = 1 ]; then
+        note "would install geoded and its user service"
+        return 0
+    fi
+    [ -x "$LOCAL_BIN/geoded" ] || { warn "geoded is unavailable; rebuild with the core component"; return 1; }
+    mkdir_p "$HOME/.geode"
+    chmod 700 "$HOME/.geode"
+    if [ "$(uname -s)" = Darwin ]; then
+        install_launch_agent dev.fpl.geoded "$LOCAL_BIN/geoded" "$HOME/.geode/geoded.log" \
+            --socket "$HOME/.geode/geode.sock" \
+            --store "$HOME/.geode/store.db" \
+            --key-file "$HOME/.geode/store.key" \
+            --init
+    else
+        install_user_unit dev.fpl.geoded "$LOCAL_BIN/geoded" \
+            --socket "$HOME/.geode/geode.sock" \
+            --store "$HOME/.geode/store.db" \
+            --key-file "$HOME/.geode/store.key" \
+            --init
+    fi
+    if [ "$START" = 0 ]; then
+        note "wrote the geode service; not started (--no-start)"
+        return 0
+    fi
+    i=0
+    while [ "$i" -lt 50 ]; do
+        [ -S "$HOME/.geode/geode.sock" ] && return 0
+        i=$((i + 1))
+        sleep 0.1
+    done
+    warn "geoded did not create $HOME/.geode/geode.sock; check $HOME/.geode/geoded.log"
+    return 1
+}
+
 install_vfs() {
     if [ "$DRY_RUN" = 1 ]; then
         note "would build/install fungos-vfs and its user services"
@@ -837,7 +969,10 @@ install_user_unit() {
         return 0
     fi
     systemctl --user daemon-reload
-    if [ "$START" = 1 ]; then systemctl --user enable --now "$name.service"; fi
+    if [ "$START" = 1 ]; then
+        systemctl --user enable "$name.service"
+        systemctl --user restart "$name.service"
+    fi
 }
 
 build_soil_cli() {
@@ -1069,6 +1204,8 @@ parse_args() {
             --no-bob) BOB=no; shift ;;
             --operator) OPERATOR=yes; shift ;;
             --no-operator) OPERATOR=no; shift ;;
+            --geode) GEODE=yes; shift ;;
+            --no-geode) GEODE=no; shift ;;
             --trust-cert) TRUST_CERT=yes; shift ;;
             --no-trust-cert) TRUST_CERT=no; shift ;;
             --local-gateway) LOCAL_GATEWAY=1; shift ;;
@@ -1158,9 +1295,9 @@ resume_updater() {
 main() {
     parse_args "$@"
     if [ "$DRY_RUN" = 0 ] && [ "$YES" != 1 ] && ! have_tty; then
-        for name in VPN VFS SOIL BOB OPERATOR ENROLL; do
+        for name in VPN VFS SOIL BOB OPERATOR GEODE ENROLL; do
             eval "value=\${$name}"
-            [ "$value" = ask ] && die "no terminal for prompts; pass --yes or set --vpn/--no-vpn, --vfs/--no-vfs, --soil/--no-soil, --bob/--no-bob, --operator/--no-operator, and --enroll/--no-enroll"
+            [ "$value" = ask ] && die "no terminal for prompts; pass --yes or set --vpn/--no-vpn, --vfs/--no-vfs, --soil/--no-soil, --bob/--no-bob, --operator/--no-operator, --geode/--no-geode, and --enroll/--no-enroll"
         done
     fi
     preflight
@@ -1178,6 +1315,7 @@ main() {
     choose SOIL yes "Install Soil and fungOS.app?"
     choose BOB yes "Install build offload (fpl-bob + sccache)?"
     choose OPERATOR yes "Configure the operator surface (gateway, skills, completions)?"
+    choose GEODE no "Install the optional geode credential broker?"
     if [ "$ENROLL" = ask ]; then
         if ask_yes "Enroll or repair this node's fleet membership?" yes; then ENROLL=yes; else ENROLL=no; fi
     fi
@@ -1193,6 +1331,7 @@ main() {
     if [ "$VPN" = yes ]; then run_component vpn install_vpn; fi
     run_component dns install_dns
     if [ "$OPERATOR" = yes ]; then run_component operator install_operator; fi
+    if [ "$GEODE" = yes ]; then run_component geode install_geode; fi
     if [ "$VFS" = yes ]; then run_component vfs install_vfs; fi
     if [ "$SOIL" = yes ]; then run_component soil install_soil; fi
     if [ "$BOB" = yes ]; then run_component bob install_bob; fi
