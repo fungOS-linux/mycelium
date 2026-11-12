@@ -92,6 +92,49 @@ when replacing a bad asset deliberately.
 `--draft` creates a draft release for multi-host collection. Finish it with
 `gh release edit v0.2.0 --draft=false` after every target has uploaded.
 
+## Remote Linux builds
+
+A macOS release host can send Linux builds to an x86_64 Linux worker through
+`fpl-bob remote`. The worker needs a Rust toolchain, the requested targets, and
+the normal `fpl bob setup` environment; the local command needs `fpl-bob` on
+`PATH` (or set `MYCELIUM_RELEASE_FPL_BOB` to its absolute path for a timer).
+`agora-one` is the reference worker: Ubuntu, x86_64, Rust 1.98.1, with
+`aarch64-unknown-linux-gnu` and `aarch64-linux-gnu-gcc` installed.
+
+```sh
+# x86_64 native and aarch64 cross, both on agora-one
+scripts/release.sh --version 0.2.0 \
+  --target x86_64-unknown-linux-gnu \
+  --target aarch64-unknown-linux-gnu \
+  --remote-host agora-one \
+  --remote-clean \
+  --publish
+```
+
+`fpl-bob remote` uploads the source tree (excluding `target/` and `.git/`), runs
+the cargo command under the worker's sccache environment, and copies
+`target/<target>/release` back before the script stages it. `--remote-clean`
+removes the worker workspace after copy-back; use it on workers with a small
+`/tmp` (agora-one currently has about 3.7 GiB free there). `--remote-session`
+can isolate concurrent releases.
+
+The worker must already have the target installed. For `aarch64-unknown-linux-gnu`
+the script sets `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc`;
+for `armv7-unknown-linux-gnueabihf` it uses `arm-linux-gnueabihf-gcc`. agora-one
+currently has the aarch64 target and linker; adding 32-bit ARM means:
+
+```sh
+rustup target add armv7-unknown-linux-gnueabihf
+sudo apt-get install gcc-arm-linux-gnueabihf
+```
+
+If `cargo-zigbuild` is installed on the worker, musl targets can use the same
+remote path; otherwise build musl locally or add the target/toolchain first.
+
+GNU artifacts inherit the worker's glibc floor. The current script does not
+record that floor, so prefer musl for broad distribution and treat GNU artifacts
+as worker-qualified builds.
+
 ## From a tag
 
 Release hosts should check out the tag, not build a branch tip:
