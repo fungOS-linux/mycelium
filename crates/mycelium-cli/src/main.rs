@@ -178,7 +178,8 @@ usage:
   mycelium services [show ID | watch [--once]] [--kind KIND] [--node NODE] [--json]
   mycelium iroh-tun status [--json]
   mycelium iroh-tun config [--tun IFACE] [--overlay CIDR]... [--mtu N] [--refresh-secs N]
-                            [--listen IP:PORT] [--enabled true|false] --write
+                            [--listen IP:PORT] [--external true|false] [--status PATH]
+                            [--enabled true|false] --write
   mycelium debug hardware [PEER] [--json]
   mycelium releases list [--json]
   mycelium releases keygen --path PATH --write [--json]

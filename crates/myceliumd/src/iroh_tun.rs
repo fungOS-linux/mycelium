@@ -80,6 +80,18 @@ pub struct Config {
     /// specific address is useful; `0.0.0.0:0` is not a hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
+    /// A privileged service (root LaunchDaemon or systemd unit) runs the child.
+    /// This daemon still owns the key, the endpoint identity and the published
+    /// observation, but it never spawns or reaps the tunnel in this mode. The
+    /// privileged child writes the same status file the daemon reads.
+    #[serde(default)]
+    pub external: bool,
+    /// Where the tunnel writes its status. A privileged child cannot safely
+    /// write into a user-writable directory (a symlink there would redirect a
+    /// root write), so the installer points this at a root-owned runtime
+    /// directory. The default remains the per-user file beside the config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +107,8 @@ impl Default for Config {
             overlay: Vec::new(),
             refresh_secs: default_refresh_secs(),
             listen: None,
+            external: false,
+            status: None,
             binary: None,
             mycelium_binary: None,
         }
@@ -142,6 +156,11 @@ impl Config {
             listen
                 .parse::<std::net::SocketAddr>()
                 .map_err(|_| format!("`listen` must be an IP:PORT socket address, got {listen}"))?;
+        }
+        if let Some(status) = &self.status {
+            if !status.is_absolute() {
+                return Err("`status` must be an absolute path".into());
+            }
         }
         let mut overlay = Vec::new();
         for value in &self.overlay {
@@ -301,7 +320,7 @@ impl Supervisor {
         };
         let binary = resolve_binary(config.binary.as_ref(), "iroh-tun");
         if state.endpoint_id.is_none() {
-            match print_id(&binary, &key).await {
+            match print_id(&binary, config.tun.as_deref().unwrap_or_default(), &key).await {
                 Ok(id) => state.endpoint_id = Some(id),
                 Err(error) => {
                     stop_child(&mut state).await;
@@ -312,7 +331,15 @@ impl Supervisor {
         }
         let endpoint_id = state.endpoint_id.clone()?;
 
-        // Reap before starting: one child, never two.
+        // Reap before starting: one child, never two. An external tunnel is owned
+        // by the privileged service; this daemon has no child to reap or start.
+        if config.external {
+            if state.child.is_some() {
+                stop_child(&mut state).await;
+            }
+            state.pid = None;
+            state.retry_at = None;
+        }
         if let Some(child) = state.child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -346,7 +373,10 @@ impl Supervisor {
             }
         }
 
-        if state.child.is_none() && state.retry_at.is_none_or(|at| Instant::now() >= at) {
+        if !config.external
+            && state.child.is_none()
+            && state.retry_at.is_none_or(|at| Instant::now() >= at)
+        {
             let mycelium_binary = resolve_binary(config.mycelium_binary.as_ref(), "mycelium");
             match spawn(
                 &self.paths,
@@ -355,6 +385,7 @@ impl Supervisor {
                 &mycelium_binary,
                 &key,
                 &endpoint_id,
+                config.status.as_deref().unwrap_or(&self.paths.status),
             ) {
                 Ok(child) => {
                     state.pid = child.id();
@@ -378,14 +409,18 @@ impl Supervisor {
 
         // The child's evidence. Stale means wedged, and wedged means it may not
         // speak for this node in the catalog.
-        let status = read_status(&self.paths.status);
+        let status_path = config.status.as_deref().unwrap_or(&self.paths.status);
+        let status = read_status(status_path);
         let wedged_after = (config.refresh_secs * 5).max(MIN_WEDGE_SECS);
         match status {
             Ok(Some(status)) if status.endpoint_id == endpoint_id => {
                 state.status_age = Some(now.saturating_sub(status.observed_at));
                 state.routes = status.routes.clone();
                 state.refresh_failures = status.refresh_failures;
-                if now.saturating_sub(status.observed_at) > wedged_after && state.child.is_some() {
+                if !config.external
+                    && now.saturating_sub(status.observed_at) > wedged_after
+                    && state.child.is_some()
+                {
                     stop_child(&mut state).await;
                     state.restarts = state.restarts.saturating_add(1);
                     state.retry_at = Some(Instant::now() + Duration::from_secs(1));
@@ -415,10 +450,17 @@ impl Supervisor {
             }
         }
 
-        let running = state.child.is_some();
+        let running = state.child.is_some() || config.external;
         let fresh = state
             .status_age
             .is_some_and(|age| age <= (config.refresh_secs * 3).max(LEASE_SECONDS));
+        if config.external && !fresh {
+            note(
+                &mut state,
+                "external iroh-tun has not written a fresh status; check the privileged service"
+                    .into(),
+            );
+        }
         if !running || !fresh {
             return None;
         }
@@ -465,17 +507,18 @@ impl Supervisor {
         let state = self.state.lock().await;
         let config = state.config.clone();
         let enabled = config.is_some();
+        let running = state.child.is_some() || config.as_ref().is_some_and(|c| c.external);
         let fresh = state.status_age.is_some_and(|age| {
             age <= config
                 .as_ref()
                 .map_or(0, |c| (c.refresh_secs * 3).max(LEASE_SECONDS))
         });
-        let running = state.child.is_some();
         serde_json::json!({
             "enabled": enabled,
             "config": self.paths.config.display().to_string(),
             "config_error": state.config_error,
             "running": running,
+            "external": config.as_ref().is_some_and(|c| c.external),
             "pid": state.pid,
             "endpoint_id": state.endpoint_id,
             "tun": config.as_ref().and_then(|c| c.tun.clone()),
@@ -490,7 +533,12 @@ impl Supervisor {
             "last_exit": state.last_exit,
             "last_error": state.last_error,
             "log": self.paths.log.display().to_string(),
-            "status_file": self.paths.status.display().to_string(),
+            "status_file": config
+                .as_ref()
+                .and_then(|c| c.status.clone())
+                .unwrap_or_else(|| self.paths.status.clone())
+                .display()
+                .to_string(),
             "node": node,
             "observed_at": now,
         })
@@ -592,10 +640,12 @@ fn expand_home(path: &Path) -> PathBuf {
     }
 }
 
-async fn print_id(binary: &Path, key: &str) -> Result<String, String> {
+async fn print_id(binary: &Path, tun: &str, key: &str) -> Result<String, String> {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(binary)
+            .arg("--tun")
+            .arg(tun)
             .arg("--secret")
             .arg(key)
             .arg("--print-id")
@@ -629,6 +679,7 @@ fn spawn(
     mycelium_binary: &Path,
     key: &str,
     endpoint_id: &str,
+    status_file: &Path,
 ) -> Result<tokio::process::Child, String> {
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -649,7 +700,7 @@ fn spawn(
         .arg("--secret")
         .arg(key)
         .arg("--status-file")
-        .arg(&paths.status)
+        .arg(status_file)
         .arg("--mycelium")
         .arg(mycelium_binary)
         .stdin(std::process::Stdio::null())
@@ -863,6 +914,63 @@ sleep 30
     }
 
     #[tokio::test]
+    async fn an_external_tunnel_publishes_from_its_status_without_a_child() {
+        let dir = temp_dir("external");
+        let paths = Paths::under(&dir);
+        let status_path = dir.join("root-status.json");
+        let binary = fake_tunnel(&dir, ID);
+        std::fs::write(
+            &paths.config,
+            serde_json::json!({
+                "tun": "utun-test",
+                "overlay": ["10.42.0.7/24"],
+                "refresh_secs": 1,
+                "external": true,
+                "status": status_path.to_string_lossy(),
+                "binary": binary,
+                "mycelium_binary": "/bin/true"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &status_path,
+            serde_json::json!({
+                "schema_version": 1,
+                "endpoint_id": ID,
+                "tun": "utun-test",
+                "mtu": 1280,
+                "observed_at": now(),
+                "routes": [{"prefix": "10.9.0.0/24", "peer": ID}],
+                "refresh_failures": 0
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let supervisor = Supervisor::at(paths);
+        let observation = supervisor
+            .tick("neo", now())
+            .await
+            .expect("a fresh external status is enough evidence to publish");
+        let Observation::ServiceAdvertisement { advertisement, .. } = observation else {
+            panic!("a daemon lease is an advertisement")
+        };
+        let projected = crate::local_services::project(&advertisement)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected.value.attributes["overlay"], "10.42.0.0/24");
+        assert_eq!(projected.value.attributes["routes"], "1");
+
+        let report = supervisor.report("neo", now()).await;
+        assert_eq!(report["external"], serde_json::json!(true));
+        assert_eq!(report["running"], serde_json::json!(true));
+        assert!(report["publishing"].as_bool().unwrap());
+        assert!(report["pid"].is_null(), "no child belongs to this daemon");
+        supervisor.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_tunnel_that_dies_is_reported_and_not_published() {
         let dir = temp_dir("dead");
         let paths = Paths::under(&dir);
@@ -910,6 +1018,17 @@ exit 1
         assert!(parsed.enabled);
         assert_eq!(parsed.mtu, 1280);
         assert_eq!(parsed.refresh_secs, 15);
+        assert!(!parsed.external, "the daemon owns the child by default");
+    }
+
+    #[test]
+    fn an_external_tunnel_is_explicit() {
+        let parsed = config(serde_json::json!({
+            "tun": "utun220",
+            "external": true
+        }))
+        .unwrap();
+        assert!(parsed.external);
     }
 
     #[test]
@@ -938,6 +1057,7 @@ exit 1
         assert!(error.contains("CIDR"), "{error}");
         assert!(config(serde_json::json!({})).is_err(), "tun is required");
         assert!(config(serde_json::json!({"tun": "utun220", "mtu": 99})).is_err());
+        assert!(config(serde_json::json!({"tun": "utun220", "status": "relative"})).is_err());
         assert!(config(serde_json::json!({"tun": "utun220", "extra": 1})).is_err());
     }
 

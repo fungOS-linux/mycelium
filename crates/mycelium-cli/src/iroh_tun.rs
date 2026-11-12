@@ -95,6 +95,9 @@ fn render(value: &Value) -> Vec<String> {
             .map(|age| age.to_string())
             .unwrap_or_else(|| "never".into())
     ));
+    if flag("external") {
+        lines.push("  owner     external privileged service (root)".into());
+    }
     if let Some(pid) = value["pid"].as_u64() {
         lines.push(format!(
             "  process   pid {pid}, {} restart(s)",
@@ -141,6 +144,12 @@ async fn config(args: &[String]) -> Result<Vec<String>, String> {
                     .map_err(|_| "--refresh-secs takes a number".to_owned())?;
             }
             "--listen" => config.listen = Some(value_of(args, &mut index, argument)?),
+            "--status" => config.status = Some(value_of(args, &mut index, argument)?.into()),
+            "--external" => {
+                config.external = value_of(args, &mut index, argument)?
+                    .parse::<bool>()
+                    .map_err(|_| "--external takes true or false".to_owned())?;
+            }
             "--binary" => config.binary = Some(value_of(args, &mut index, argument)?.into()),
             "--mycelium-binary" => {
                 config.mycelium_binary = Some(value_of(args, &mut index, argument)?.into())
