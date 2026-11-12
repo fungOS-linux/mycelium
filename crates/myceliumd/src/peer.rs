@@ -47,7 +47,7 @@ mod iroh_sync;
 #[cfg(feature = "iroh-sync")]
 pub(crate) use iroh_sync::transport_key;
 #[cfg(feature = "iroh-sync")]
-pub use iroh_sync::{SyncConfig, SyncRendezvous, SyncStatus};
+pub use iroh_sync::{SyncConfig, SyncRendezvous};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerView {
