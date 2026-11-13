@@ -246,7 +246,8 @@ fn frontdoor_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
     );
     for (name, key) in [
         ("frontdoor agent", "frontdoor_agent"),
-        ("https agent", "https_agent"),
+        ("ingress https agent", "ingress_https_agent"),
+        ("ingress http agent", "ingress_http_agent"),
     ] {
         let loaded = snapshot[key]["loaded"].as_bool().unwrap_or(false);
         add(
@@ -261,7 +262,16 @@ fn frontdoor_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
     }
     for (name, key, address_key) in [
         ("frontdoor listener", "frontdoor_listening", "listen"),
-        ("https listener", "https_listening", "https_listen"),
+        (
+            "ingress https listener",
+            "ingress_https_listening",
+            "https_listen",
+        ),
+        (
+            "ingress http listener",
+            "ingress_http_listening",
+            "http_listen",
+        ),
     ] {
         let listening = snapshot[key].as_bool().unwrap_or(false);
         add(

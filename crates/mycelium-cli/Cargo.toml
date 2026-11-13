@@ -13,8 +13,8 @@ name = "mycelium"
 path = "src/main.rs"
 
 [[bin]]
-name = "mycelium-https-forwarder"
-path = "src/https_forwarder.rs"
+name = "mycelium-ingress"
+path = "src/ingress.rs"
 
 [dependencies]
 qrcode = { version = "0.14", default-features = false, optional = true }

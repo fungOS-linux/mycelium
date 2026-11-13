@@ -10,7 +10,7 @@ use rcgen::{
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::Command,
@@ -20,22 +20,30 @@ use std::{
 const DEFAULT_FRONTDOOR_LISTEN: &str = "127.0.0.1:8443";
 const HTTPS_ADDR: &str = "127.0.0.1:443";
 const HTTPS_PORT: u16 = 443;
+const HTTP_ADDR: &str = "127.0.0.1:80";
+const HTTP_PORT: u16 = 80;
 const FRONTDOOR_LABEL: &str = "dev.fpl.mycelium-frontdoor";
-const HTTPS_LABEL: &str = "dev.fpl.mycelium-https";
+const INGRESS_HTTPS_LABEL: &str = "dev.fpl.mycelium-ingress-https";
+const INGRESS_HTTP_LABEL: &str = "dev.fpl.mycelium-ingress-http";
 const FRONTDOOR_UNIT: &str = "mycelium-frontdoor.service";
-const HTTPS_SOCKET_UNIT: &str = "mycelium-https.socket";
-const HTTPS_SERVICE_UNIT: &str = "mycelium-https.service";
+const INGRESS_HTTPS_SOCKET_UNIT: &str = "mycelium-ingress-https.socket";
+const INGRESS_HTTPS_SERVICE_UNIT: &str = "mycelium-ingress-https.service";
+const INGRESS_HTTP_SOCKET_UNIT: &str = "mycelium-ingress-http.socket";
+const INGRESS_HTTP_SERVICE_UNIT: &str = "mycelium-ingress-http.service";
 const SYSTEM_CA_PATH: &str = "/usr/local/share/ca-certificates/mycelium-frontdoor.crt";
-// Names installed by the former `mycelium gateway` lifecycle. They are retired
-// on install and removed on uninstall so an upgrade does not leave two
-// processes competing for the same listener.
+// Names installed by the former `mycelium gateway` lifecycle and the separate
+// HTTPS forwarder. They are retired on install and removed on uninstall so an
+// upgrade does not leave two processes competing for the same listener.
 const LEGACY_FRONTDOOR_LABEL: &str = "dev.fpl.mycelium-gateway";
 const LEGACY_FRONTDOOR_UNIT: &str = "mycelium-gateway.service";
+const LEGACY_HTTPS_LABEL: &str = "dev.fpl.mycelium-https";
+const LEGACY_HTTPS_SOCKET_UNIT: &str = "mycelium-https.socket";
+const LEGACY_HTTPS_SERVICE_UNIT: &str = "mycelium-https.service";
 const LEGACY_SYSTEM_CA_PATH: &str = "/usr/local/share/ca-certificates/mycelium-gateway.crt";
 
 const USAGE: &str = "mycelium frontdoor status [--json] [--path MYCELIUM-HOME]\n\
 mycelium frontdoor usage [--json] [--fleet] [--path MYCELIUM-HOME]\n\
-mycelium frontdoor install [--write|--dry-run] [--trust-cert] [--listen ADDR] [--routes PATH] [--cert PATH --key PATH] [--frontdoor-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]\n\
+mycelium frontdoor install [--write|--dry-run] [--trust-cert] [--listen ADDR] [--routes PATH] [--cert PATH --key PATH] [--frontdoor-bin PATH] [--ingress-bin PATH] [--path MYCELIUM-HOME]\n\
 mycelium frontdoor uninstall [--write|--dry-run] [--path MYCELIUM-HOME]";
 
 #[derive(Clone, Debug)]
@@ -48,7 +56,7 @@ pub struct Paths {
     pub key: PathBuf,
     pub ca: PathBuf,
     pub frontdoor_bin: PathBuf,
-    pub forwarder_bin: PathBuf,
+    pub ingress_bin: PathBuf,
     pub listen: SocketAddr,
 }
 
@@ -86,7 +94,7 @@ impl Paths {
             key,
             ca,
             frontdoor_bin: home.join("bin/mycelium-frontdoor"),
-            forwarder_bin: home.join("bin/mycelium-https-forwarder"),
+            ingress_bin: home.join("bin/mycelium-ingress"),
             listen: installed_listen().unwrap_or_else(default_listen),
         }
     }
@@ -132,48 +140,55 @@ fn migrate_state(home: &Path, dry_run: bool, actions: &mut Vec<String>) -> Resul
 fn retire_legacy_services(dry_run: bool, actions: &mut Vec<String>) -> Result<(), String> {
     match platform()? {
         Platform::Macos => {
-            let path = launch_agent_path(LEGACY_FRONTDOOR_LABEL)?;
-            if !path.is_file() {
-                return Ok(());
-            }
-            if dry_run {
-                actions.push(format!("would retire legacy agent {}", path.display()));
-                return Ok(());
-            }
             let domain = launch_domain()?;
-            let _ = Command::new("launchctl")
-                .args(["bootout", &format!("{domain}/{LEGACY_FRONTDOOR_LABEL}")])
-                .output();
-            fs::remove_file(&path)
-                .map_err(|error| format!("remove legacy agent {}: {error}", path.display()))?;
-            actions.push(format!("retired legacy agent {}", path.display()));
+            for label in [LEGACY_FRONTDOOR_LABEL, LEGACY_HTTPS_LABEL] {
+                let path = launch_agent_path(label)?;
+                if !path.is_file() {
+                    continue;
+                }
+                if dry_run {
+                    actions.push(format!("would retire legacy agent {}", path.display()));
+                    continue;
+                }
+                let _ = Command::new("launchctl")
+                    .args(["bootout", &format!("{domain}/{label}")])
+                    .output();
+                fs::remove_file(&path)
+                    .map_err(|error| format!("remove legacy agent {}: {error}", path.display()))?;
+                actions.push(format!("retired legacy agent {}", path.display()));
+            }
         }
         Platform::Linux => {
-            let unit = systemd_unit_path(LEGACY_FRONTDOOR_UNIT);
+            let units = [
+                LEGACY_FRONTDOOR_UNIT,
+                LEGACY_HTTPS_SOCKET_UNIT,
+                LEGACY_HTTPS_SERVICE_UNIT,
+            ];
             let ca = Path::new(LEGACY_SYSTEM_CA_PATH);
-            if !unit.is_file() && !ca.is_file() {
+            if !units.iter().any(|name| systemd_unit_path(name).is_file()) && !ca.is_file() {
                 return Ok(());
             }
             if dry_run {
-                if unit.is_file() {
-                    actions.push(format!("would retire legacy unit {}", unit.display()));
+                for name in units {
+                    let path = systemd_unit_path(name);
+                    if path.is_file() {
+                        actions.push(format!("would retire legacy unit {}", path.display()));
+                    }
                 }
                 if ca.is_file() {
                     actions.push(format!("would remove legacy CA {}", ca.display()));
                 }
                 return Ok(());
             }
-            let _ = run_privileged(
-                "systemctl",
-                &[
-                    "disable".to_owned(),
-                    "--now".to_owned(),
-                    LEGACY_FRONTDOOR_UNIT.to_owned(),
-                ],
-            );
-            if unit.is_file() {
-                run_privileged("rm", &["-f".to_owned(), unit.display().to_string()])?;
-                actions.push(format!("retired legacy unit {}", unit.display()));
+            let mut disable = vec!["disable".to_owned(), "--now".to_owned()];
+            disable.extend(units.iter().map(|name| (*name).to_owned()));
+            let _ = run_privileged("systemctl", &disable);
+            for name in units {
+                let unit = systemd_unit_path(name);
+                if unit.is_file() {
+                    run_privileged("rm", &["-f".to_owned(), unit.display().to_string()])?;
+                    actions.push(format!("retired legacy unit {}", unit.display()));
+                }
             }
             if ca.is_file() {
                 run_privileged("rm", &["-f".to_owned(), ca.display().to_string()])?;
@@ -216,6 +231,10 @@ fn https_listen() -> SocketAddr {
     HTTPS_ADDR.parse().expect("https listen address is valid")
 }
 
+fn http_listen() -> SocketAddr {
+    HTTP_ADDR.parse().expect("http listen address is valid")
+}
+
 fn listen_addr(value: &str) -> Result<SocketAddr, String> {
     let address: SocketAddr = value
         .parse()
@@ -225,7 +244,7 @@ fn listen_addr(value: &str) -> Result<SocketAddr, String> {
     }
     if address.port() == 0 || address.port() == HTTPS_PORT {
         return Err(format!(
-            "frontdoor must not bind port {HTTPS_PORT}; the privileged socket belongs to the forwarder"
+            "frontdoor must not bind port {HTTPS_PORT}; the privileged socket belongs to the ingress"
         ));
     }
     Ok(address)
@@ -234,12 +253,23 @@ fn listen_addr(value: &str) -> Result<SocketAddr, String> {
 /// The installed service definition is the single source of truth for the
 /// frontdoor address, so reinstall/status keep using a custom `--listen`.
 fn installed_listen() -> Option<SocketAddr> {
-    let path = match platform() {
-        Ok(Platform::Macos) => launch_agent_path(FRONTDOOR_LABEL).ok()?,
-        Ok(Platform::Linux) => systemd_unit_path(FRONTDOOR_UNIT),
-        Err(_) => return None,
+    let names = match platform().ok()? {
+        Platform::Macos => [FRONTDOOR_LABEL, LEGACY_FRONTDOOR_LABEL],
+        Platform::Linux => [FRONTDOOR_UNIT, LEGACY_FRONTDOOR_UNIT],
     };
-    parse_listen(&fs::read_to_string(path).ok()?)
+    for name in names {
+        let path = match platform().ok()? {
+            Platform::Macos => launch_agent_path(name).ok()?,
+            Platform::Linux => systemd_unit_path(name),
+        };
+        if let Some(listen) = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| parse_listen(&text))
+        {
+            return Some(listen);
+        }
+    }
+    None
 }
 
 fn parse_listen(text: &str) -> Option<SocketAddr> {
@@ -271,21 +301,24 @@ fn parse_listen(text: &str) -> Option<SocketAddr> {
 #[derive(Clone, Copy)]
 enum Service {
     Frontdoor,
-    HttpsSocket,
+    IngressHttps,
+    IngressHttp,
 }
 
 impl Service {
     fn macos_label(self) -> &'static str {
         match self {
             Self::Frontdoor => FRONTDOOR_LABEL,
-            Self::HttpsSocket => HTTPS_LABEL,
+            Self::IngressHttps => INGRESS_HTTPS_LABEL,
+            Self::IngressHttp => INGRESS_HTTP_LABEL,
         }
     }
 
     fn linux_unit(self) -> &'static str {
         match self {
             Self::Frontdoor => FRONTDOOR_UNIT,
-            Self::HttpsSocket => HTTPS_SOCKET_UNIT,
+            Self::IngressHttps => INGRESS_HTTPS_SOCKET_UNIT,
+            Self::IngressHttp => INGRESS_HTTP_SOCKET_UNIT,
         }
     }
 
@@ -312,7 +345,7 @@ struct InstallOptions {
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
     frontdoor_bin: Option<PathBuf>,
-    forwarder_bin: Option<PathBuf>,
+    ingress_bin: Option<PathBuf>,
     listen: Option<SocketAddr>,
     trust: bool,
     write: bool,
@@ -327,7 +360,7 @@ impl InstallOptions {
             cert: None,
             key: None,
             frontdoor_bin: None,
-            forwarder_bin: None,
+            ingress_bin: None,
             listen: None,
             trust: false,
             write: false,
@@ -579,7 +612,8 @@ fn render_status(value: &Value) -> Vec<String> {
     )];
     for (label, key) in [
         ("frontdoor agent", "frontdoor_agent"),
-        ("https agent", "https_agent"),
+        ("ingress https agent", "ingress_https_agent"),
+        ("ingress http agent", "ingress_http_agent"),
     ] {
         let agent = &value[key];
         let text = if agent["supported"].as_bool().unwrap_or(false) {
@@ -605,14 +639,29 @@ fn render_status(value: &Value) -> Vec<String> {
             "down"
         }
     ));
-    lines.push(format!(
-        "  https listener: {}",
-        if value["https_listening"].as_bool().unwrap_or(false) {
-            value["https_listen"].as_str().unwrap_or(HTTPS_ADDR)
-        } else {
-            "down"
-        }
-    ));
+    for (label, key, address_key, default) in [
+        (
+            "ingress https listener",
+            "ingress_https_listening",
+            "https_listen",
+            HTTPS_ADDR,
+        ),
+        (
+            "ingress http listener",
+            "ingress_http_listening",
+            "http_listen",
+            HTTP_ADDR,
+        ),
+    ] {
+        lines.push(format!(
+            "  {label}: {}",
+            if value[key].as_bool().unwrap_or(false) {
+                value[address_key].as_str().unwrap_or(default)
+            } else {
+                "down"
+            }
+        ));
+    }
     lines.push(format!(
         "  certificate: {} ({})",
         value["certificate"].as_str().unwrap_or("missing"),
@@ -648,7 +697,7 @@ fn render_status(value: &Value) -> Vec<String> {
     }
     if let Some(path) = value["system_daemon"].as_str() {
         lines.push(format!(
-            "  warning: system LaunchDaemon {path} also claims :{HTTPS_PORT}"
+            "  warning: system LaunchDaemon {path} also claims a privileged ingress port"
         ));
     }
     lines
@@ -656,9 +705,12 @@ fn render_status(value: &Value) -> Vec<String> {
 
 pub async fn snapshot(home: &Path) -> Value {
     let paths = Paths::discover(home);
-    let installed = Service::Frontdoor.installed() && Service::HttpsSocket.installed();
+    let installed = Service::Frontdoor.installed()
+        && Service::IngressHttps.installed()
+        && Service::IngressHttp.installed();
     let frontdoor_listening = tcp_probe(paths.listen);
-    let https_listening = tcp_probe(https_listen());
+    let ingress_https_listening = tcp_probe(https_listen());
+    let ingress_http_listening = tcp_probe(http_listen());
     let certificate_trusted = paths.cert.is_file() && certificate_trusted(&paths.cert);
     let health = if frontdoor_listening {
         probe(paths.listen).await.ok()
@@ -678,19 +730,22 @@ pub async fn snapshot(home: &Path) -> Value {
     json!({
         "installed": installed,
         "frontdoor_agent": service_state(Service::Frontdoor),
-        "https_agent": service_state(Service::HttpsSocket),
+        "ingress_https_agent": service_state(Service::IngressHttps),
+        "ingress_http_agent": service_state(Service::IngressHttp),
         "frontdoor_listening": frontdoor_listening,
-        "https_listening": https_listening,
+        "ingress_https_listening": ingress_https_listening,
+        "ingress_http_listening": ingress_http_listening,
         "listen": paths.listen.to_string(),
         "https_listen": HTTPS_ADDR,
+        "http_listen": HTTP_ADDR,
         "certificate": paths.cert.display().to_string(),
         "certificate_trusted": certificate_trusted,
         "routes": paths.routes.display().to_string(),
         "routes_valid": read_routes(&paths.routes).is_ok(),
         "frontdoor_binary": paths.frontdoor_bin.display().to_string(),
         "frontdoor_binary_present": paths.frontdoor_bin.is_file(),
-        "forwarder_binary": paths.forwarder_bin.display().to_string(),
-        "forwarder_binary_present": paths.forwarder_bin.is_file(),
+        "ingress_binary": paths.ingress_bin.display().to_string(),
+        "ingress_binary_present": paths.ingress_bin.is_file(),
         "health": health,
         "tls_verified": tls_verified,
         "tls_error": tls_error,
@@ -723,28 +778,34 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
 
     platform()?;
     let mut actions = Vec::new();
-    // Stop the old lifecycle before preflight: it may still own :8443, and the
-    // new label is not recognized as the same service by launchd/systemd.
-    migrate_state(&options.home, options.dry_run, &mut actions)?;
-    retire_legacy_services(options.dry_run, &mut actions)?;
+    // Validate both binaries before stopping the old lifecycle. A failed
+    // upgrade must not leave the machine with no working frontdoor.
     let paths = Paths::discover(&options.home);
-    let listen = options.listen.unwrap_or(paths.listen);
+    // Capture a custom listen from the legacy unit before retirement removes
+    // the only place it is recorded.
+    let requested_listen = options.listen.unwrap_or(paths.listen);
     let frontdoor_source = find_binary(
         "mycelium-frontdoor",
         options.frontdoor_bin.as_deref(),
         &paths.frontdoor_bin,
     )?;
-    let forwarder_source = find_binary(
-        "mycelium-https-forwarder",
-        options.forwarder_bin.as_deref(),
-        &paths.forwarder_bin,
+    let ingress_source = find_binary(
+        "mycelium-ingress",
+        options.ingress_bin.as_deref(),
+        &paths.ingress_bin,
     )?;
+    migrate_state(&options.home, options.dry_run, &mut actions)?;
+    let paths = Paths::discover(&options.home);
+    let listen = requested_listen;
     let routes = prepare_routes(&paths, &options, &mut actions)?;
     let material = prepare_certificate(&paths, &options, &routes, &mut actions)?;
+    // Stop the old lifecycle before preflight: it may still own :8443, and the
+    // new label is not recognized as the same service by launchd/systemd.
+    retire_legacy_services(options.dry_run, &mut actions)?;
 
     if options.dry_run {
         actions.push(format!(
-            "would require {listen} and :{HTTPS_PORT} to be free after retiring the legacy service"
+            "would require {listen}, :{HTTPS_PORT}, and :{HTTP_PORT} to be free after retiring the legacy service"
         ));
         actions.push(format!("would use frontdoor listen {listen}"));
         actions.push(format!(
@@ -754,8 +815,8 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
         ));
         actions.push(format!(
             "would install {} from {}",
-            paths.forwarder_bin.display(),
-            forwarder_source.display()
+            paths.ingress_bin.display(),
+            ingress_source.display()
         ));
         actions.push(format!(
             "would write {}",
@@ -781,15 +842,16 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     preflight(listen)?;
     create_private_dir(&paths.dir)?;
     let frontdoor_bin = install_binary(&frontdoor_source, &paths.frontdoor_bin)?;
-    let forwarder_bin = install_binary(&forwarder_source, &paths.forwarder_bin)?;
+    let ingress_bin = install_binary(&ingress_source, &paths.ingress_bin)?;
     install_frontdoor_service(&paths, listen, &frontdoor_bin, &routes, &material)?;
-    install_https_services(&paths, listen, &forwarder_bin)?;
+    install_ingress_services(&paths, listen, &ingress_bin)?;
     if options.trust {
         trust_certificate(material.trust_anchor())?;
     }
 
     start_services()?;
     wait_for_listener(listen)?;
+    wait_for_redirect(http_listen())?;
     let health = wait_for_https(HTTPS_PORT).await?;
     if health["status"].as_u64() != Some(200) {
         return Err(format!(
@@ -812,7 +874,7 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
         options.home.display()
     )];
     lines.push(format!("  frontdoor: {}", frontdoor_bin.display()));
-    lines.push(format!("  forwarder: {}", forwarder_bin.display()));
+    lines.push(format!("  ingress: {}", ingress_bin.display()));
     lines.push(format!("  listen: {listen}"));
     lines.push(format!("  routes: {}", routes.display()));
     lines.push(format!("  certificate: {}", material.cert.display()));
@@ -839,14 +901,19 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
 
 fn preflight(listen: SocketAddr) -> Result<(), String> {
     if let Some(path) = system_daemon_path() {
+        let label = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("the system service");
         return Err(format!(
-            "{} also claims 127.0.0.1:{HTTPS_PORT} for the system launchd domain; remove it before installing the user agent: sudo launchctl bootout system/{HTTPS_LABEL} && sudo rm {}",
+            "{} also claims a privileged ingress port for the system launchd domain; remove it before installing the user agent: sudo launchctl bootout system/{label} && sudo rm {}",
             path.display(),
             path.display()
         ));
     }
     ensure_port_available(Service::Frontdoor, listen)?;
-    ensure_port_available(Service::HttpsSocket, https_listen())
+    ensure_port_available(Service::IngressHttps, https_listen())?;
+    ensure_port_available(Service::IngressHttp, http_listen())
 }
 
 /// Refuse to start when a listener is not the service we are about to replace.
@@ -954,10 +1021,10 @@ fn parse_install(args: &[String]) -> Result<InstallOptions, String> {
                     args.get(index).ok_or("--frontdoor-bin requires a path")?,
                 ));
             }
-            "--forwarder-bin" => {
+            "--ingress-bin" | "--forwarder-bin" => {
                 index += 1;
-                options.forwarder_bin = Some(expand_home(
-                    args.get(index).ok_or("--forwarder-bin requires a path")?,
+                options.ingress_bin = Some(expand_home(
+                    args.get(index).ok_or("--ingress-bin requires a path")?,
                 ));
             }
             other => return Err(format!("unknown frontdoor install argument `{other}`")),
@@ -1209,7 +1276,7 @@ fn find_binary(name: &str, explicit: Option<&Path>, installed: &Path) -> Result<
         "{name} not found; place it next to the mycelium binary or pass {}",
         match name {
             "mycelium-frontdoor" => "--frontdoor-bin",
-            "mycelium-https-forwarder" => "--forwarder-bin",
+            "mycelium-ingress" => "--ingress-bin",
             _ => "the matching --*-bin flag",
         }
     ))
@@ -1264,14 +1331,45 @@ fn render_frontdoor_plist(
     )
 }
 
-fn render_https_plist(paths: &Paths, forwarder_bin: &Path, listen: SocketAddr) -> String {
+fn render_ingress_plist(
+    label: &str,
+    ingress_bin: &Path,
+    arguments: &[String],
+    socket: &str,
+    port: u16,
+    log: &Path,
+) -> String {
+    let arguments = arguments
+        .iter()
+        .map(|argument| format!("<string>{}</string>", xml(argument)))
+        .collect::<String>();
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{forwarder}</string><string>--target</string><string>{listen}</string></array>\n<key>RunAtLoad</key><true/><key>ThrottleInterval</key><integer>5</integer>\n<key>StandardErrorPath</key><string>{log}</string>\n<key>Sockets</key><dict><key>HTTPS</key><dict><key>SockNodeName</key><string>127.0.0.1</string><key>SockServiceName</key><integer>{port}</integer><key>SockFamily</key><string>IPv4</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict></dict>\n</dict></plist>\n",
-        label = xml(HTTPS_LABEL),
-        forwarder = xml(&forwarder_bin.display().to_string()),
-        listen = listen,
-        log = xml(&paths.dir.join("https-forwarder.log").display().to_string()),
-        port = HTTPS_PORT,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{ingress}</string>{arguments}</array>\n<key>RunAtLoad</key><true/><key>ThrottleInterval</key><integer>5</integer>\n<key>StandardErrorPath</key><string>{log}</string>\n<key>Sockets</key><dict><key>{socket}</key><dict><key>SockNodeName</key><string>127.0.0.1</string><key>SockServiceName</key><integer>{port}</integer><key>SockFamily</key><string>IPv4</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict></dict>\n</dict></plist>\n",
+        label = xml(label),
+        ingress = xml(&ingress_bin.display().to_string()),
+        log = xml(&log.display().to_string()),
+    )
+}
+
+fn render_ingress_https_plist(paths: &Paths, ingress_bin: &Path, listen: SocketAddr) -> String {
+    render_ingress_plist(
+        INGRESS_HTTPS_LABEL,
+        ingress_bin,
+        &["https".into(), "--target".into(), listen.to_string()],
+        "HTTPS",
+        HTTPS_PORT,
+        &paths.dir.join("ingress-https.log"),
+    )
+}
+
+fn render_ingress_http_plist(paths: &Paths, ingress_bin: &Path) -> String {
+    render_ingress_plist(
+        INGRESS_HTTP_LABEL,
+        ingress_bin,
+        &["http-redirect".into()],
+        "HTTP",
+        HTTP_PORT,
+        &paths.dir.join("ingress-http.log"),
     )
 }
 
@@ -1298,18 +1396,36 @@ fn render_frontdoor_unit(
     ))
 }
 
-fn render_https_socket_unit() -> String {
+fn render_ingress_https_socket_unit() -> String {
     format!(
-        "[Unit]\nDescription=Mycelium .myc HTTPS socket\n\n[Socket]\nListenStream={HTTPS_ADDR}\nAccept=no\nService={HTTPS_SERVICE_UNIT}\n\n[Install]\nWantedBy=sockets.target\n"
+        "[Unit]\nDescription=Mycelium .myc HTTPS socket\n\n[Socket]\nListenStream={HTTPS_ADDR}\nAccept=no\nService={INGRESS_HTTPS_SERVICE_UNIT}\n\n[Install]\nWantedBy=sockets.target\n"
     )
 }
 
-fn render_https_service_unit(listen: SocketAddr, forwarder_bin: &Path) -> Result<String, String> {
+fn render_ingress_https_service_unit(
+    listen: SocketAddr,
+    ingress_bin: &Path,
+) -> Result<String, String> {
     let user = current_user()?;
     let group = current_group()?;
     Ok(format!(
-        "[Unit]\nDescription=Mycelium .myc HTTPS forwarder\nRequires={HTTPS_SOCKET_UNIT}\nAfter={FRONTDOOR_UNIT}\n\n[Service]\nUser={user}\nGroup={group}\nExecStart={forwarder} --target {listen}\nNoNewPrivileges=true\nPrivateTmp=true\n",
-        forwarder = systemd_quote(&forwarder_bin.display().to_string()),
+        "[Unit]\nDescription=Mycelium .myc HTTPS ingress\nRequires={INGRESS_HTTPS_SOCKET_UNIT}\nAfter={FRONTDOOR_UNIT}\n\n[Service]\nUser={user}\nGroup={group}\nExecStart={ingress} https --target {listen}\nNoNewPrivileges=true\nPrivateTmp=true\n",
+        ingress = systemd_quote(&ingress_bin.display().to_string()),
+    ))
+}
+
+fn render_ingress_http_socket_unit() -> String {
+    format!(
+        "[Unit]\nDescription=Mycelium .myc HTTP redirect socket\n\n[Socket]\nListenStream={HTTP_ADDR}\nAccept=no\nService={INGRESS_HTTP_SERVICE_UNIT}\n\n[Install]\nWantedBy=sockets.target\n"
+    )
+}
+
+fn render_ingress_http_service_unit(ingress_bin: &Path) -> Result<String, String> {
+    let user = current_user()?;
+    let group = current_group()?;
+    Ok(format!(
+        "[Unit]\nDescription=Mycelium .myc HTTP redirect\nRequires={INGRESS_HTTP_SOCKET_UNIT}\n\n[Service]\nUser={user}\nGroup={group}\nExecStart={ingress} http-redirect\nNoNewPrivileges=true\nPrivateTmp=true\n",
+        ingress = systemd_quote(&ingress_bin.display().to_string()),
     ))
 }
 
@@ -1344,20 +1460,30 @@ fn service_paths() -> Result<Vec<PathBuf>, String> {
     Ok(match platform()? {
         Platform::Macos => vec![
             launch_agent_path(FRONTDOOR_LABEL)?,
-            launch_agent_path(HTTPS_LABEL)?,
+            launch_agent_path(INGRESS_HTTPS_LABEL)?,
+            launch_agent_path(INGRESS_HTTP_LABEL)?,
         ],
         Platform::Linux => vec![
             systemd_unit_path(FRONTDOOR_UNIT),
-            systemd_unit_path(HTTPS_SOCKET_UNIT),
-            systemd_unit_path(HTTPS_SERVICE_UNIT),
+            systemd_unit_path(INGRESS_HTTPS_SOCKET_UNIT),
+            systemd_unit_path(INGRESS_HTTPS_SERVICE_UNIT),
+            systemd_unit_path(INGRESS_HTTP_SOCKET_UNIT),
+            systemd_unit_path(INGRESS_HTTP_SERVICE_UNIT),
         ],
     })
 }
 
 fn legacy_service_paths() -> Result<Vec<PathBuf>, String> {
     Ok(match platform()? {
-        Platform::Macos => vec![launch_agent_path(LEGACY_FRONTDOOR_LABEL)?],
-        Platform::Linux => vec![systemd_unit_path(LEGACY_FRONTDOOR_UNIT)],
+        Platform::Macos => vec![
+            launch_agent_path(LEGACY_FRONTDOOR_LABEL)?,
+            launch_agent_path(LEGACY_HTTPS_LABEL)?,
+        ],
+        Platform::Linux => vec![
+            systemd_unit_path(LEGACY_FRONTDOOR_UNIT),
+            systemd_unit_path(LEGACY_HTTPS_SOCKET_UNIT),
+            systemd_unit_path(LEGACY_HTTPS_SERVICE_UNIT),
+        ],
     })
 }
 
@@ -1384,24 +1510,42 @@ fn install_frontdoor_service(
     Ok(())
 }
 
-fn install_https_services(
+fn install_ingress_services(
     paths: &Paths,
     listen: SocketAddr,
-    forwarder_bin: &Path,
+    ingress_bin: &Path,
 ) -> Result<(), String> {
     match platform()? {
         Platform::Macos => {
             write_named_plist(
-                HTTPS_LABEL,
-                &render_https_plist(paths, forwarder_bin, listen),
+                INGRESS_HTTPS_LABEL,
+                &render_ingress_https_plist(paths, ingress_bin, listen),
+            )?;
+            write_named_plist(
+                INGRESS_HTTP_LABEL,
+                &render_ingress_http_plist(paths, ingress_bin),
             )?;
         }
         Platform::Linux => {
-            install_system_unit(&paths.dir, HTTPS_SOCKET_UNIT, &render_https_socket_unit())?;
             install_system_unit(
                 &paths.dir,
-                HTTPS_SERVICE_UNIT,
-                &render_https_service_unit(listen, forwarder_bin)?,
+                INGRESS_HTTPS_SOCKET_UNIT,
+                &render_ingress_https_socket_unit(),
+            )?;
+            install_system_unit(
+                &paths.dir,
+                INGRESS_HTTPS_SERVICE_UNIT,
+                &render_ingress_https_service_unit(listen, ingress_bin)?,
+            )?;
+            install_system_unit(
+                &paths.dir,
+                INGRESS_HTTP_SOCKET_UNIT,
+                &render_ingress_http_socket_unit(),
+            )?;
+            install_system_unit(
+                &paths.dir,
+                INGRESS_HTTP_SERVICE_UNIT,
+                &render_ingress_http_service_unit(ingress_bin)?,
             )?;
         }
     }
@@ -1473,7 +1617,11 @@ fn start_services() -> Result<(), String> {
     match platform()? {
         Platform::Macos => {
             bootstrap(FRONTDOOR_LABEL, &launch_agent_path(FRONTDOOR_LABEL)?)?;
-            bootstrap(HTTPS_LABEL, &launch_agent_path(HTTPS_LABEL)?)?;
+            bootstrap(
+                INGRESS_HTTPS_LABEL,
+                &launch_agent_path(INGRESS_HTTPS_LABEL)?,
+            )?;
+            bootstrap(INGRESS_HTTP_LABEL, &launch_agent_path(INGRESS_HTTP_LABEL)?)?;
         }
         Platform::Linux => {
             run_privileged("systemctl", &["daemon-reload".to_owned()])?;
@@ -1482,7 +1630,8 @@ fn start_services() -> Result<(), String> {
                 &[
                     "enable".to_owned(),
                     FRONTDOOR_UNIT.to_owned(),
-                    HTTPS_SOCKET_UNIT.to_owned(),
+                    INGRESS_HTTPS_SOCKET_UNIT.to_owned(),
+                    INGRESS_HTTP_SOCKET_UNIT.to_owned(),
                 ],
             )?;
             run_privileged(
@@ -1491,7 +1640,11 @@ fn start_services() -> Result<(), String> {
             )?;
             run_privileged(
                 "systemctl",
-                &["restart".to_owned(), HTTPS_SOCKET_UNIT.to_owned()],
+                &["restart".to_owned(), INGRESS_HTTPS_SOCKET_UNIT.to_owned()],
+            )?;
+            run_privileged(
+                "systemctl",
+                &["restart".to_owned(), INGRESS_HTTP_SOCKET_UNIT.to_owned()],
             )?;
         }
     }
@@ -1534,9 +1687,32 @@ fn wait_for_listener(address: SocketAddr) -> Result<(), String> {
     }
 }
 
+fn wait_for_redirect(address: SocketAddr) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            let _ =
+                stream.write_all(b"GET / HTTP/1.1\r\nHost: ai.myc\r\nConnection: close\r\n\r\n");
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            if response.starts_with("HTTP/1.1 301") {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "HTTP redirect listener {address} did not answer 301 within 10 seconds"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn tcp_probe(address: SocketAddr) -> bool {
     // Prefer lsof: a bare TCP connect to the socket-activated :443 would wake
-    // the forwarder and log a failed TLS handshake on every status check.
+    // the ingress and log a failed TLS handshake on every status check.
     if !listener_pids(address).is_empty() {
         return true;
     }
@@ -1837,8 +2013,18 @@ fn tls_verified(address: SocketAddr, anchor: Option<&Path>) -> Result<(), String
 }
 
 fn system_daemon_path() -> Option<PathBuf> {
-    let path = Path::new("/Library/LaunchDaemons").join(format!("{HTTPS_LABEL}.plist"));
-    path.is_file().then_some(path)
+    for label in [
+        INGRESS_HTTPS_LABEL,
+        INGRESS_HTTP_LABEL,
+        LEGACY_HTTPS_LABEL,
+        LEGACY_FRONTDOOR_LABEL,
+    ] {
+        let path = Path::new("/Library/LaunchDaemons").join(format!("{label}.plist"));
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn certificate_trusted(cert: &Path) -> bool {
@@ -1924,21 +2110,35 @@ fn uninstall(args: &[String]) -> Result<Vec<String>, String> {
     if dry_run {
         let mut lines = paths
             .iter()
+            .filter(|path| path.exists())
             .map(|path| format!("would remove {}", path.display()))
             .collect::<Vec<_>>();
-        if platform()? == Platform::Linux
-            && (Path::new(SYSTEM_CA_PATH).is_file() || Path::new(LEGACY_SYSTEM_CA_PATH).is_file())
-        {
-            lines.push(format!(
-                "would remove {SYSTEM_CA_PATH} and {LEGACY_SYSTEM_CA_PATH}"
-            ));
+        if lines.is_empty() {
+            lines.push("no frontdoor services are installed".into());
+        }
+        if platform()? == Platform::Linux {
+            let mut cas = Vec::new();
+            for path in [SYSTEM_CA_PATH, LEGACY_SYSTEM_CA_PATH] {
+                if Path::new(path).is_file() {
+                    cas.push(path);
+                }
+            }
+            if !cas.is_empty() {
+                lines.push(format!("would remove {}", cas.join(" and ")));
+            }
         }
         return Ok(lines);
     }
     match platform()? {
         Platform::Macos => {
             let domain = launch_domain()?;
-            for label in [FRONTDOOR_LABEL, HTTPS_LABEL, LEGACY_FRONTDOOR_LABEL] {
+            for label in [
+                FRONTDOOR_LABEL,
+                INGRESS_HTTPS_LABEL,
+                INGRESS_HTTP_LABEL,
+                LEGACY_FRONTDOOR_LABEL,
+                LEGACY_HTTPS_LABEL,
+            ] {
                 let _ = Command::new("launchctl")
                     .args(["bootout", &format!("{domain}/{label}")])
                     .output();
@@ -1956,10 +2156,14 @@ fn uninstall(args: &[String]) -> Result<Vec<String>, String> {
                 &[
                     "disable".to_owned(),
                     "--now".to_owned(),
-                    HTTPS_SOCKET_UNIT.to_owned(),
-                    HTTPS_SERVICE_UNIT.to_owned(),
+                    INGRESS_HTTPS_SOCKET_UNIT.to_owned(),
+                    INGRESS_HTTPS_SERVICE_UNIT.to_owned(),
+                    INGRESS_HTTP_SOCKET_UNIT.to_owned(),
+                    INGRESS_HTTP_SERVICE_UNIT.to_owned(),
                     FRONTDOOR_UNIT.to_owned(),
                     LEGACY_FRONTDOOR_UNIT.to_owned(),
+                    LEGACY_HTTPS_SOCKET_UNIT.to_owned(),
+                    LEGACY_HTTPS_SERVICE_UNIT.to_owned(),
                 ],
             );
             for path in &paths {
@@ -2283,12 +2487,16 @@ mod tests {
             &material,
             listen,
         );
-        let https = render_https_plist(&paths, Path::new("/tmp/mycelium-https-forwarder"), listen);
+        let https = render_ingress_https_plist(&paths, Path::new("/tmp/mycelium-ingress"), listen);
+        let http = render_ingress_http_plist(&paths, Path::new("/tmp/mycelium-ingress"));
         assert!(frontdoor.contains("127.0.0.1:9443"));
         assert!(frontdoor.contains("--tls-cert"));
         assert!(https.contains("SockServiceName"));
         assert!(https.contains("<integer>443</integer>"));
         assert!(https.contains("127.0.0.1:9443"));
+        assert!(https.contains("https"));
+        assert!(http.contains("<integer>80</integer>"));
+        assert!(http.contains("http-redirect"));
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2313,15 +2521,22 @@ mod tests {
         assert!(frontdoor.contains("--usage \"/home/a/.mycelium/frontdoor/usage.json\""));
         assert!(frontdoor.contains("Restart=on-failure"));
         assert!(frontdoor.contains("mycelium-frontdoor"));
-        let socket = render_https_socket_unit();
+        let socket = render_ingress_https_socket_unit();
         assert!(socket.contains("ListenStream=127.0.0.1:443"));
-        assert!(socket.contains("Service=mycelium-https.service"));
-        let forwarder = render_https_service_unit(
+        assert!(socket.contains("Service=mycelium-ingress-https.service"));
+        let ingress = render_ingress_https_service_unit(
             listen,
-            Path::new("/home/a/.mycelium/bin/mycelium-https-forwarder"),
+            Path::new("/home/a/.mycelium/bin/mycelium-ingress"),
         )
         .unwrap();
-        assert!(forwarder.contains("--target 127.0.0.1:10443"));
+        assert!(ingress.contains("https --target 127.0.0.1:10443"));
+        let http_socket = render_ingress_http_socket_unit();
+        assert!(http_socket.contains("ListenStream=127.0.0.1:80"));
+        assert!(http_socket.contains("Service=mycelium-ingress-http.service"));
+        let http =
+            render_ingress_http_service_unit(Path::new("/home/a/.mycelium/bin/mycelium-ingress"))
+                .unwrap();
+        assert!(http.contains("http-redirect"));
     }
 
     #[test]

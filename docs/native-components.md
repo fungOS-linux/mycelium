@@ -17,7 +17,7 @@ should be a Spore where the runtime already provides the capability.
 | `mycelium` | `mycelium-cli` | CLI, enrollment, daemon via hidden `_serve` | yes | Unix socket, PKI, host state | Canonical user-facing binary; launchd/systemd run `mycelium _serve`. |
 | `myceliumd` | `myceliumd` | Standalone daemon binary | no | same as `_serve` | The managed service runs `mycelium _serve`, which links the `myceliumd` crate. The binary is not a separate feature; keep it as a compatibility/debug artifact until the package/service audit is complete. |
 | `mycelium-frontdoor` | `mycelium-frontdoor` | Loopback TLS/Host router for `*.myc` services | operator | loopback listener, TLS keys | Could be a hidden `mycelium` mode; separate binary keeps its dependency graph out of the CLI. |
-| `mycelium-https-forwarder` | `mycelium-cli` (second `[[bin]]`) | Socket-activated `:443` byte forwarder | operator | privileged socket activation | It is a binary target in the `mycelium-cli` crate, not its own crate. Keep the keyless process split; it can become `mycelium _https-forwarder`. |
+| `mycelium-ingress` | `mycelium-cli` (second `[[bin]]`) | Socket-activated `:443` byte forwarder and `:80` redirect | operator | privileged socket activation | One binary, two modes (`https`, `http-redirect`), two supervised processes. It is a binary target in the `mycelium-cli` crate, not its own crate. Keep the keyless process split; it can become `mycelium _ingress`. |
 | `mycelium-dns-resolver` | `mycelium-driver-dnsmasq` | Legacy standalone resolver runner | migration only | dnsmasq child, DNS socket | `mycelium dns resolver run` is canonical. The installer now retires legacy `mycelium-dns-resolver` agents before applying the new resolver; remove the artifact after that migration has shipped. |
 | `geoded` | `geoded` | Owner-only credential lease broker | opt-in | Unix socket, file-backed secret store | Installed only with `--geode`; its user service is upgraded by re-running that flag. |
 
@@ -88,11 +88,16 @@ older LaunchAgents/systemd units. The installer now retires those legacy agents
 before applying the current resolver, so dropping the legacy artifact is a
 later cleanup, not a feature removal.
 
-### 2. Fold the HTTPS forwarder into `mycelium`
+### 2. Consolidate HTTP and HTTPS ingress
 
-`mycelium-https-forwarder` is a second binary target in the `mycelium-cli`
-crate. Add a hidden `mycelium _https-forwarder` mode and point the socket units
-at `mycelium`; the process remains unprivileged, keyless, and socket-activated.
+`mycelium-ingress` is a second binary target in the `mycelium-cli` crate with two
+modes: `https --target` moves raw bytes for the TLS frontdoor, and
+`http-redirect` answers port 80 with a 301. They run as separate supervised
+processes so the `:443` relay still never parses HTTP. The former
+`mycelium-http-redirect` binary is gone; the previous `mycelium-https-forwarder`
+service is retired during upgrade. A later cleanup can add a hidden
+`mycelium _ingress` mode and point both units at `mycelium`, but the process
+split and keyless boundary stay either way.
 
 ### 3. Decide whether the frontdoor is a binary or a mode
 
@@ -129,7 +134,7 @@ serves many Spores instead of launching one native server per view.
 
 - OS tunnel devices and packet I/O (`iroh-tun`).
 - FUSE mounts (`fungos-vfs-fuse`).
-- Privileged socket activation and TLS key custody (`https-forwarder`, frontdoor).
+- Privileged socket activation (`mycelium-ingress`) and TLS key custody (frontdoor).
 - Unix-socket daemon state, PKI, enrollment, and update activation (`mycelium`).
 - Credential/key custody (`geoded`, `soil-spore` signing).
 - Process/SSH orchestration (`fpl-bob`).

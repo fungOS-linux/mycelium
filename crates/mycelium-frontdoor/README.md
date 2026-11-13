@@ -11,16 +11,22 @@ cannot: binding a listener, authenticating local callers, and forwarding by
 app / Soil Spore
   -> https://ai.myc
   -> host-owned :443 socket (launchd/systemd)
-  -> mycelium-https-forwarder
+  -> mycelium-ingress https --target 127.0.0.1:8443
   -> mycelium-frontdoor :8443 (TLS)
   -> configured route (local Bifrost, MCP bridge, Soil launcher, ...)
+
+http://ai.myc
+  -> host-owned :80 socket
+  -> mycelium-ingress http-redirect
+  -> 301 https://ai.myc/...
 ```
 
 The frontdoor terminates TLS when given `--tls-cert` and `--tls-key`. The privileged
-socket stays with the service manager: `mycelium-https-forwarder` accepts the
-`443` socket and forwards raw bytes to the frontdoor on loopback `8443`. It has no
-keys and cannot authorize requests, so certificate custody remains with the
-frontdoor process.
+sockets stay with the service manager: `mycelium-ingress` accepts `:443` and
+forwards raw bytes to the frontdoor on loopback `8443`. Its `http-redirect` mode
+answers `:80` with a 301 and never proxies a request. Neither mode has keys or
+can authorize requests, so certificate custody remains with the frontdoor
+process.
 
 Routes are a deliberately small table, loaded from JSON and hot-reloaded when
 the file changes:
@@ -135,9 +141,9 @@ mycelium doctor
 
 `frontdoor install` writes a local CA and leaf certificate (or retains an
 existing certificate pair), installs the default capability routes, copies the
-frontdoor/forwarder binaries under `$MYCELIUM_HOME/bin`, and installs the host
-services: two LaunchAgents on macOS, a frontdoor service plus a socket-activated
-forwarder on Linux. `--trust-cert` adds the issuing CA to the login keychain on
+frontdoor and ingress binaries under `$MYCELIUM_HOME/bin`, and installs the host
+services: three LaunchAgents on macOS, a frontdoor service plus two
+socket-activated ingress modes on Linux. `--trust-cert` adds the issuing CA to the login keychain on
 macOS or the system CA store on Linux; it is deliberately explicit because it
 changes the host's trust settings. `mycelium setup --local-frontdoor
 --trust-cert` runs the same installation after enrollment. `mycelium doctor
@@ -145,14 +151,15 @@ changes the host's trust settings. `mycelium setup --local-frontdoor
 doctor` exits non-zero when a check fails so it can gate scripts.
 
 Linux units live in `/etc/systemd/system`: `mycelium-frontdoor.service`,
-`mycelium-https.socket`, and `mycelium-https.service`. Installing them needs
+`mycelium-ingress-https.socket`, `mycelium-ingress-https.service`,
+`mycelium-ingress-http.socket`, and `mycelium-ingress-http.service`. Installing them needs
 passwordless sudo (the CLI uses `sudo -n` and fails loudly otherwise). Use
 `--listen 127.0.0.1:PORT` when another service already owns the default
 frontdoor port; the installed unit is the source of truth, so later reinstalls
 keep that address.
 
-`frontdoor install` refuses to start when the configured frontdoor address or
-`:443` is already held by a different process, so a leftover system LaunchDaemon
+`frontdoor install` refuses to start when the configured frontdoor address,
+`:443`, or `:80` is already held by a different process, so a leftover system LaunchDaemon
 or another service is reported instead of being silently duplicated. `frontdoor
 uninstall` removes only the Mycelium user agents/systemd units and the Linux CA
 entry; it never touches `/Library/LaunchDaemons` or unrelated units.
@@ -189,8 +196,9 @@ mycelium-frontdoor --listen 127.0.0.1:8443 \
   --tls-key "$HOME/.mycelium/frontdoor/server-key.pem"
 ```
 
-On macOS, launchd can own `:443` for an unprivileged LaunchAgent. The agent is
-started on the first connection and runs the forwarder as the logged-in user:
+On macOS, launchd can own the privileged ports for an unprivileged LaunchAgent.
+Each agent is started on the first connection and runs `mycelium-ingress` as the
+logged-in user:
 
 ```xml
 <key>Sockets</key><dict><key>HTTPS</key><dict>
@@ -202,34 +210,21 @@ started on the first connection and runs the forwarder as the logged-in user:
 </dict></dict>
 ```
 
-Point its `ProgramArguments` at `mycelium-https-forwarder --target
+Point its `ProgramArguments` at `mycelium-ingress https --target
 127.0.0.1:8443`; keep the frontdoor itself in a separate agent or supervisor on
 `127.0.0.1:8443`. No root process is required, and the frontdoor does not run with
 privileged socket ownership. The same split works with a systemd socket unit on
 Linux.
 
-Binding `:443` directly in the frontdoor would require a privileged supervisor and
-is not the intended deployment. Use the socket-activated forwarder so the
-listener and the process holding TLS keys have different privileges.
+For `:80`, use a second agent with an `HTTP` socket and `ProgramArguments` at
+`mycelium-ingress http-redirect`. It answers every request with `301 Moved
+Permanently` to the same `https://` URL and never proxies a request body. This
+listener is intentionally TLS-only in the other direction: a plaintext request
+either moves to HTTPS or fails, and no request is forwarded over plaintext.
 
-For `:80`, run `mycelium-http-redirect` as the socket-activated agent on the
-`HTTP` socket. It answers every request with `301 Moved Permanently` to the same
-`https://` URL and never proxies a request body:
-
-```xml
-<key>Sockets</key><dict><key>HTTP</key><dict>
-  <key>SockNodeName</key><string>127.0.0.1</string>
-  <key>SockServiceName</key><integer>80</integer>
-  <key>SockFamily</key><string>IPv4</string>
-  <key>SockType</key><string>stream</string>
-  <key>SockProtocol</key><string>TCP</string>
-</dict></dict>
-```
-
-Point its `ProgramArguments` at `mycelium-http-redirect`; it activates the
-socket named `HTTP` and needs no privileged listener of its own. This listener
-is intentionally TLS-only in the other direction: a plaintext request either
-moves to HTTPS or fails, and no request is forwarded over plaintext.
+Binding `:443` or `:80` directly in the frontdoor would require a privileged
+supervisor and is not the intended deployment. Use `mycelium-ingress` so the
+listeners and the process holding TLS keys have different privileges.
 
 Use a bearer token for local callers:
 
@@ -258,10 +253,10 @@ listener.
 
 The frontdoor binds one address. Binding `:443` belongs to the
 Spore/Confluence ingress layer: the service manager owns the privileged socket,
-`mycelium-https-forwarder` moves raw bytes, and the frontdoor terminates TLS on a
-loopback port. `:80` is a redirect-only listener (`mycelium-http-redirect`), so
-it never carries a request body or a credential. This keeps both privileged
-listeners free of certificates and request authorization.
+`mycelium-ingress https` moves raw bytes, and the frontdoor terminates TLS on a
+loopback port. `mycelium-ingress http-redirect` owns `:80` and never carries a
+request body or a credential. This keeps both privileged listeners free of
+certificates and request authorization.
 
 ## Current scope
 
@@ -269,5 +264,5 @@ This slice uses a static JSON route file. Mycelium service records are the
 intended source for that file: the route table is the narrow handoff point, and
 a service-discovery reconciler can regenerate it without granting Spores a
 listening socket. Service-record reconciliation and Palisade-backed caller
-identity are follow-ups. TLS termination and the host-owned HTTPS forwarder are
+identity are follow-ups. TLS termination and the host-owned ingress are
 implemented here.

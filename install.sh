@@ -328,14 +328,14 @@ install_mycelium() {
         BIN_SRC="$src/target/release"
     fi
     mkdir -p "$BIN_DIR" "$LOCAL_BIN"
-    for name in mycelium myceliumd mycelium-frontdoor mycelium-https-forwarder mycelium-dns-resolver geoded; do
+    for name in mycelium myceliumd mycelium-frontdoor mycelium-ingress mycelium-dns-resolver geoded; do
         if [ -f "$BIN_SRC/$name" ]; then
             install_atomic "$BIN_SRC/$name" "$BIN_DIR/$name"
         else
             warn "prebuilt $name missing; that service will be unavailable"
         fi
     done
-    for name in mycelium myceliumd mycelium-frontdoor mycelium-https-forwarder geoded; do
+    for name in mycelium myceliumd mycelium-frontdoor mycelium-ingress geoded; do
         if [ -f "$BIN_SRC/$name" ]; then install_atomic "$BIN_SRC/$name" "$LOCAL_BIN/$name"; fi
     done
     if [ -f "$BIN_SRC/mycelium-dns-resolver" ] && [ ! -L "$LOCAL_BIN/mycelium-dns-resolver" ]; then
