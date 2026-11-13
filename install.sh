@@ -8,6 +8,7 @@
 # Components are asked for in order. Every prompt can be answered up front:
 #
 #   ./install.sh --yes
+#   ./install.sh --code MYC1-...
 #   ./install.sh --no-vpn --no-bob
 #   ./install.sh --source . --bin-dir target/release --no-enroll
 #
@@ -86,7 +87,8 @@ when no terminal is available; the installer will not assume defaults silently.
 
 Core:
   --gateway URL          enrollment gateway (default https://sso.fpl.dev)
-  --claim CODE           redeem an enrollment claim
+  --claim CODE           redeem a pairing or enrollment code
+  --code CODE            alias for --claim
   --claim-file PATH      redeem a claim from a file
   --local-frontdoor      install the loopback HTTPS frontdoor
   --trust-cert           trust the generated frontdoor CA (prompted by default)
@@ -1382,7 +1384,7 @@ parse_args() {
             --no-trust-cert) TRUST_CERT=no; shift ;;
             --local-frontdoor|--local-gateway) LOCAL_FRONTDOOR=1; shift ;;
             --gateway) [ $# -ge 2 ] || die "--gateway needs a URL"; GATEWAY=$2; shift 2 ;;
-            --claim) [ $# -ge 2 ] || die "--claim needs a code"; CLAIM=$2; shift 2 ;;
+            --claim|--code) [ $# -ge 2 ] || die "$1 needs a code"; CLAIM=$2; shift 2 ;;
             --claim-file) [ $# -ge 2 ] || die "--claim-file needs a path"; CLAIM_FILE=$2; shift 2 ;;
             --source) [ $# -ge 2 ] || die "--source needs a directory"; SRC=$2; shift 2 ;;
             --bin-dir) [ $# -ge 2 ] || die "--bin-dir needs a directory"; BIN_SRC=$2; shift 2 ;;
@@ -1468,6 +1470,15 @@ resume_updater() {
 
 main() {
     parse_args "$@"
+    # A join code is meant to be consumed without a conversation. `curl | bash`
+    # leaves stdin as a pipe while /dev/tty still exists, so test stdin: piping
+    # the installer with a code selects the documented component defaults
+    # instead of dying at the prompt guard.
+    if [ "$DRY_RUN" = 0 ] && [ "$YES" != 1 ] && [ ! -t 0 ] \
+        && { [ -n "$CLAIM" ] || [ -n "$CLAIM_FILE" ]; }; then
+        note "join code supplied in a piped install; using the component defaults"
+        YES=1
+    fi
     if [ "$DRY_RUN" = 0 ] && [ "$YES" != 1 ] && ! have_tty; then
         for name in VPN VFS SOIL BOB OPERATOR GEODE ENROLL; do
             eval "value=\${$name}"

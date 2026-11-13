@@ -12,16 +12,13 @@ Use `--yes` for the recommended defaults, or answer the component prompts. The
 prompts run in this order: IPv6 VPN (then sudo), VFS, Soil + `fungOS.app`, build
 offload, operator surface, optional geode broker, enrollment. Every prompt can be
 answered up front with the flags below. With no terminal, pass `--yes` or every
-component flag; the installer stops rather than silently assuming defaults. A
+component flag; the installer stops rather than silently assuming defaults. The
+exception is a join code: a piped installer with `--code`/`--claim` uses the
+same defaults, so a one-line join needs no other flags. A
 source build is the default until these installer and `iroh-tun` supervisor
 changes are in a signed release. The installer disables automatic updates for a local build by default
 (the signed channel can otherwise replace it with an older release); pass
 `--enable-updates` to keep them enabled.
-
-> Until this branch lands on `master`, the raw `master` one-liner installs an
-> older tree that cannot publish an external tunnel. Run the checkout directly:
-> `./install.sh --source .`. The one-liner above is the command users should get
-> once the branch is merged.
 
 ## Platform support
 
@@ -50,6 +47,35 @@ if they must start before a login session exists.
 | Soil (default) | Builds the `soil` CLI, creates the fungOS data directories, installs `fungOS.app` on macOS when a bundle is supplied or present, and installs `soil-home`/`soil-store` as LaunchAgents or systemd user units when the runtime binaries are available. A failed CLI build is reported but does not block the app or runtime setup. |
 | Geode (opt-in) | Installs the `geoded` broker and a user service with a private store under `~/.geode`. Re-run with `--geode` to upgrade it; omitting the flag leaves an existing service alone. |
 | Build offload (default) | Builds `fpl-bob`, writes the sccache client configuration, and records the optional sccache-dist scheduler and remote build hosts. |
+
+## Joining a principal or fleet
+
+A join code is minted by an authority and redeemed by the installer. The code
+carries the claim lifetime and the credential lifetime; the joining machine
+cannot extend either.
+
+```sh
+# Authority: SSH access for a principal (15 minute code, 8 hour certificate)
+mycelium pair --name buddy --unix-user operator --ttl 15m --credential-ttl 8h
+
+# Authority: peer membership in a site (no SSH access by itself)
+mycelium pair --kind peer --name sandbox-7 --site lab \
+  --peer 100.120.101.5:7443 --ttl 10m --credential-ttl 2h
+
+# Joining machine: one line, no prompts
+curl -fsSL https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh \
+  | bash -s -- --code "MYC1-..."
+```
+
+`--code` is an alias for `--claim`; use `--claim-file PATH` to keep the code out
+of process arguments in unattended provisioning. `--ttl` (default `15m`, max
+7 days) bounds how long the code can be redeemed, while `--credential-ttl`
+(default `8h`, max 30 days) bounds the certificate or peer identity the joiner
+receives. Use a short pair for a sandbox.
+
+The installer still installs the DNS resolver service, which needs root: run as
+root, pre-authorize sudo, or it stops at that step. `--no-vpn` drops the IPv6
+tunnel but does not remove the DNS service's root requirement.
 
 ## The privileged tunnel
 
@@ -118,9 +144,9 @@ sudo rm -rf /usr/local/libexec/mycelium /var/run/mycelium
 # Enable or upgrade the optional geode broker later
 ./install.sh --geode
 
-# Non-interactive claim redemption
+# Non-interactive join with a code
 curl -fsSL https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh \
-  | bash -s -- --yes --claim MYC1-...
+  | bash -s -- --code MYC1-...
 
 # See the plan without changing the machine
 ./install.sh --dry-run --yes --source .
