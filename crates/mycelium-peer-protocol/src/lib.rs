@@ -1,6 +1,6 @@
 //! Symmetric, transport-neutral messages exchanged by Mycelium peers.
 
-pub mod gateway_usage;
+pub mod frontdoor_usage;
 pub mod profile;
 pub mod identity;
 

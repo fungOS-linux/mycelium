@@ -2,7 +2,7 @@
 //!
 //! Doctor deliberately reports local facts rather than starting the daemon or
 //! changing the host. `--fix` is the only mutating mode and delegates to the
-//! gateway lifecycle module.
+//! frontdoor lifecycle module.
 use myceliumd::{client::Client, protocol::Request};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -41,9 +41,9 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     let mut fix_lines = Vec::new();
     let mut catalog: Option<Value> = None;
     if fix {
-        match crate::gateway::install_default(&home, trust).await {
+        match crate::frontdoor::install_default(&home, trust).await {
             Ok(lines) => fix_lines.extend(lines),
-            Err(error) => add(&mut checks, "gateway fix", "fail", error),
+            Err(error) => add(&mut checks, "frontdoor fix", "fail", error),
         }
     }
     let mut client = match Client::try_connect().await {
@@ -169,8 +169,8 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         }
     }
 
-    let snapshot = crate::gateway::snapshot(&home).await;
-    gateway_checks(&mut checks, &snapshot, &home);
+    let snapshot = crate::frontdoor::snapshot(&home).await;
+    frontdoor_checks(&mut checks, &snapshot, &home);
     signature_checks(&mut checks);
 
     let failed = checks
@@ -186,7 +186,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         vec![json!({
             "ok": ok,
             "checks": checks,
-            "gateway": snapshot,
+            "frontdoor": snapshot,
             "fix": fix_lines,
         })
         .to_string()]
@@ -207,7 +207,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
             failed
         ));
         if !ok {
-            lines.push("remediation: mycelium gateway install --write --trust-cert".into());
+            lines.push("remediation: mycelium frontdoor install --write --trust-cert".into());
         }
         lines
     };
@@ -223,29 +223,29 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
 
-fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
-    if crate::gateway::supported_platform().is_err() {
+fn frontdoor_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
+    if crate::frontdoor::supported_platform().is_err() {
         add(
             checks,
-            "local gateway",
+            "local frontdoor",
             "warn",
-            "gateway lifecycle supports macOS and Linux only".into(),
+            "frontdoor lifecycle supports macOS and Linux only".into(),
         );
         return;
     }
     let installed = snapshot["installed"].as_bool().unwrap_or(false);
     add(
         checks,
-        "gateway install",
+        "frontdoor install",
         if installed { "ok" } else { "fail" },
         if installed {
             format!("agents and configuration present under {}", home.display())
         } else {
-            "run `mycelium gateway install --write --trust-cert`".into()
+            "run `mycelium frontdoor install --write --trust-cert`".into()
         },
     );
     for (name, key) in [
-        ("gateway agent", "gateway_agent"),
+        ("frontdoor agent", "frontdoor_agent"),
         ("https agent", "https_agent"),
     ] {
         let loaded = snapshot[key]["loaded"].as_bool().unwrap_or(false);
@@ -260,7 +260,7 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
         );
     }
     for (name, key, address_key) in [
-        ("gateway listener", "gateway_listening", "listen"),
+        ("frontdoor listener", "frontdoor_listening", "listen"),
         ("https listener", "https_listening", "https_listen"),
     ] {
         let listening = snapshot[key].as_bool().unwrap_or(false);
@@ -286,7 +286,7 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
             if cert_trusted {
                 "verified for ai.myc"
             } else {
-                "browser will warn; run `mycelium gateway install --write --trust-cert`"
+                "browser will warn; run `mycelium frontdoor install --write --trust-cert`"
             }
         ),
     );
@@ -315,7 +315,7 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
             let status = health.get("status").and_then(Value::as_u64).unwrap_or(0);
             add(
                 checks,
-                "gateway health",
+                "frontdoor health",
                 if status == 200 { "ok" } else { "fail" },
                 format!(
                     "HTTP {status} {}",
@@ -336,7 +336,7 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
             if auth_required == Some(false) {
                 add(
                     checks,
-                    "gateway auth",
+                    "frontdoor auth",
                     "warn",
                     "auth_required is false: anything that can reach the listener is served without a grant; this is only safe while the listener is loopback-only".into(),
                 );
@@ -344,7 +344,7 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
         }
         None => add(
             checks,
-            "gateway health",
+            "frontdoor health",
             "fail",
             "no response on 127.0.0.1:8443".into(),
         ),
@@ -359,7 +359,7 @@ fn gateway_checks(checks: &mut Vec<Value>, snapshot: &Value, home: &Path) {
         } else if let Some(error) = snapshot["tls_error"].as_str() {
             format!("TLS probe failed: {error}")
         } else {
-            "gateway is not listening on 127.0.0.1:8443".into()
+            "frontdoor is not listening on 127.0.0.1:8443".into()
         },
     );
 }

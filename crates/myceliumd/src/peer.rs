@@ -2594,44 +2594,53 @@ fn collect_health() -> Result<HostHealth, AnyError> {
     #[cfg(target_os = "macos")]
     let mut health = collect_darwin()?;
     add_update_health(&mut health);
-    add_gateway_usage(&mut health);
+    add_frontdoor_usage(&mut health);
     Ok(health)
 }
 
-/// Publish the token counters the local gateway persists so every peer can roll
-/// them up. A snapshot that is not fresh is dropped instead of gossiped: a
-/// gateway that stopped running must not look like a fleet that went quiet.
-fn add_gateway_usage(health: &mut HostHealth) {
-    let path = crate::home_dir().join("gateway/usage.json");
+/// Publish the token counters the local frontdoor persists so every peer can
+/// roll them up. A snapshot that is not fresh is dropped instead of gossiped: a
+/// frontdoor that stopped running must not look like a fleet that went quiet.
+fn add_frontdoor_usage(health: &mut HostHealth) {
+    let home = crate::home_dir();
+    // The old directory stays readable until the frontdoor migration has run.
+    let Some(path) = [
+        home.join("frontdoor/usage.json"),
+        home.join("gateway/usage.json"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file()) else {
+        return;
+    };
     let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
-    match gateway_usage_metrics(&bytes, now()) {
+    match frontdoor_usage_metrics(&bytes, now()) {
         Ok(Some(metrics)) => health.platform_metrics.extend(metrics),
-        // A gateway that is not running (or has just started) publishes nothing.
-        // Peers already drop metrics that are not fresh, so this is not an error
-        // worth repeating on every health tick.
+        // A frontdoor that is not running (or has just started) publishes
+        // nothing. Peers already drop metrics that are not fresh, so this is not
+        // an error worth repeating on every health tick.
         Ok(None) => {}
-        Err(error) => eprintln!("gateway usage: {}: {error}", path.display()),
+        Err(error) => eprintln!("frontdoor usage: {}: {error}", path.display()),
     }
 }
 
-fn gateway_usage_metrics(
+fn frontdoor_usage_metrics(
     bytes: &[u8],
     now: u64,
 ) -> Result<Option<BTreeMap<String, String>>, String> {
-    use mycelium_peer_protocol::gateway_usage::{
-        GatewayUsageMetrics, GatewayUsageSnapshot, GATEWAY_USAGE_SCHEMA_VERSION,
+    use mycelium_peer_protocol::frontdoor_usage::{
+        FrontdoorUsageMetrics, FrontdoorUsageSnapshot, FRONTDOOR_USAGE_SCHEMA_VERSION,
     };
-    let snapshot: GatewayUsageSnapshot =
+    let snapshot: FrontdoorUsageSnapshot =
         serde_json::from_slice(bytes).map_err(|error| format!("unreadable usage: {error}"))?;
-    if snapshot.schema_version != GATEWAY_USAGE_SCHEMA_VERSION {
+    if snapshot.schema_version != FRONTDOOR_USAGE_SCHEMA_VERSION {
         return Err(format!(
             "unsupported usage schema {}",
             snapshot.schema_version
         ));
     }
-    let metrics = GatewayUsageMetrics::from_snapshot(&snapshot);
+    let metrics = FrontdoorUsageMetrics::from_snapshot(&snapshot);
     if !metrics.is_fresh(now) {
         return Ok(None);
     }
@@ -3043,8 +3052,8 @@ mod tests {
     }
 
     #[test]
-    fn fresh_gateway_usage_is_gossiped_and_stale_usage_is_dropped() {
-        let metrics = gateway_usage_metrics(&usage_document(1_000, 1), 1_060)
+    fn fresh_frontdoor_usage_is_gossiped_and_stale_usage_is_dropped() {
+        let metrics = frontdoor_usage_metrics(&usage_document(1_000, 1), 1_060)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3061,9 +3070,9 @@ mod tests {
         );
         // A stopped gateway must not report yesterday's traffic as current, and
         // being stopped is a state rather than an error to log on every tick.
-        assert!(gateway_usage_metrics(
+        assert!(frontdoor_usage_metrics(
             &usage_document(1_000, 1),
-            1_000 + mycelium_peer_protocol::gateway_usage::GATEWAY_USAGE_MAX_AGE_SECONDS + 1
+            1_000 + mycelium_peer_protocol::frontdoor_usage::FRONTDOOR_USAGE_MAX_AGE_SECONDS + 1
         )
         .unwrap()
         .is_none());
@@ -3071,8 +3080,8 @@ mod tests {
 
     #[test]
     fn usage_from_another_schema_is_not_reinterpreted() {
-        assert!(gateway_usage_metrics(&usage_document(1_000, 99), 1_060).is_err());
-        assert!(gateway_usage_metrics(b"not json", 1_060).is_err());
+        assert!(frontdoor_usage_metrics(&usage_document(1_000, 99), 1_060).is_err());
+        assert!(frontdoor_usage_metrics(b"not json", 1_060).is_err());
     }
 
     #[test]

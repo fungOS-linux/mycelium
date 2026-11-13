@@ -8,13 +8,13 @@ reach, not on how the client is configured.
 ```text
 client (pi / opencode / Delta)
   -> https://ai.myc/v1
-  -> local gateway (host-owned :443, TLS on loopback)
+  -> local frontdoor (host-owned :443, TLS on loopback)
   -> 1. this machine      Bifrost :4000, or UMIE on a UMIE host
      2. this mesh         an `ai` lease owned by another node (UMIE)
      3. the public edge   https://ai.fpl.dev
 ```
 
-The route is one entry in `$MYCELIUM_HOME/gateway/routes.json`:
+The route is one entry in `$MYCELIUM_HOME/frontdoor/routes.json`:
 
 ```json
 {
@@ -34,8 +34,8 @@ the next candidate — a timeout or an HTTP error does not, because replaying a
 completion could duplicate billed work.
 
 `remote_token_file` is read per request, so the edge key rotates without a
-gateway restart and never lands in a plist or unit file. See
-[the gateway README](../crates/mycelium-gateway/README.md) for the full routing
+frontdoor restart and never lands in a plist or unit file. See
+[the frontdoor README](../crates/mycelium-frontdoor/README.md) for the full routing
 and credential rules.
 
 ## Direct to UMIE on fleet nodes
@@ -68,13 +68,13 @@ publishing step is needed — the normal scan produces the lease:
 3. projection publishes an `ai` observation with an **HTTP** origin — the scheme
    is stated because the kind's contract is an OpenAI-compatible HTTP surface, not
    because a port proves anything;
-4. every gateway's `service_kind: "ai"` discovery turns that into a candidate,
+4. every frontdoor's `service_kind: "ai"` discovery turns that into a candidate,
    ordered after this machine and before `ai.fpl.dev`.
 
 One deployment rule follows from the second step: **bind the server beyond
 loopback** (`0.0.0.0:8122` or the mesh address). A loopback-only listener is
 published as `http://127.0.0.1:<port>` with `endpoint_scope=host-local`: the
-owning host's gateway accepts it, every peer drops it as a remote loopback hint,
+owning host's frontdoor accepts it, every peer drops it as a remote loopback hint,
 and nothing is advertised that a peer cannot reach. Scanning used to discard the
 bind address, which is why an AI listener could never be discovered before.
 
@@ -90,7 +90,7 @@ accept leases from nodes you would route prompts to.
 
 ## Token accounting
 
-The gateway is the only hop every client shares, so it is where usage is counted.
+The frontdoor is the only hop every client shares, so it is where usage is counted.
 For completion requests it reads the upstream `usage` object — from a buffered
 JSON body, or from the final SSE event. A streaming request that did not ask for
 usage gets `stream_options.include_usage` added; a client that set the field
@@ -108,25 +108,25 @@ Requests whose upstream reported nothing are counted as **unmetered**, never
 estimated. A visible gap is usable; a plausible guess is not.
 
 ```sh
-mycelium gateway usage            # this machine
-mycelium gateway usage --json
-mycelium gateway usage --fleet    # gossiped totals from every peer
+mycelium frontdoor usage            # this machine
+mycelium frontdoor usage --json
+mycelium frontdoor usage --fleet    # gossiped totals from every peer
 curl -sk https://ai.myc/.mycelium/usage
 curl -sk https://ai.myc/.mycelium/metrics
 ```
 
-With `--usage` in the installed unit (the installer sets it), the gateway writes
-`$MYCELIUM_HOME/gateway/usage.json` and `myceliumd` republishes the scalars as
+With `--usage` in the installed unit (the installer sets it), the frontdoor writes
+`$MYCELIUM_HOME/frontdoor/usage.json` and `myceliumd` republishes the scalars as
 `mycelium_ai.*` metrics inside the existing gossiped `platform_metrics`. A
-snapshot older than ten minutes is not gossiped: a gateway that stopped must not
+snapshot older than ten minutes is not gossiped: a frontdoor that stopped must not
 read as a fleet that went idle. Counters survive a restart; the throughput window
-starts empty. One request crosses one gateway — do not chain `.myc` gateways, or
+starts empty. One request crosses one frontdoor — do not chain `.myc` frontdoors, or
 the same tokens are counted twice.
 
 ## Client configuration
 
 All three clients use the OpenAI-compatible surface with the **local** Bifrost
-key. The gateway replaces that key with `remote_token_file` when it falls
+key. The frontdoor replaces that key with `remote_token_file` when it falls
 through to the public edge, so the local key never has to double as the cloud
 key. Keep the local key in a file so it can be rotated without editing three
 configs:
@@ -174,10 +174,10 @@ A discovered peer never receives the caller's key.
 mycelium doctor
 curl -sk https://ai.myc/health
 curl -sk -H "Authorization: Bearer $KEY" https://ai.myc/v1/models
-mycelium gateway usage
-mycelium gateway usage --fleet
+mycelium frontdoor usage
+mycelium frontdoor usage --fleet
 ```
 
-`mycelium doctor` reports gateway state, certificate trust, route health and the
+`mycelium doctor` reports frontdoor state, certificate trust, route health and the
 TLS handshake. Usage reporting is per machine: a host appears in
-`gateway usage --fleet` only once its daemon has gossiped a fresh snapshot.
+`frontdoor usage --fleet` only once its daemon has gossiped a fresh snapshot.

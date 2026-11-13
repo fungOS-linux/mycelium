@@ -16,7 +16,7 @@ should be a Spore where the runtime already provides the capability.
 |---|---|---|---|---|---|
 | `mycelium` | `mycelium-cli` | CLI, enrollment, daemon via hidden `_serve` | yes | Unix socket, PKI, host state | Canonical user-facing binary; launchd/systemd run `mycelium _serve`. |
 | `myceliumd` | `myceliumd` | Standalone daemon binary | no | same as `_serve` | The managed service runs `mycelium _serve`, which links the `myceliumd` crate. The binary is not a separate feature; keep it as a compatibility/debug artifact until the package/service audit is complete. |
-| `mycelium-gateway` | `mycelium-gateway` | Loopback TLS/Host router for `*.myc` services | operator | loopback listener, TLS keys | Could be a hidden `mycelium` mode; separate binary keeps its dependency graph out of the CLI. |
+| `mycelium-frontdoor` | `mycelium-frontdoor` | Loopback TLS/Host router for `*.myc` services | operator | loopback listener, TLS keys | Could be a hidden `mycelium` mode; separate binary keeps its dependency graph out of the CLI. |
 | `mycelium-https-forwarder` | `mycelium-cli` (second `[[bin]]`) | Socket-activated `:443` byte forwarder | operator | privileged socket activation | It is a binary target in the `mycelium-cli` crate, not its own crate. Keep the keyless process split; it can become `mycelium _https-forwarder`. |
 | `mycelium-dns-resolver` | `mycelium-driver-dnsmasq` | Legacy standalone resolver runner | migration only | dnsmasq child, DNS socket | `mycelium dns resolver run` is canonical. The installer now retires legacy `mycelium-dns-resolver` agents before applying the new resolver; remove the artifact after that migration has shipped. |
 | `geoded` | `geoded` | Owner-only credential lease broker | opt-in | Unix socket, file-backed secret store | Installed only with `--geode`; its user service is upgraded by re-running that flag. |
@@ -68,7 +68,7 @@ These are not built by the installer but are required by at least one component.
 | `macFUSE` / `libfuse` + `/dev/fuse` | VFS mount | VFS component |
 | `systemd` user + system manager | Linux services | Linux installs |
 | `systemd-resolved` 258+ | Linux DNS suffix delegation | preferred Linux DNS path |
-| `ca-certificates` / `update-ca-certificates` | Linux gateway trust | operator `--trust-cert` |
+| `ca-certificates` / `update-ca-certificates` | Linux frontdoor trust | operator `--trust-cert` |
 | `ssh`, `tar` | `fpl-bob` remote builds | build offload |
 | `sccache` | `fpl-bob` | downloaded and pinned by `fpl-bob setup`, not by the installer |
 
@@ -94,13 +94,13 @@ later cleanup, not a feature removal.
 crate. Add a hidden `mycelium _https-forwarder` mode and point the socket units
 at `mycelium`; the process remains unprivileged, keyless, and socket-activated.
 
-### 3. Decide whether the gateway is a binary or a mode
+### 3. Decide whether the frontdoor is a binary or a mode
 
-`mycelium-gateway` depends on axum/rustls and is intentionally separate from the
-control-plane CLI. Folding it into `mycelium _gateway` would reduce one artifact
+`mycelium-frontdoor` depends on axum/rustls and is intentionally separate from the
+control-plane CLI. Folding it into `mycelium _frontdoor` would reduce one artifact
 but grow the CLI dependency graph. This is a size/simplicity tradeoff, not a
-correctness issue. My recommendation: keep the gateway separate until the
-wasm32/Spore host story makes the gateway a capability of a smaller host.
+correctness issue. My recommendation: keep the frontdoor separate until the
+wasm32/Spore host story makes the frontdoor a capability of a smaller host.
 
 ### 4. Keep `iroh-tun` standalone
 
@@ -129,7 +129,7 @@ serves many Spores instead of launching one native server per view.
 
 - OS tunnel devices and packet I/O (`iroh-tun`).
 - FUSE mounts (`fungos-vfs-fuse`).
-- Privileged socket activation and TLS key custody (`https-forwarder`, gateway).
+- Privileged socket activation and TLS key custody (`https-forwarder`, frontdoor).
 - Unix-socket daemon state, PKI, enrollment, and update activation (`mycelium`).
 - Credential/key custody (`geoded`, `soil-spore` signing).
 - Process/SSH orchestration (`fpl-bob`).

@@ -50,7 +50,7 @@ GEODE=ask
 TRUST_CERT=ask
 CLAIM=
 CLAIM_FILE=
-LOCAL_GATEWAY=0
+LOCAL_FRONTDOOR=0
 SRC=
 BIN_SRC=
 OVERLAY=
@@ -85,8 +85,8 @@ Core:
   --gateway URL          enrollment gateway (default https://sso.fpl.dev)
   --claim CODE           redeem an enrollment claim
   --claim-file PATH      redeem a claim from a file
-  --local-gateway        install the loopback HTTPS gateway
-  --trust-cert           trust the generated gateway CA (prompted by default)
+  --local-frontdoor      install the loopback HTTPS frontdoor
+  --trust-cert           trust the generated frontdoor CA (prompted by default)
   --no-enroll            install/update only; do not enroll
   --no-start             write service definitions but do not start them
   --enable-updates       keep automatic updates enabled (default: disable for a local build)
@@ -101,7 +101,7 @@ Components:
   --soil / --no-soil     Soil CLI/runtime and fungOS.app (default yes)
   --bob / --no-bob       fpl-bob build offload (default yes)
   --operator / --no-operator
-                         gateway, skills, completions, update policy (default yes)
+                         frontdoor, skills, completions, update policy (default yes)
   --geode / --no-geode   optional geode credential broker (default no)
 
 Component inputs:
@@ -322,20 +322,20 @@ install_mycelium() {
             die "cargo build failed"
         fi
         if ! ( cd "$src" && run cargo build --release --locked \
-            -p myceliumd -p mycelium-gateway -p mycelium-driver-dnsmasq -p geoded ); then
+            -p myceliumd -p mycelium-frontdoor -p mycelium-driver-dnsmasq -p geoded ); then
             die "cargo build failed"
         fi
         BIN_SRC="$src/target/release"
     fi
     mkdir -p "$BIN_DIR" "$LOCAL_BIN"
-    for name in mycelium myceliumd mycelium-gateway mycelium-https-forwarder mycelium-dns-resolver geoded; do
+    for name in mycelium myceliumd mycelium-frontdoor mycelium-https-forwarder mycelium-dns-resolver geoded; do
         if [ -f "$BIN_SRC/$name" ]; then
             install_atomic "$BIN_SRC/$name" "$BIN_DIR/$name"
         else
             warn "prebuilt $name missing; that service will be unavailable"
         fi
     done
-    for name in mycelium myceliumd mycelium-gateway mycelium-https-forwarder geoded; do
+    for name in mycelium myceliumd mycelium-frontdoor mycelium-https-forwarder geoded; do
         if [ -f "$BIN_SRC/$name" ]; then install_atomic "$BIN_SRC/$name" "$LOCAL_BIN/$name"; fi
     done
     if [ -f "$BIN_SRC/mycelium-dns-resolver" ] && [ ! -L "$LOCAL_BIN/mycelium-dns-resolver" ]; then
@@ -422,7 +422,7 @@ setup_node() {
         if [ "$START" = 1 ]; then
             if [ -f "$MYCELIUM_HOME/pki/node.pem" ] || [ -f "$MYCELIUM_HOME/node.env" ]; then
                 set -- setup --repair --path "$MYCELIUM_HOME"
-                if [ "$LOCAL_GATEWAY" = 1 ]; then set -- "$@" --local-gateway; fi
+                if [ "$LOCAL_FRONTDOOR" = 1 ]; then set -- "$@" --local-frontdoor; fi
                 run "$MYC" "$@"
             else
                 run env MYCELIUM_HOME="$MYCELIUM_HOME" MYCELIUM_NO_AUTOSTART=1 "$MYC" daemon stop || true
@@ -434,12 +434,12 @@ setup_node() {
     elif [ -f "$MYCELIUM_HOME/pki/node.pem" ] || [ -f "$MYCELIUM_HOME/node.env" ]; then
         say "Existing enrollment found; repairing the service definition"
         set -- setup --repair --path "$MYCELIUM_HOME"
-        if [ "$LOCAL_GATEWAY" = 1 ]; then set -- "$@" --local-gateway; fi
+        if [ "$LOCAL_FRONTDOOR" = 1 ]; then set -- "$@" --local-frontdoor; fi
         run "$MYC" "$@"
     else
         say "Starting enrollment"
         set -- setup --gateway "$GATEWAY"
-        if [ "$LOCAL_GATEWAY" = 1 ]; then set -- "$@" --local-gateway; fi
+        if [ "$LOCAL_FRONTDOOR" = 1 ]; then set -- "$@" --local-frontdoor; fi
         if [ -n "$CLAIM" ]; then
             set -- "$@" --claim "$CLAIM"
         elif [ -n "$CLAIM_FILE" ]; then
@@ -516,14 +516,14 @@ install_dns() {
 install_operator() {
     MYC="$LOCAL_BIN/mycelium"
     if [ "$DRY_RUN" = 1 ]; then
-        note "would install the gateway, agent skills, shell completions, and update policy"
+        note "would install the frontdoor, agent skills, shell completions, and update policy"
         return 0
     fi
-    if ask_yes "Install the local HTTPS gateway (ai.myc, mcp.myc)?" yes; then
-        if [ "$TRUST_CERT" = yes ] || { [ "$TRUST_CERT" = ask ] && ask_yes "Trust the generated gateway CA in your login keychain?" yes; }; then
-            run "$MYC" gateway install --write --trust-cert
+    if ask_yes "Install the local HTTPS frontdoor (ai.myc, mcp.myc)?" yes; then
+        if [ "$TRUST_CERT" = yes ] || { [ "$TRUST_CERT" = ask ] && ask_yes "Trust the generated frontdoor CA in your login keychain?" yes; }; then
+            run "$MYC" frontdoor install --write --trust-cert
         else
-            run "$MYC" gateway install --write
+            run "$MYC" frontdoor install --write
         fi
     fi
     if ask_yes "Install Mycelium agent skills?" yes; then
@@ -1066,7 +1066,7 @@ install_soil() {
     if [ "$(uname -s)" = Darwin ]; then
         if [ -x "$HOME/.local/share/fungos/bin/soil-home" ]; then
             install_launch_agent dev.fungos.soil-home "$HOME/.local/share/fungos/bin/soil-home" \
-                "$HOME/.local/share/fungos/store/home.log" --routes "$MYCELIUM_HOME/gateway/routes.json"
+                "$HOME/.local/share/fungos/store/home.log" --routes "$MYCELIUM_HOME/frontdoor/routes.json"
         fi
         if [ -x "$HOME/.local/share/fungos/bin/soil-store" ]; then
             install_launch_agent dev.fungos.soil-store "$HOME/.local/share/fungos/bin/soil-store" \
@@ -1081,7 +1081,7 @@ install_soil() {
     else
         if [ -x "$HOME/.local/share/fungos/bin/soil-home" ]; then
             install_user_unit dev.fungos.soil-home "$HOME/.local/share/fungos/bin/soil-home" \
-                --routes "$MYCELIUM_HOME/gateway/routes.json"
+                --routes "$MYCELIUM_HOME/frontdoor/routes.json"
         fi
         if [ -x "$HOME/.local/share/fungos/bin/soil-store" ]; then
             install_user_unit dev.fungos.soil-store "$HOME/.local/share/fungos/bin/soil-store" \
@@ -1208,7 +1208,7 @@ parse_args() {
             --no-geode) GEODE=no; shift ;;
             --trust-cert) TRUST_CERT=yes; shift ;;
             --no-trust-cert) TRUST_CERT=no; shift ;;
-            --local-gateway) LOCAL_GATEWAY=1; shift ;;
+            --local-frontdoor|--local-gateway) LOCAL_FRONTDOOR=1; shift ;;
             --gateway) [ $# -ge 2 ] || die "--gateway needs a URL"; GATEWAY=$2; shift 2 ;;
             --claim) [ $# -ge 2 ] || die "--claim needs a code"; CLAIM=$2; shift 2 ;;
             --claim-file) [ $# -ge 2 ] || die "--claim-file needs a path"; CLAIM_FILE=$2; shift 2 ;;
@@ -1314,7 +1314,7 @@ main() {
     choose VFS yes "Install the content VFS (fungos-vfs + FUSE/LaunchAgent)?"
     choose SOIL yes "Install Soil and fungOS.app?"
     choose BOB yes "Install build offload (fpl-bob + sccache)?"
-    choose OPERATOR yes "Configure the operator surface (gateway, skills, completions)?"
+    choose OPERATOR yes "Configure the operator surface (frontdoor, skills, completions)?"
     choose GEODE no "Install the optional geode credential broker?"
     if [ "$ENROLL" = ask ]; then
         if ask_yes "Enroll or repair this node's fleet membership?" yes; then ENROLL=yes; else ENROLL=no; fi

@@ -24,7 +24,7 @@ pub struct ServiceIndex {
     local_node: Option<String>,
     by_kind: BTreeMap<String, Vec<Candidate>>,
     /// Names claimed by a fresh lease, mapped to the service kind that answers
-    /// them. This is the host table the gateway derives instead of asking every
+    /// them. This is the host table the frontdoor derives instead of asking every
     /// node to keep a hand-edited route file.
     hosts: BTreeMap<String, String>,
 }
@@ -48,7 +48,7 @@ impl ServiceIndex {
 
     /// Read the local node identity and the authenticated service catalog from
     /// the running myceliumd. This is intentionally the same CLI surface the
-    /// DNS resolver uses, so the gateway and resolver see one catalog.
+    /// DNS resolver uses, so the frontdoor and resolver see one catalog.
     pub async fn load(bin: &Path) -> Result<Self, String> {
         let status = run_json(bin, &["node", "status", "--json"]).await?;
         let local_node = status
@@ -124,7 +124,7 @@ impl ServiceIndex {
         }
         for candidates in by_kind.values_mut() {
             // Local endpoints first, then a stable URL order. The resolver does
-            // not choose ports; the gateway only reorders explicit hints.
+            // not choose ports; the frontdoor only reorders explicit hints.
             candidates.sort_by(|left, right| {
                 right
                     .local

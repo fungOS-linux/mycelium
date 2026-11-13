@@ -1,4 +1,4 @@
-use crate::config::{GatewayConfig, MeteringConfig, Route};
+use crate::config::{FrontdoorConfig, MeteringConfig, Route};
 use crate::discovery::{is_loopback, ServiceIndex};
 use crate::route::RouteTable;
 use crate::usage::{self, Metering, StreamUsage, UsageStore};
@@ -10,7 +10,7 @@ use axum::Router;
 use futures_util::{Stream, StreamExt};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
-use mycelium_peer_protocol::gateway_usage::GatewayUsageSnapshot;
+use mycelium_peer_protocol::frontdoor_usage::FrontdoorUsageSnapshot;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -31,7 +31,7 @@ const MAX_METERED_BODY_BYTES: usize = 32 * 1024 * 1024;
 const USAGE_PERSIST_SECS: u64 = 15;
 
 #[derive(Clone)]
-struct GatewayState {
+struct FrontdoorState {
     client: reqwest::Client,
     table: Arc<std::sync::RwLock<RouteTable>>,
     services: Arc<std::sync::RwLock<ServiceIndex>>,
@@ -87,7 +87,7 @@ pub async fn run_with_tls(
 }
 
 /// `usage_path` is where token counters are persisted for `myceliumd` to
-/// gossip. Without it the gateway still meters and serves `/.mycelium/usage`,
+/// gossip. Without it the frontdoor still meters and serves `/.mycelium/usage`,
 /// but nothing survives a restart and nothing leaves the machine.
 pub async fn run_with_options(
     listeners: Vec<SocketAddr>,
@@ -97,14 +97,14 @@ pub async fn run_with_options(
     tls: Option<(PathBuf, PathBuf)>,
     usage_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Read every operator input before opening the listener. A gateway that
+    // Read every operator input before opening the listener. A frontdoor that
     // started without its token or route table would be quietly wrong.
     let auth_token = match token_file.as_deref() {
         Some(path) => Some(read_token(path)?),
         None => None,
     };
     let (config, initial_mtime) = match config_path.as_deref() {
-        Some(path) => (GatewayConfig::load(path)?, mtime(path)),
+        Some(path) => (FrontdoorConfig::load(path)?, mtime(path)),
         None => (default_config(), None),
     };
     let table = Arc::new(std::sync::RwLock::new(RouteTable::new(
@@ -131,7 +131,7 @@ pub async fn run_with_options(
         match ServiceIndex::load(&bin).await {
             Ok(index) => {
                 eprintln!(
-                    "mycelium-gateway: discovered {} service endpoints from {}",
+                    "mycelium-frontdoor: discovered {} service endpoints from {}",
                     index.len(),
                     bin.display()
                 );
@@ -140,7 +140,7 @@ pub async fn run_with_options(
             }
             Err(error) => {
                 eprintln!(
-                    "mycelium-gateway: initial service discovery failed; static routes still work: {error}"
+                    "mycelium-frontdoor: initial service discovery failed; static routes still work: {error}"
                 );
             }
         }
@@ -151,13 +151,13 @@ pub async fn run_with_options(
     if let Some(path) = usage_path.as_deref() {
         spawn_usage_persist(usage.clone());
         eprintln!(
-            "mycelium-gateway: recording token usage in {}",
+            "mycelium-frontdoor: recording token usage in {}",
             path.display()
         );
     }
 
     let forwarded_proto = if tls.is_some() { "https" } else { "http" };
-    let state = GatewayState {
+    let state = FrontdoorState {
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .pool_max_idle_per_host(64)
@@ -174,7 +174,7 @@ pub async fn run_with_options(
         spawn_reload(path, table, initial_mtime, reload_secs, services_for_reload);
     }
 
-    // Bind every address before serving any of them. A gateway that came up on
+    // Bind every address before serving any of them. A frontdoor that came up on
     // one of several configured addresses would answer its own health check and
     // serve half the mesh, which is the failure this whole change exists to
     // remove.
@@ -191,13 +191,15 @@ pub async fn run_with_options(
             match tls {
                 Some((cert, key)) => {
                     let config = tls_config(&cert, &key).map_err(|error| error.to_string())?;
-                    eprintln!("mycelium-gateway: listening on https://{address}; routing by Host");
+                    eprintln!(
+                        "mycelium-frontdoor: listening on https://{address}; routing by Host"
+                    );
                     serve_tls(listener, app, config)
                         .await
                         .map_err(|error| error.to_string())
                 }
                 None => {
-                    eprintln!("mycelium-gateway: listening on http://{address}; routing by Host");
+                    eprintln!("mycelium-frontdoor: listening on http://{address}; routing by Host");
                     axum::serve(listener, app)
                         .with_graceful_shutdown(shutdown_signal())
                         .await
@@ -215,7 +217,7 @@ pub async fn run_with_options(
     }
     // Final write so a restart continues from the counters it stopped at.
     if let Err(error) = usage.persist() {
-        eprintln!("mycelium-gateway: writing token usage failed: {error}");
+        eprintln!("mycelium-frontdoor: writing token usage failed: {error}");
     }
     Ok(())
 }
@@ -228,9 +230,9 @@ fn spawn_usage_persist(usage: Arc<UsageStore>) {
             match tokio::task::spawn_blocking(move || writer.persist()).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
-                    eprintln!("mycelium-gateway: writing token usage failed: {error}")
+                    eprintln!("mycelium-frontdoor: writing token usage failed: {error}")
                 }
-                Err(error) => eprintln!("mycelium-gateway: token usage task failed: {error}"),
+                Err(error) => eprintln!("mycelium-frontdoor: token usage task failed: {error}"),
             }
         }
     });
@@ -275,11 +277,11 @@ async fn serve_tls(
                     let tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
                         Ok(Ok(tls)) => tls,
                         Ok(Err(error)) => {
-                            eprintln!("mycelium-gateway: TLS handshake from {peer} failed: {error}");
+                            eprintln!("mycelium-frontdoor: TLS handshake from {peer} failed: {error}");
                             return;
                         }
                         Err(_) => {
-                            eprintln!("mycelium-gateway: TLS handshake from {peer} timed out");
+                            eprintln!("mycelium-frontdoor: TLS handshake from {peer} timed out");
                             return;
                         }
                     };
@@ -288,7 +290,7 @@ async fn serve_tls(
                         .serve_connection_with_upgrades(io, service)
                         .await
                     {
-                        eprintln!("mycelium-gateway: HTTPS connection from {peer} failed: {error}");
+                        eprintln!("mycelium-frontdoor: HTTPS connection from {peer} failed: {error}");
                     }
                 });
             }
@@ -327,7 +329,7 @@ fn spawn_service_refresh(
                 }
                 Err(error) => {
                     eprintln!(
-                        "mycelium-gateway: service refresh failed; keeping previous catalog: {error}"
+                        "mycelium-frontdoor: service refresh failed; keeping previous catalog: {error}"
                     );
                 }
             }
@@ -352,23 +354,25 @@ fn spawn_reload(
             // Update the cursor even on failure: a malformed edit should log
             // once, not once per second, and the next save will be retried.
             last_mtime = current;
-            match GatewayConfig::load(&path) {
+            match FrontdoorConfig::load(&path) {
                 Ok(config) => {
                     let index = services.read().unwrap().clone();
                     let mut table = table.write().unwrap();
                     *table = RouteTable::new(config.routes, config.default_route);
                     table.set_discovered(&index);
-                    eprintln!("mycelium-gateway: reloaded {}", path.display());
+                    eprintln!("mycelium-frontdoor: reloaded {}", path.display());
                 }
                 Err(error) => {
-                    eprintln!("mycelium-gateway: keeping previous routes; reload failed: {error}");
+                    eprintln!(
+                        "mycelium-frontdoor: keeping previous routes; reload failed: {error}"
+                    );
                 }
             }
         }
     });
 }
 
-fn routes(state: GatewayState) -> Router {
+fn routes(state: FrontdoorState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/.mycelium/usage", get(usage_report))
@@ -377,7 +381,7 @@ fn routes(state: GatewayState) -> Router {
         .with_state(state)
 }
 
-async fn healthz(State(state): State<GatewayState>) -> impl axum::response::IntoResponse {
+async fn healthz(State(state): State<FrontdoorState>) -> impl axum::response::IntoResponse {
     let table = state.table.read().unwrap();
     let services = state.services.read().unwrap();
     axum::Json(json!({
@@ -392,13 +396,13 @@ async fn healthz(State(state): State<GatewayState>) -> impl axum::response::Into
     }))
 }
 
-/// Token counters for this machine, in the shape `mycelium gateway usage`
+/// Token counters for this machine, in the shape `mycelium frontdoor usage`
 /// prints and `myceliumd` gossips.
-async fn usage_report(State(state): State<GatewayState>) -> axum::Json<GatewayUsageSnapshot> {
+async fn usage_report(State(state): State<FrontdoorState>) -> axum::Json<FrontdoorUsageSnapshot> {
     axum::Json(state.usage.snapshot())
 }
 
-async fn metrics_report(State(state): State<GatewayState>) -> Response<Body> {
+async fn metrics_report(State(state): State<FrontdoorState>) -> Response<Body> {
     let snapshot = state.usage.snapshot();
     Response::builder()
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
@@ -406,7 +410,7 @@ async fn metrics_report(State(state): State<GatewayState>) -> Response<Body> {
         .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "invalid response"))
 }
 
-fn prometheus(snapshot: &GatewayUsageSnapshot) -> String {
+fn prometheus(snapshot: &FrontdoorUsageSnapshot) -> String {
     let totals = &snapshot.totals;
     let mut body = String::new();
     for (name, kind, value) in [
@@ -445,11 +449,11 @@ fn prometheus(snapshot: &GatewayUsageSnapshot) -> String {
             format!("{:.3}", snapshot.window.generation_tokens_per_second()),
         ),
     ] {
-        let full = format!("mycelium_gateway_ai_{name}");
+        let full = format!("mycelium_frontdoor_ai_{name}");
         body.push_str(&format!("# TYPE {full} {kind}\n{full} {value}\n"));
     }
     for (label, counts) in [("route", &snapshot.routes), ("model", &snapshot.models)] {
-        let full = format!("mycelium_gateway_ai_{label}_completion_tokens_total");
+        let full = format!("mycelium_frontdoor_ai_{label}_completion_tokens_total");
         body.push_str(&format!("# TYPE {full} counter\n"));
         for (value, counts) in counts {
             body.push_str(&format!(
@@ -471,7 +475,7 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-async fn proxy(State(state): State<GatewayState>, request: Request<Body>) -> Response<Body> {
+async fn proxy(State(state): State<FrontdoorState>, request: Request<Body>) -> Response<Body> {
     if !authorized(&request, state.auth_token.as_deref()) {
         return text(StatusCode::UNAUTHORIZED, "unauthorized");
     }
@@ -513,7 +517,7 @@ async fn proxy(State(state): State<GatewayState>, request: Request<Body>) -> Res
         let mut forwarded = state.client.request(method.clone(), url);
         for (name, value) in &headers {
             // Authorization is decided per target: a credential minted for the
-            // local gateway must not be replayed to an unknown peer.
+            // local frontdoor must not be replayed to an unknown peer.
             if skip_header(name.as_str()) || name == "authorization" {
                 continue;
             }
@@ -528,7 +532,7 @@ async fn proxy(State(state): State<GatewayState>, request: Request<Body>) -> Res
             }
             Ok(None) => {}
             Err(error) => {
-                eprintln!("mycelium-gateway: {}", error);
+                eprintln!("mycelium-frontdoor: {}", error);
                 last_error = Some(error);
                 continue;
             }
@@ -550,14 +554,14 @@ async fn proxy(State(state): State<GatewayState>, request: Request<Body>) -> Res
             // ambiguous timeout or a non-idempotent POST could duplicate work.
             Err(error) if error.is_connect() => {
                 eprintln!(
-                    "mycelium-gateway: {} candidate {} connect failed: {error}",
+                    "mycelium-frontdoor: {} candidate {} connect failed: {error}",
                     route.name, target.base
                 );
                 last_error = Some(error.to_string());
             }
             Err(error) => {
                 eprintln!(
-                    "mycelium-gateway: {} candidate {} failed: {error}",
+                    "mycelium-frontdoor: {} candidate {} failed: {error}",
                     route.name, target.base
                 );
                 return text(StatusCode::BAD_GATEWAY, "upstream unavailable");
@@ -702,7 +706,7 @@ async fn relay_buffered(
             Ok(chunk) => chunk,
             Err(error) => {
                 eprintln!(
-                    "mycelium-gateway: {} response body failed: {error}",
+                    "mycelium-frontdoor: {} response body failed: {error}",
                     meter.route
                 );
                 meter.store.record(
@@ -906,11 +910,11 @@ fn mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-fn default_config() -> GatewayConfig {
-    GatewayConfig {
+fn default_config() -> FrontdoorConfig {
+    FrontdoorConfig {
         routes: default_routes(),
         default_route: Some("default".into()),
-        ..GatewayConfig::default()
+        ..FrontdoorConfig::default()
     }
 }
 
@@ -936,7 +940,7 @@ async fn shutdown_signal() {
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(signal) => signal,
                 Err(error) => {
-                    eprintln!("mycelium-gateway: cannot install a SIGTERM handler: {error}");
+                    eprintln!("mycelium-frontdoor: cannot install a SIGTERM handler: {error}");
                     ctrl_c.await;
                     return;
                 }
@@ -1136,11 +1140,11 @@ mod tests {
 
     #[test]
     fn prometheus_labels_cannot_break_the_exposition_format() {
-        let mut snapshot = GatewayUsageSnapshot {
+        let mut snapshot = FrontdoorUsageSnapshot {
             schema_version: 1,
             generated_at: 10,
             window_seconds: 60,
-            ..GatewayUsageSnapshot::default()
+            ..FrontdoorUsageSnapshot::default()
         };
         snapshot
             .models

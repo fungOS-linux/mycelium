@@ -52,7 +52,7 @@ impl Default for MeteringConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct GatewayConfig {
+pub struct FrontdoorConfig {
     #[serde(default)]
     pub routes: Vec<Route>,
     #[serde(default)]
@@ -87,7 +87,7 @@ fn default_service_refresh_secs() -> u64 {
     15
 }
 
-impl Default for GatewayConfig {
+impl Default for FrontdoorConfig {
     fn default() -> Self {
         Self {
             routes: Vec::new(),
@@ -118,7 +118,7 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-impl GatewayConfig {
+impl FrontdoorConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let bytes = fs::read(path).map_err(ConfigError::Io)?;
         let config = serde_json::from_slice::<Self>(&bytes).map_err(ConfigError::Parse)?;
@@ -239,7 +239,7 @@ impl GatewayConfig {
 mod tests {
     use super::*;
 
-    fn config(json: &str) -> GatewayConfig {
+    fn config(json: &str) -> FrontdoorConfig {
         serde_json::from_str(json).unwrap()
     }
 

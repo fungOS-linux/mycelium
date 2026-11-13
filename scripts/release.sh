@@ -40,7 +40,7 @@ FPL_BOB=${MYCELIUM_RELEASE_FPL_BOB:-fpl-bob}
 COMPONENTS=(
     mycelium
     myceliumd
-    mycelium-gateway
+    mycelium-frontdoor
     mycelium-https-forwarder
     mycelium-dns-resolver
     geoded
@@ -209,11 +209,11 @@ build_target() {
     local build
     build=(cargo build --release --locked --target "$target"
         -p mycelium-cli --features mycelium-cli/iroh-sync
-        -p mycelium-gateway -p mycelium-driver-dnsmasq -p geoded -p myceliumd)
+        -p mycelium-frontdoor -p mycelium-driver-dnsmasq -p geoded -p myceliumd)
     if [[ "$target" == *-unknown-linux-musl ]] && command -v cargo-zigbuild >/dev/null 2>&1; then
         build=(cargo zigbuild --release --locked --target "$target"
             -p mycelium-cli --features mycelium-cli/iroh-sync
-            -p mycelium-gateway -p mycelium-driver-dnsmasq -p geoded -p myceliumd)
+            -p mycelium-frontdoor -p mycelium-driver-dnsmasq -p geoded -p myceliumd)
     fi
     local remote=0
     if [ -n "$REMOTE_HOST" ] && [[ "$target" == *-linux-* ]]; then
@@ -227,7 +227,7 @@ build_target() {
         # aarch64-unknown-linux-gnu and aarch64-linux-gnu-gcc.
         local remote_build=(cargo build --release --locked --target "$target"
             -p mycelium-cli --features mycelium-cli/iroh-sync
-            -p mycelium-gateway -p mycelium-driver-dnsmasq -p geoded -p myceliumd)
+            -p mycelium-frontdoor -p mycelium-driver-dnsmasq -p geoded -p myceliumd)
         if [ "$target" = aarch64-unknown-linux-gnu ]; then
             remote_build=(env CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
                 "${remote_build[@]}")

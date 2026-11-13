@@ -1,6 +1,6 @@
-//! Local `.myc` HTTPS gateway lifecycle.
+//! Local `.myc` HTTPS frontdoor lifecycle.
 //!
-//! The gateway itself is an ordinary loopback process that terminates TLS. This
+//! The frontdoor itself is an ordinary loopback process that terminates TLS. This
 //! module owns the parts that belong to the host: certificate material, route
 //! defaults, launchd wiring, and the privileged-socket split.
 use rcgen::{
@@ -17,20 +17,26 @@ use std::{
     time::Duration,
 };
 
-const DEFAULT_GATEWAY_LISTEN: &str = "127.0.0.1:8443";
+const DEFAULT_FRONTDOOR_LISTEN: &str = "127.0.0.1:8443";
 const HTTPS_ADDR: &str = "127.0.0.1:443";
 const HTTPS_PORT: u16 = 443;
-const GATEWAY_LABEL: &str = "dev.fpl.mycelium-gateway";
+const FRONTDOOR_LABEL: &str = "dev.fpl.mycelium-frontdoor";
 const HTTPS_LABEL: &str = "dev.fpl.mycelium-https";
-const GATEWAY_UNIT: &str = "mycelium-gateway.service";
+const FRONTDOOR_UNIT: &str = "mycelium-frontdoor.service";
 const HTTPS_SOCKET_UNIT: &str = "mycelium-https.socket";
 const HTTPS_SERVICE_UNIT: &str = "mycelium-https.service";
-const SYSTEM_CA_PATH: &str = "/usr/local/share/ca-certificates/mycelium-gateway.crt";
+const SYSTEM_CA_PATH: &str = "/usr/local/share/ca-certificates/mycelium-frontdoor.crt";
+// Names installed by the former `mycelium gateway` lifecycle. They are retired
+// on install and removed on uninstall so an upgrade does not leave two
+// processes competing for the same listener.
+const LEGACY_FRONTDOOR_LABEL: &str = "dev.fpl.mycelium-gateway";
+const LEGACY_FRONTDOOR_UNIT: &str = "mycelium-gateway.service";
+const LEGACY_SYSTEM_CA_PATH: &str = "/usr/local/share/ca-certificates/mycelium-gateway.crt";
 
-const USAGE: &str = "mycelium gateway status [--json] [--path MYCELIUM-HOME]\n\
-mycelium gateway usage [--json] [--fleet] [--path MYCELIUM-HOME]\n\
-mycelium gateway install [--write|--dry-run] [--trust-cert] [--listen ADDR] [--routes PATH] [--cert PATH --key PATH] [--gateway-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]\n\
-mycelium gateway uninstall [--write|--dry-run] [--path MYCELIUM-HOME]";
+const USAGE: &str = "mycelium frontdoor status [--json] [--path MYCELIUM-HOME]\n\
+mycelium frontdoor usage [--json] [--fleet] [--path MYCELIUM-HOME]\n\
+mycelium frontdoor install [--write|--dry-run] [--trust-cert] [--listen ADDR] [--routes PATH] [--cert PATH --key PATH] [--frontdoor-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]\n\
+mycelium frontdoor uninstall [--write|--dry-run] [--path MYCELIUM-HOME]";
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -41,38 +47,143 @@ pub struct Paths {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub ca: PathBuf,
-    pub gateway_bin: PathBuf,
+    pub frontdoor_bin: PathBuf,
     pub forwarder_bin: PathBuf,
     pub listen: SocketAddr,
 }
 
 impl Paths {
     pub fn discover(home: &Path) -> Self {
-        let dir = home.join("gateway");
-        let modern_cert = dir.join("server.pem");
-        let modern_key = dir.join("server-key.pem");
-        let legacy_cert = dir.join("server.crt");
-        let legacy_key = dir.join("server.key");
-        let (cert, key) = if modern_cert.is_file() || modern_key.is_file() {
-            (modern_cert, modern_key)
-        } else if legacy_cert.is_file() || legacy_key.is_file() {
-            (legacy_cert, legacy_key)
-        } else {
-            (modern_cert, modern_key)
+        let dir = home.join("frontdoor");
+        // A dry run reports what the migration would reuse, and `status` run
+        // before an upgrade still sees the old state. After a write the old
+        // directory has moved, so every installed path resolves under `dir`.
+        let old = home.join("gateway");
+        let (cert, key) = [
+            (dir.join("server.pem"), dir.join("server-key.pem")),
+            (old.join("server.pem"), old.join("server-key.pem")),
+            (dir.join("server.crt"), dir.join("server.key")),
+            (old.join("server.crt"), old.join("server.key")),
+        ]
+        .into_iter()
+        .find(|(cert, key)| cert.is_file() || key.is_file())
+        .unwrap_or_else(|| (dir.join("server.pem"), dir.join("server-key.pem")));
+        let pick = |name: &str| {
+            [dir.join(name), old.join(name)]
+                .into_iter()
+                .find(|path| path.is_file())
+                .unwrap_or_else(|| dir.join(name))
         };
+        let routes = pick("routes.json");
+        let usage = pick("usage.json");
+        let ca = pick("ca.pem");
         Self {
             home: home.to_path_buf(),
             dir,
-            routes: home.join("gateway/routes.json"),
-            usage: home.join("gateway/usage.json"),
+            routes,
+            usage,
             cert,
             key,
-            ca: home.join("gateway/ca.pem"),
-            gateway_bin: home.join("bin/mycelium-gateway"),
+            ca,
+            frontdoor_bin: home.join("bin/mycelium-frontdoor"),
             forwarder_bin: home.join("bin/mycelium-https-forwarder"),
             listen: installed_listen().unwrap_or_else(default_listen),
         }
     }
+}
+
+/// Move the pre-rename state directory into place before anything reads it.
+/// Refusing to merge two directories is deliberate: a half-migrated state dir
+/// would leave the old service reading one route table and the new one another.
+fn migrate_state(home: &Path, dry_run: bool, actions: &mut Vec<String>) -> Result<(), String> {
+    let old = home.join("gateway");
+    let new = home.join("frontdoor");
+    let metadata = match fs::symlink_metadata(&old) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("inspect {}: {error}", old.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to migrate symlinked frontdoor state {}",
+            old.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", old.display()));
+    }
+    if new.exists() {
+        return Err(format!(
+            "both {} and {} exist; move the old files into the new directory or remove one before installing",
+            old.display(),
+            new.display()
+        ));
+    }
+    if dry_run {
+        actions.push(format!("would move {} to {}", old.display(), new.display()));
+        return Ok(());
+    }
+    fs::rename(&old, &new)
+        .map_err(|error| format!("move {} to {}: {error}", old.display(), new.display()))?;
+    actions.push(format!("moved {} to {}", old.display(), new.display()));
+    Ok(())
+}
+
+fn retire_legacy_services(dry_run: bool, actions: &mut Vec<String>) -> Result<(), String> {
+    match platform()? {
+        Platform::Macos => {
+            let path = launch_agent_path(LEGACY_FRONTDOOR_LABEL)?;
+            if !path.is_file() {
+                return Ok(());
+            }
+            if dry_run {
+                actions.push(format!("would retire legacy agent {}", path.display()));
+                return Ok(());
+            }
+            let domain = launch_domain()?;
+            let _ = Command::new("launchctl")
+                .args(["bootout", &format!("{domain}/{LEGACY_FRONTDOOR_LABEL}")])
+                .output();
+            fs::remove_file(&path)
+                .map_err(|error| format!("remove legacy agent {}: {error}", path.display()))?;
+            actions.push(format!("retired legacy agent {}", path.display()));
+        }
+        Platform::Linux => {
+            let unit = systemd_unit_path(LEGACY_FRONTDOOR_UNIT);
+            let ca = Path::new(LEGACY_SYSTEM_CA_PATH);
+            if !unit.is_file() && !ca.is_file() {
+                return Ok(());
+            }
+            if dry_run {
+                if unit.is_file() {
+                    actions.push(format!("would retire legacy unit {}", unit.display()));
+                }
+                if ca.is_file() {
+                    actions.push(format!("would remove legacy CA {}", ca.display()));
+                }
+                return Ok(());
+            }
+            let _ = run_privileged(
+                "systemctl",
+                &[
+                    "disable".to_owned(),
+                    "--now".to_owned(),
+                    LEGACY_FRONTDOOR_UNIT.to_owned(),
+                ],
+            );
+            if unit.is_file() {
+                run_privileged("rm", &["-f".to_owned(), unit.display().to_string()])?;
+                actions.push(format!("retired legacy unit {}", unit.display()));
+            }
+            if ca.is_file() {
+                run_privileged("rm", &["-f".to_owned(), ca.display().to_string()])?;
+                run_privileged("update-ca-certificates", &[])?;
+                actions.push(format!("removed legacy CA {}", ca.display()));
+            }
+            run_privileged("systemctl", &["daemon-reload".to_owned()])?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +198,7 @@ fn platform() -> Result<Platform, String> {
     } else if cfg!(target_os = "linux") {
         Ok(Platform::Linux)
     } else {
-        Err("the local gateway supports macOS launchd and Linux systemd only".into())
+        Err("the local frontdoor supports macOS launchd and Linux systemd only".into())
     }
 }
 
@@ -96,9 +207,9 @@ pub fn supported_platform() -> Result<(), String> {
 }
 
 fn default_listen() -> SocketAddr {
-    DEFAULT_GATEWAY_LISTEN
+    DEFAULT_FRONTDOOR_LISTEN
         .parse()
-        .expect("default gateway listen address is valid")
+        .expect("default frontdoor listen address is valid")
 }
 
 fn https_listen() -> SocketAddr {
@@ -110,22 +221,22 @@ fn listen_addr(value: &str) -> Result<SocketAddr, String> {
         .parse()
         .map_err(|_| format!("listen address must be IP:PORT, got `{value}`"))?;
     if !address.ip().is_loopback() {
-        return Err(format!("gateway must listen on loopback, got {address}"));
+        return Err(format!("frontdoor must listen on loopback, got {address}"));
     }
     if address.port() == 0 || address.port() == HTTPS_PORT {
         return Err(format!(
-            "gateway must not bind port {HTTPS_PORT}; the privileged socket belongs to the forwarder"
+            "frontdoor must not bind port {HTTPS_PORT}; the privileged socket belongs to the forwarder"
         ));
     }
     Ok(address)
 }
 
 /// The installed service definition is the single source of truth for the
-/// gateway address, so reinstall/status keep using a custom `--listen`.
+/// frontdoor address, so reinstall/status keep using a custom `--listen`.
 fn installed_listen() -> Option<SocketAddr> {
     let path = match platform() {
-        Ok(Platform::Macos) => launch_agent_path(GATEWAY_LABEL).ok()?,
-        Ok(Platform::Linux) => systemd_unit_path(GATEWAY_UNIT),
+        Ok(Platform::Macos) => launch_agent_path(FRONTDOOR_LABEL).ok()?,
+        Ok(Platform::Linux) => systemd_unit_path(FRONTDOOR_UNIT),
         Err(_) => return None,
     };
     parse_listen(&fs::read_to_string(path).ok()?)
@@ -159,21 +270,21 @@ fn parse_listen(text: &str) -> Option<SocketAddr> {
 
 #[derive(Clone, Copy)]
 enum Service {
-    Gateway,
+    Frontdoor,
     HttpsSocket,
 }
 
 impl Service {
     fn macos_label(self) -> &'static str {
         match self {
-            Self::Gateway => GATEWAY_LABEL,
+            Self::Frontdoor => FRONTDOOR_LABEL,
             Self::HttpsSocket => HTTPS_LABEL,
         }
     }
 
     fn linux_unit(self) -> &'static str {
         match self {
-            Self::Gateway => GATEWAY_UNIT,
+            Self::Frontdoor => FRONTDOOR_UNIT,
             Self::HttpsSocket => HTTPS_SOCKET_UNIT,
         }
     }
@@ -200,7 +311,7 @@ struct InstallOptions {
     routes: Option<PathBuf>,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
-    gateway_bin: Option<PathBuf>,
+    frontdoor_bin: Option<PathBuf>,
     forwarder_bin: Option<PathBuf>,
     listen: Option<SocketAddr>,
     trust: bool,
@@ -215,7 +326,7 @@ impl InstallOptions {
             routes: None,
             cert: None,
             key: None,
-            gateway_bin: None,
+            frontdoor_bin: None,
             forwarder_bin: None,
             listen: None,
             trust: false,
@@ -237,7 +348,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         "uninstall" => uninstall(rest),
         "help" | "--help" | "-h" => Ok(USAGE.lines().map(str::to_owned).collect()),
         other => Err(format!(
-            "unknown gateway action `{other}` (see `mycelium gateway --help`)"
+            "unknown frontdoor action `{other}` (see `mycelium frontdoor --help`)"
         )),
     }
 }
@@ -251,7 +362,7 @@ pub async fn status(args: &[String]) -> Result<Vec<String>, String> {
     Ok(render_status(&value))
 }
 
-/// Token usage recorded by the local gateway, or rolled up across the fleet from
+/// Token usage recorded by the local frontdoor, or rolled up across the fleet from
 /// the `mycelium_ai.*` platform metrics every daemon gossips.
 async fn usage(args: &[String]) -> Result<Vec<String>, String> {
     let mut json_output = false;
@@ -266,7 +377,7 @@ async fn usage(args: &[String]) -> Result<Vec<String>, String> {
                 index += 1;
                 home = expand_home(args.get(index).ok_or("--path requires a directory")?);
             }
-            other => return Err(format!("unknown gateway usage argument `{other}`")),
+            other => return Err(format!("unknown frontdoor usage argument `{other}`")),
         }
         index += 1;
     }
@@ -276,18 +387,18 @@ async fn usage(args: &[String]) -> Result<Vec<String>, String> {
     let path = Paths::discover(&home).usage;
     let bytes = fs::read(&path).map_err(|error| {
         format!(
-            "no token usage at {}: {error} (the gateway records usage while it runs)",
+            "no token usage at {}: {error} (the frontdoor records usage while it runs)",
             path.display()
         )
     })?;
-    let snapshot: mycelium_peer_protocol::gateway_usage::GatewayUsageSnapshot =
+    let snapshot: mycelium_peer_protocol::frontdoor_usage::FrontdoorUsageSnapshot =
         serde_json::from_slice(&bytes)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
     if snapshot.schema_version
-        != mycelium_peer_protocol::gateway_usage::GATEWAY_USAGE_SCHEMA_VERSION
+        != mycelium_peer_protocol::frontdoor_usage::FRONTDOOR_USAGE_SCHEMA_VERSION
     {
         return Err(format!(
-            "{} was written by a different gateway (schema {})",
+            "{} was written by a different frontdoor (schema {})",
             path.display(),
             snapshot.schema_version
         ));
@@ -301,11 +412,11 @@ async fn usage(args: &[String]) -> Result<Vec<String>, String> {
 }
 
 fn render_usage(
-    snapshot: &mycelium_peer_protocol::gateway_usage::GatewayUsageSnapshot,
+    snapshot: &mycelium_peer_protocol::frontdoor_usage::FrontdoorUsageSnapshot,
 ) -> Vec<String> {
     let totals = &snapshot.totals;
     let mut lines = vec![format!(
-        "gateway ai usage (recorded {}, window {}s):",
+        "frontdoor ai usage (recorded {}, window {}s):",
         snapshot.generated_at, snapshot.window_seconds
     )];
     lines.push(format!(
@@ -351,11 +462,11 @@ async fn fleet_usage(json_output: bool) -> Result<Vec<String>, String> {
     Ok(render_fleet_usage(&peers, unix_now(), json_output))
 }
 
-/// Aggregate the usage each peer gossiped. Hosts with no gateway, a stale
+/// Aggregate the usage each peer gossiped. Hosts with no frontdoor, a stale
 /// snapshot, or an older daemon simply do not appear: an absent row is honest,
 /// a zero row would be a guess.
 fn render_fleet_usage(peers: &Value, now: u64, json_output: bool) -> Vec<String> {
-    use mycelium_peer_protocol::gateway_usage::{GatewayUsageMetrics, TokenCounts};
+    use mycelium_peer_protocol::frontdoor_usage::{FrontdoorUsageMetrics, TokenCounts};
     let mut rows = Vec::new();
     let mut total = TokenCounts::default();
     let mut throughput = 0.0;
@@ -363,7 +474,7 @@ fn render_fleet_usage(peers: &Value, now: u64, json_output: bool) -> Vec<String>
     for peer in peers.as_array().into_iter().flatten() {
         let metrics: std::collections::BTreeMap<String, String> =
             serde_json::from_value(peer["health"]["platform_metrics"].clone()).unwrap_or_default();
-        let Some(usage) = GatewayUsageMetrics::from_platform_metrics(&metrics) else {
+        let Some(usage) = FrontdoorUsageMetrics::from_platform_metrics(&metrics) else {
             continue;
         };
         if !usage.is_fresh(now) {
@@ -402,7 +513,7 @@ fn render_fleet_usage(peers: &Value, now: u64, json_output: bool) -> Vec<String>
         .to_string()];
     }
     if rows.is_empty() {
-        return vec!["fleet ai usage: no gateway on any peer has recorded usage yet".into()];
+        return vec!["fleet ai usage: no frontdoor on any peer has recorded usage yet".into()];
     }
     let mut lines = vec![format!(
         "fleet ai usage ({} machines): {} requests, {} prompt tokens, {} completion tokens, {:.2} tok/s",
@@ -423,7 +534,7 @@ fn render_fleet_usage(peers: &Value, now: u64, json_output: bool) -> Vec<String>
         ));
     }
     lines.push(
-        "  note: hosts without a gateway, or with one that stopped reporting, are absent".into(),
+        "  note: hosts without a frontdoor, or with one that stopped reporting, are absent".into(),
     );
     lines
 }
@@ -449,7 +560,7 @@ fn status_options(args: &[String]) -> Result<(PathBuf, bool), String> {
                         .ok_or("--path requires a Mycelium home directory")?,
                 );
             }
-            other => return Err(format!("unknown gateway status argument `{other}`")),
+            other => return Err(format!("unknown frontdoor status argument `{other}`")),
         }
         index += 1;
     }
@@ -459,7 +570,7 @@ fn status_options(args: &[String]) -> Result<(PathBuf, bool), String> {
 fn render_status(value: &Value) -> Vec<String> {
     let installed = value["installed"].as_bool().unwrap_or(false);
     let mut lines = vec![format!(
-        "gateway: {}",
+        "frontdoor: {}",
         if installed {
             "installed"
         } else {
@@ -467,7 +578,7 @@ fn render_status(value: &Value) -> Vec<String> {
         }
     )];
     for (label, key) in [
-        ("gateway agent", "gateway_agent"),
+        ("frontdoor agent", "frontdoor_agent"),
         ("https agent", "https_agent"),
     ] {
         let agent = &value[key];
@@ -487,8 +598,8 @@ fn render_status(value: &Value) -> Vec<String> {
         lines.push(format!("  {label}: {text}"));
     }
     lines.push(format!(
-        "  gateway listener: {}",
-        if value["gateway_listening"].as_bool().unwrap_or(false) {
+        "  frontdoor listener: {}",
+        if value["frontdoor_listening"].as_bool().unwrap_or(false) {
             value["listen"].as_str().unwrap_or("unknown")
         } else {
             "down"
@@ -545,16 +656,16 @@ fn render_status(value: &Value) -> Vec<String> {
 
 pub async fn snapshot(home: &Path) -> Value {
     let paths = Paths::discover(home);
-    let installed = Service::Gateway.installed() && Service::HttpsSocket.installed();
-    let gateway_listening = tcp_probe(paths.listen);
+    let installed = Service::Frontdoor.installed() && Service::HttpsSocket.installed();
+    let frontdoor_listening = tcp_probe(paths.listen);
     let https_listening = tcp_probe(https_listen());
     let certificate_trusted = paths.cert.is_file() && certificate_trusted(&paths.cert);
-    let health = if gateway_listening {
+    let health = if frontdoor_listening {
         probe(paths.listen).await.ok()
     } else {
         None
     };
-    let tls = if gateway_listening {
+    let tls = if frontdoor_listening {
         Some(tls_chain_verified(&paths, paths.listen))
     } else {
         None
@@ -566,9 +677,9 @@ pub async fn snapshot(home: &Path) -> Value {
     };
     json!({
         "installed": installed,
-        "gateway_agent": service_state(Service::Gateway),
+        "frontdoor_agent": service_state(Service::Frontdoor),
         "https_agent": service_state(Service::HttpsSocket),
-        "gateway_listening": gateway_listening,
+        "frontdoor_listening": frontdoor_listening,
         "https_listening": https_listening,
         "listen": paths.listen.to_string(),
         "https_listen": HTTPS_ADDR,
@@ -576,8 +687,8 @@ pub async fn snapshot(home: &Path) -> Value {
         "certificate_trusted": certificate_trusted,
         "routes": paths.routes.display().to_string(),
         "routes_valid": read_routes(&paths.routes).is_ok(),
-        "gateway_binary": paths.gateway_bin.display().to_string(),
-        "gateway_binary_present": paths.gateway_bin.is_file(),
+        "frontdoor_binary": paths.frontdoor_bin.display().to_string(),
+        "frontdoor_binary_present": paths.frontdoor_bin.is_file(),
         "forwarder_binary": paths.forwarder_bin.display().to_string(),
         "forwarder_binary_present": paths.forwarder_bin.is_file(),
         "health": health,
@@ -601,39 +712,45 @@ pub async fn install_default(home: &Path, trust: bool) -> Result<Vec<String>, St
 
 async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, String> {
     if options.write && options.dry_run {
-        return Err("gateway install accepts only one of --write or --dry-run".into());
+        return Err("frontdoor install accepts only one of --write or --dry-run".into());
     }
     if !options.write && !options.dry_run {
-        return Err("gateway install requires --write or --dry-run".into());
+        return Err("frontdoor install requires --write or --dry-run".into());
     }
     if options.cert.is_some() != options.key.is_some() {
         return Err("--cert and --key must be provided together".into());
     }
 
     platform()?;
+    let mut actions = Vec::new();
+    // Stop the old lifecycle before preflight: it may still own :8443, and the
+    // new label is not recognized as the same service by launchd/systemd.
+    migrate_state(&options.home, options.dry_run, &mut actions)?;
+    retire_legacy_services(options.dry_run, &mut actions)?;
     let paths = Paths::discover(&options.home);
     let listen = options.listen.unwrap_or(paths.listen);
-    preflight(listen)?;
-    let gateway_source = find_binary(
-        "mycelium-gateway",
-        options.gateway_bin.as_deref(),
-        &paths.gateway_bin,
+    let frontdoor_source = find_binary(
+        "mycelium-frontdoor",
+        options.frontdoor_bin.as_deref(),
+        &paths.frontdoor_bin,
     )?;
     let forwarder_source = find_binary(
         "mycelium-https-forwarder",
         options.forwarder_bin.as_deref(),
         &paths.forwarder_bin,
     )?;
-    let mut actions = Vec::new();
     let routes = prepare_routes(&paths, &options, &mut actions)?;
     let material = prepare_certificate(&paths, &options, &routes, &mut actions)?;
 
     if options.dry_run {
-        actions.push(format!("would use gateway listen {listen}"));
+        actions.push(format!(
+            "would require {listen} and :{HTTPS_PORT} to be free after retiring the legacy service"
+        ));
+        actions.push(format!("would use frontdoor listen {listen}"));
         actions.push(format!(
             "would install {} from {}",
-            paths.gateway_bin.display(),
-            gateway_source.display()
+            paths.frontdoor_bin.display(),
+            frontdoor_source.display()
         ));
         actions.push(format!(
             "would install {} from {}",
@@ -661,10 +778,11 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
         return Ok(actions);
     }
 
+    preflight(listen)?;
     create_private_dir(&paths.dir)?;
-    let gateway_bin = install_binary(&gateway_source, &paths.gateway_bin)?;
+    let frontdoor_bin = install_binary(&frontdoor_source, &paths.frontdoor_bin)?;
     let forwarder_bin = install_binary(&forwarder_source, &paths.forwarder_bin)?;
-    install_gateway_service(&paths, listen, &gateway_bin, &routes, &material)?;
+    install_frontdoor_service(&paths, listen, &frontdoor_bin, &routes, &material)?;
     install_https_services(&paths, listen, &forwarder_bin)?;
     if options.trust {
         trust_certificate(material.trust_anchor())?;
@@ -675,12 +793,12 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     let health = wait_for_https(HTTPS_PORT).await?;
     if health["status"].as_u64() != Some(200) {
         return Err(format!(
-            "installed the gateway, but https://ai.myc/healthz returned HTTP {}",
+            "installed the frontdoor, but https://ai.myc/healthz returned HTTP {}",
             health["status"]
         ));
     }
     tls_chain_verified(&paths, https_listen()).map_err(|error| {
-        format!("installed the gateway, but the :{HTTPS_PORT} TLS check failed: {error}")
+        format!("installed the frontdoor, but the :{HTTPS_PORT} TLS check failed: {error}")
     })?;
     if options.trust && !certificate_trusted(&material.cert) {
         return Err(format!(
@@ -690,16 +808,16 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     }
 
     let mut lines = vec![format!(
-        "installed local HTTPS gateway for {}",
+        "installed local HTTPS frontdoor for {}",
         options.home.display()
     )];
-    lines.push(format!("  gateway: {}", gateway_bin.display()));
+    lines.push(format!("  frontdoor: {}", frontdoor_bin.display()));
     lines.push(format!("  forwarder: {}", forwarder_bin.display()));
     lines.push(format!("  listen: {listen}"));
     lines.push(format!("  routes: {}", routes.display()));
     lines.push(format!("  certificate: {}", material.cert.display()));
     if material.generated {
-        lines.push("  generated a local CA and gateway certificate".into());
+        lines.push("  generated a local CA and frontdoor certificate".into());
     }
     if options.trust {
         lines.push(format!(
@@ -713,7 +831,7 @@ async fn install_with_options(options: InstallOptions) -> Result<Vec<String>, St
     } else if certificate_trusted(&material.cert) {
         lines.push("  certificate trust: already verified for ai.myc".into());
     } else {
-        lines.push("  certificate trust: not installed; run `mycelium gateway install --write --trust-cert` or use `mycelium doctor --fix --trust-cert`".into());
+        lines.push("  certificate trust: not installed; run `mycelium frontdoor install --write --trust-cert` or use `mycelium doctor --fix --trust-cert`".into());
     }
     lines.push("  browser URL: https://ai.myc/health".into());
     Ok(lines)
@@ -727,7 +845,7 @@ fn preflight(listen: SocketAddr) -> Result<(), String> {
             path.display()
         ));
     }
-    ensure_port_available(Service::Gateway, listen)?;
+    ensure_port_available(Service::Frontdoor, listen)?;
     ensure_port_available(Service::HttpsSocket, https_listen())
 }
 
@@ -745,7 +863,7 @@ fn ensure_port_available(service: Service, address: SocketAddr) -> Result<(), St
     );
     let owners = listener_pids(address);
     // The service must own the listener, not merely be active. Without this a
-    // second gateway on the same port could pass preflight against the first
+    // second frontdoor on the same port could pass preflight against the first
     // one's socket and only fail later.
     let owned = owners.is_empty()
         || service_pid(service).is_none_or(|pid| owners.iter().all(|owner| *owner == pid));
@@ -830,10 +948,10 @@ fn parse_install(args: &[String]) -> Result<InstallOptions, String> {
                 index += 1;
                 options.key = Some(expand_home(args.get(index).ok_or("--key requires a path")?));
             }
-            "--gateway-bin" => {
+            "--frontdoor-bin" | "--gateway-bin" => {
                 index += 1;
-                options.gateway_bin = Some(expand_home(
-                    args.get(index).ok_or("--gateway-bin requires a path")?,
+                options.frontdoor_bin = Some(expand_home(
+                    args.get(index).ok_or("--frontdoor-bin requires a path")?,
                 ));
             }
             "--forwarder-bin" => {
@@ -842,7 +960,7 @@ fn parse_install(args: &[String]) -> Result<InstallOptions, String> {
                     args.get(index).ok_or("--forwarder-bin requires a path")?,
                 ));
             }
-            other => return Err(format!("unknown gateway install argument `{other}`")),
+            other => return Err(format!("unknown frontdoor install argument `{other}`")),
         }
         index += 1;
     }
@@ -977,7 +1095,7 @@ fn generate_certificate(dir: &Path, route_hosts: &[String]) -> Result<Certificat
     ca_params.distinguished_name = DistinguishedName::new();
     ca_params
         .distinguished_name
-        .push(DnType::CommonName, "Mycelium Local Gateway CA");
+        .push(DnType::CommonName, "Mycelium Local Frontdoor CA");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
@@ -995,7 +1113,7 @@ fn generate_certificate(dir: &Path, route_hosts: &[String]) -> Result<Certificat
     leaf_params.distinguished_name = DistinguishedName::new();
     leaf_params
         .distinguished_name
-        .push(DnType::CommonName, "mycelium-gateway");
+        .push(DnType::CommonName, "mycelium-frontdoor");
     leaf_params.is_ca = IsCa::NoCa;
     leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -1026,7 +1144,7 @@ fn certificate_names(route_hosts: &[String]) -> Vec<String> {
     // `*.myc` alone is not accepted by OpenSSL/most browsers because the
     // wildcard sits in a single-label domain. List the bootstrap names and
     // every host in the installed route table so the generated certificate
-    // covers what the gateway actually serves.
+    // covers what the frontdoor actually serves.
     let mut names = [
         "ai.myc",
         "api.myc",
@@ -1090,7 +1208,7 @@ fn find_binary(name: &str, explicit: Option<&Path>, installed: &Path) -> Result<
     Err(format!(
         "{name} not found; place it next to the mycelium binary or pass {}",
         match name {
-            "mycelium-gateway" => "--gateway-bin",
+            "mycelium-frontdoor" => "--frontdoor-bin",
             "mycelium-https-forwarder" => "--forwarder-bin",
             _ => "the matching --*-bin flag",
         }
@@ -1126,23 +1244,23 @@ fn install_binary(source: &Path, destination: &Path) -> Result<PathBuf, String> 
     Ok(destination.to_path_buf())
 }
 
-fn render_gateway_plist(
+fn render_frontdoor_plist(
     paths: &Paths,
-    gateway_bin: &Path,
+    frontdoor_bin: &Path,
     routes: &Path,
     material: &CertificateMaterial,
     listen: SocketAddr,
 ) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{gateway}</string><string>--listen</string><string>{listen}</string><string>--routes</string><string>{routes}</string><string>--usage</string><string>{usage}</string><string>--reload-secs</string><string>1</string><string>--tls-cert</string><string>{cert}</string><string>--tls-key</string><string>{key}</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n",
-        label = xml(GATEWAY_LABEL),
-        gateway = xml(&gateway_bin.display().to_string()),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{frontdoor}</string><string>--listen</string><string>{listen}</string><string>--routes</string><string>{routes}</string><string>--usage</string><string>{usage}</string><string>--reload-secs</string><string>1</string><string>--tls-cert</string><string>{cert}</string><string>--tls-key</string><string>{key}</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n",
+        label = xml(FRONTDOOR_LABEL),
+        frontdoor = xml(&frontdoor_bin.display().to_string()),
         listen = listen,
         routes = xml(&routes.display().to_string()),
         usage = xml(&paths.usage.display().to_string()),
         cert = xml(&material.cert.display().to_string()),
         key = xml(&material.key.display().to_string()),
-        log = xml(&paths.dir.join("gateway.log").display().to_string()),
+        log = xml(&paths.dir.join("frontdoor.log").display().to_string()),
     )
 }
 
@@ -1157,22 +1275,22 @@ fn render_https_plist(paths: &Paths, forwarder_bin: &Path, listen: SocketAddr) -
     )
 }
 
-fn render_gateway_unit(
+fn render_frontdoor_unit(
     usage: &Path,
     listen: SocketAddr,
-    gateway_bin: &Path,
+    frontdoor_bin: &Path,
     routes: &Path,
     material: &CertificateMaterial,
 ) -> Result<String, String> {
     let user = current_user()?;
     let group = current_group()?;
     Ok(format!(
-        "[Unit]\nDescription=Mycelium local .myc HTTPS gateway\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={user}\nGroup={group}\nEnvironment={home}\nExecStart={gateway} --listen {listen} --routes {routes} --usage {usage} --reload-secs 1 --tls-cert {cert} --tls-key {key}\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Mycelium local .myc HTTPS frontdoor\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={user}\nGroup={group}\nEnvironment={home}\nExecStart={frontdoor} --listen {listen} --routes {routes} --usage {usage} --reload-secs 1 --tls-cert {cert} --tls-key {key}\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n",
         home = systemd_quote(&format!(
             "HOME={}",
             user_home()?.display()
         )),
-        gateway = systemd_quote(&gateway_bin.display().to_string()),
+        frontdoor = systemd_quote(&frontdoor_bin.display().to_string()),
         routes = systemd_quote(&routes.display().to_string()),
         usage = systemd_quote(&usage.display().to_string()),
         cert = systemd_quote(&material.cert.display().to_string()),
@@ -1190,7 +1308,7 @@ fn render_https_service_unit(listen: SocketAddr, forwarder_bin: &Path) -> Result
     let user = current_user()?;
     let group = current_group()?;
     Ok(format!(
-        "[Unit]\nDescription=Mycelium .myc HTTPS forwarder\nRequires={HTTPS_SOCKET_UNIT}\nAfter={GATEWAY_UNIT}\n\n[Service]\nUser={user}\nGroup={group}\nExecStart={forwarder} --target {listen}\nNoNewPrivileges=true\nPrivateTmp=true\n",
+        "[Unit]\nDescription=Mycelium .myc HTTPS forwarder\nRequires={HTTPS_SOCKET_UNIT}\nAfter={FRONTDOOR_UNIT}\n\n[Service]\nUser={user}\nGroup={group}\nExecStart={forwarder} --target {listen}\nNoNewPrivileges=true\nPrivateTmp=true\n",
         forwarder = systemd_quote(&forwarder_bin.display().to_string()),
     ))
 }
@@ -1225,34 +1343,42 @@ fn id_field(flag: &str) -> Result<String, String> {
 fn service_paths() -> Result<Vec<PathBuf>, String> {
     Ok(match platform()? {
         Platform::Macos => vec![
-            launch_agent_path(GATEWAY_LABEL)?,
+            launch_agent_path(FRONTDOOR_LABEL)?,
             launch_agent_path(HTTPS_LABEL)?,
         ],
         Platform::Linux => vec![
-            systemd_unit_path(GATEWAY_UNIT),
+            systemd_unit_path(FRONTDOOR_UNIT),
             systemd_unit_path(HTTPS_SOCKET_UNIT),
             systemd_unit_path(HTTPS_SERVICE_UNIT),
         ],
     })
 }
 
-fn install_gateway_service(
+fn legacy_service_paths() -> Result<Vec<PathBuf>, String> {
+    Ok(match platform()? {
+        Platform::Macos => vec![launch_agent_path(LEGACY_FRONTDOOR_LABEL)?],
+        Platform::Linux => vec![systemd_unit_path(LEGACY_FRONTDOOR_UNIT)],
+    })
+}
+
+fn install_frontdoor_service(
     paths: &Paths,
     listen: SocketAddr,
-    gateway_bin: &Path,
+    frontdoor_bin: &Path,
     routes: &Path,
     material: &CertificateMaterial,
 ) -> Result<(), String> {
     match platform()? {
         Platform::Macos => {
             write_named_plist(
-                GATEWAY_LABEL,
-                &render_gateway_plist(paths, gateway_bin, routes, material, listen),
+                FRONTDOOR_LABEL,
+                &render_frontdoor_plist(paths, frontdoor_bin, routes, material, listen),
             )?;
         }
         Platform::Linux => {
-            let unit = render_gateway_unit(&paths.usage, listen, gateway_bin, routes, material)?;
-            install_system_unit(&paths.dir, GATEWAY_UNIT, &unit)?;
+            let unit =
+                render_frontdoor_unit(&paths.usage, listen, frontdoor_bin, routes, material)?;
+            install_system_unit(&paths.dir, FRONTDOOR_UNIT, &unit)?;
         }
     }
     Ok(())
@@ -1346,7 +1472,7 @@ fn run_privileged(program: &str, args: &[String]) -> Result<(), String> {
 fn start_services() -> Result<(), String> {
     match platform()? {
         Platform::Macos => {
-            bootstrap(GATEWAY_LABEL, &launch_agent_path(GATEWAY_LABEL)?)?;
+            bootstrap(FRONTDOOR_LABEL, &launch_agent_path(FRONTDOOR_LABEL)?)?;
             bootstrap(HTTPS_LABEL, &launch_agent_path(HTTPS_LABEL)?)?;
         }
         Platform::Linux => {
@@ -1355,13 +1481,13 @@ fn start_services() -> Result<(), String> {
                 "systemctl",
                 &[
                     "enable".to_owned(),
-                    GATEWAY_UNIT.to_owned(),
+                    FRONTDOOR_UNIT.to_owned(),
                     HTTPS_SOCKET_UNIT.to_owned(),
                 ],
             )?;
             run_privileged(
                 "systemctl",
-                &["restart".to_owned(), GATEWAY_UNIT.to_owned()],
+                &["restart".to_owned(), FRONTDOOR_UNIT.to_owned()],
             )?;
             run_privileged(
                 "systemctl",
@@ -1401,7 +1527,7 @@ fn wait_for_listener(address: SocketAddr) -> Result<(), String> {
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "gateway listener {address} did not become ready within 10 seconds"
+                "frontdoor listener {address} did not become ready within 10 seconds"
             ));
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -1619,7 +1745,7 @@ fn default_routes(home: &Path) -> Value {
             },
             {
                 // The Spore Store is a local service: it advertises kind
-                // `store` when it runs, and the gateway serves `store.myc`
+                // `store` when it runs, and the frontdoor serves `store.myc`
                 // from loopback. With no service the name resolves to nothing
                 // rather than forwarding to a third party.
                 "name": "store",
@@ -1641,9 +1767,9 @@ fn read_routes(path: &Path) -> Result<Value, String> {
     Ok(value)
 }
 
-/// Probe the gateway over TLS without judging the certificate. Used for health
+/// Probe the frontdoor over TLS without judging the certificate. Used for health
 /// and forwarding checks; certificate validation is a separate handshake below
-/// so a broken cert does not hide an otherwise reachable gateway.
+/// so a broken cert does not hide an otherwise reachable frontdoor.
 async fn probe(address: SocketAddr) -> Result<Value, String> {
     let port = address.port();
     let client = reqwest::Client::builder()
@@ -1651,7 +1777,7 @@ async fn probe(address: SocketAddr) -> Result<Value, String> {
         .resolve("ai.myc", address)
         .danger_accept_invalid_certs(true)
         .build()
-        .map_err(|error| format!("build gateway client: {error}"))?;
+        .map_err(|error| format!("build frontdoor client: {error}"))?;
     let response = client
         .get(format!("https://ai.myc:{port}/healthz"))
         .send()
@@ -1661,11 +1787,11 @@ async fn probe(address: SocketAddr) -> Result<Value, String> {
     let body = response
         .json::<Value>()
         .await
-        .map_err(|error| format!("parse gateway health: {error}"))?;
+        .map_err(|error| format!("parse frontdoor health: {error}"))?;
     Ok(json!({"status": status, "body": body}))
 }
 
-/// Verify the certificate the gateway actually presents against the local
+/// Verify the certificate the frontdoor actually presents against the local
 /// trust anchor with an independent TLS implementation. `reqwest`'s rustls
 /// backend rejects CA-as-leaf certificates (the legacy `server.crt` shape),
 /// while macOS browsers and OpenSSL accept them, so `openssl s_client` is the
@@ -1784,28 +1910,35 @@ fn uninstall(args: &[String]) -> Result<Vec<String>, String> {
                 index += 1;
                 home = expand_home(args.get(index).ok_or("--path requires a directory")?);
             }
-            other => return Err(format!("unknown gateway uninstall argument `{other}`")),
+            other => return Err(format!("unknown frontdoor uninstall argument `{other}`")),
         }
         index += 1;
     }
     if write == dry_run {
-        return Err("gateway uninstall requires exactly one of --write or --dry-run".into());
+        return Err("frontdoor uninstall requires exactly one of --write or --dry-run".into());
     }
-    let paths = service_paths()?;
+    let mut paths = service_paths()?;
+    paths.extend(legacy_service_paths()?);
+    paths.sort();
+    paths.dedup();
     if dry_run {
         let mut lines = paths
             .iter()
             .map(|path| format!("would remove {}", path.display()))
             .collect::<Vec<_>>();
-        if platform()? == Platform::Linux && Path::new(SYSTEM_CA_PATH).is_file() {
-            lines.push(format!("would remove {SYSTEM_CA_PATH}"));
+        if platform()? == Platform::Linux
+            && (Path::new(SYSTEM_CA_PATH).is_file() || Path::new(LEGACY_SYSTEM_CA_PATH).is_file())
+        {
+            lines.push(format!(
+                "would remove {SYSTEM_CA_PATH} and {LEGACY_SYSTEM_CA_PATH}"
+            ));
         }
         return Ok(lines);
     }
     match platform()? {
         Platform::Macos => {
             let domain = launch_domain()?;
-            for label in [GATEWAY_LABEL, HTTPS_LABEL] {
+            for label in [FRONTDOOR_LABEL, HTTPS_LABEL, LEGACY_FRONTDOOR_LABEL] {
                 let _ = Command::new("launchctl")
                     .args(["bootout", &format!("{domain}/{label}")])
                     .output();
@@ -1825,7 +1958,8 @@ fn uninstall(args: &[String]) -> Result<Vec<String>, String> {
                     "--now".to_owned(),
                     HTTPS_SOCKET_UNIT.to_owned(),
                     HTTPS_SERVICE_UNIT.to_owned(),
-                    GATEWAY_UNIT.to_owned(),
+                    FRONTDOOR_UNIT.to_owned(),
+                    LEGACY_FRONTDOOR_UNIT.to_owned(),
                 ],
             );
             for path in &paths {
@@ -1845,12 +1979,20 @@ fn uninstall(args: &[String]) -> Result<Vec<String>, String> {
         ),
         "routes and certificates were retained".into(),
     ];
-    if platform()? == Platform::Linux && Path::new(SYSTEM_CA_PATH).is_file() {
-        run_privileged("rm", &["-f".to_owned(), SYSTEM_CA_PATH.to_owned()])?;
-        run_privileged("update-ca-certificates", &[])?;
-        lines.push(format!(
-            "removed the system CA trust entry {SYSTEM_CA_PATH}"
-        ));
+    if platform()? == Platform::Linux {
+        let mut removed_ca = false;
+        for path in [SYSTEM_CA_PATH, LEGACY_SYSTEM_CA_PATH] {
+            if Path::new(path).is_file() {
+                run_privileged("rm", &["-f".to_owned(), path.to_owned()])?;
+                removed_ca = true;
+            }
+        }
+        if removed_ca {
+            run_privileged("update-ca-certificates", &[])?;
+            lines.push(format!(
+                "removed system CA trust entries {SYSTEM_CA_PATH} and {LEGACY_SYSTEM_CA_PATH}"
+            ));
+        }
     }
     if let Some(path) = system_daemon_path() {
         lines.push(format!(
@@ -1868,7 +2010,7 @@ mod tests {
 
     fn temporary_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "mycelium-gateway-{name}-{}-{}",
+            "mycelium-frontdoor-{name}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1918,11 +2060,11 @@ mod tests {
 
     #[test]
     fn fleet_usage_sums_fresh_hosts_and_drops_stale_ones() {
-        use mycelium_peer_protocol::gateway_usage::{
-            GatewayUsageMetrics, TokenCounts, GATEWAY_USAGE_MAX_AGE_SECONDS,
+        use mycelium_peer_protocol::frontdoor_usage::{
+            FrontdoorUsageMetrics, TokenCounts, FRONTDOOR_USAGE_MAX_AGE_SECONDS,
         };
         let peer = |hostname: &str, updated_at: u64, completion: u64| {
-            let usage = GatewayUsageMetrics {
+            let usage = FrontdoorUsageMetrics {
                 updated_at,
                 window_seconds: 60,
                 totals: TokenCounts {
@@ -1949,8 +2091,8 @@ mod tests {
         let peers = json!([
             peer("agora-one", now - 5, 30),
             peer("titan", now - 10, 10),
-            peer("gone", now - GATEWAY_USAGE_MAX_AGE_SECONDS - 60, 999),
-            json!({"hello": {"hostname": "no-gateway"}, "health": {"platform_metrics": {}}}),
+            peer("gone", now - FRONTDOOR_USAGE_MAX_AGE_SECONDS - 60, 999),
+            json!({"hello": {"hostname": "no-frontdoor"}, "health": {"platform_metrics": {}}}),
         ]);
         let rendered = render_fleet_usage(&peers, now, false).join("\n");
         assert!(
@@ -1961,7 +2103,7 @@ mod tests {
         );
         assert!(rendered.contains("agora-one requests=2 prompt=10 completion=30 tok/s=1.00"));
         assert!(!rendered.contains("gone"), "{rendered}");
-        assert!(!rendered.contains("no-gateway"), "{rendered}");
+        assert!(!rendered.contains("no-frontdoor"), "{rendered}");
 
         let collected: Value =
             serde_json::from_str(&render_fleet_usage(&peers, now, true)[0]).unwrap();
@@ -1972,8 +2114,8 @@ mod tests {
 
     #[test]
     fn usage_rendering_makes_unmetered_requests_visible() {
-        use mycelium_peer_protocol::gateway_usage::{GatewayUsageSnapshot, TokenCounts};
-        let snapshot = GatewayUsageSnapshot {
+        use mycelium_peer_protocol::frontdoor_usage::{FrontdoorUsageSnapshot, TokenCounts};
+        let snapshot = FrontdoorUsageSnapshot {
             schema_version: 1,
             generated_at: 100,
             window_seconds: 60,
@@ -1992,7 +2134,7 @@ mod tests {
                 generation_millis: 1_000,
                 ..TokenCounts::default()
             },
-            ..GatewayUsageSnapshot::default()
+            ..FrontdoorUsageSnapshot::default()
         };
         let rendered = render_usage(&snapshot).join("\n");
         assert!(
@@ -2036,13 +2178,50 @@ mod tests {
     #[test]
     fn legacy_certificate_pair_is_discovered() {
         let home = temporary_dir("legacy");
-        let dir = home.join("gateway");
+        let dir = home.join("frontdoor");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("server.crt"), "cert").unwrap();
         fs::write(dir.join("server.key"), "key").unwrap();
         let paths = Paths::discover(&home);
         assert_eq!(paths.cert, dir.join("server.crt"));
         assert_eq!(paths.key, dir.join("server.key"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn old_gateway_directory_is_migrated() {
+        let home = temporary_dir("migrate");
+        let old = home.join("gateway");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("routes.json"), "{}").unwrap();
+        let mut actions = Vec::new();
+        migrate_state(&home, false, &mut actions).unwrap();
+        assert!(home.join("frontdoor/routes.json").is_file());
+        assert!(!old.exists());
+        assert!(actions[0].contains("moved"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn migration_refuses_to_merge_two_state_directories() {
+        let home = temporary_dir("merge");
+        fs::create_dir_all(home.join("gateway")).unwrap();
+        fs::create_dir_all(home.join("frontdoor")).unwrap();
+        let error = migrate_state(&home, false, &mut Vec::new()).unwrap_err();
+        assert!(error.contains("both"), "{error}");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn old_gateway_certificate_is_discovered_before_migration() {
+        let home = temporary_dir("old-cert");
+        let old = home.join("gateway");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("server.pem"), "cert").unwrap();
+        fs::write(old.join("server-key.pem"), "key").unwrap();
+        let paths = Paths::discover(&home);
+        assert_eq!(paths.cert, old.join("server.pem"));
+        assert_eq!(paths.key, old.join("server-key.pem"));
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2087,7 +2266,7 @@ mod tests {
     #[test]
     fn services_use_the_configured_loopback_and_socket_activation() {
         let home = temporary_dir("plist");
-        let dir = home.join("gateway");
+        let dir = home.join("frontdoor");
         fs::create_dir_all(&dir).unwrap();
         let paths = Paths::discover(&home);
         let material = CertificateMaterial {
@@ -2097,16 +2276,16 @@ mod tests {
             generated: false,
         };
         let listen: SocketAddr = "127.0.0.1:9443".parse().unwrap();
-        let gateway = render_gateway_plist(
+        let frontdoor = render_frontdoor_plist(
             &paths,
-            Path::new("/tmp/mycelium-gateway"),
+            Path::new("/tmp/mycelium-frontdoor"),
             &paths.routes,
             &material,
             listen,
         );
         let https = render_https_plist(&paths, Path::new("/tmp/mycelium-https-forwarder"), listen);
-        assert!(gateway.contains("127.0.0.1:9443"));
-        assert!(gateway.contains("--tls-cert"));
+        assert!(frontdoor.contains("127.0.0.1:9443"));
+        assert!(frontdoor.contains("--tls-cert"));
         assert!(https.contains("SockServiceName"));
         assert!(https.contains("<integer>443</integer>"));
         assert!(https.contains("127.0.0.1:9443"));
@@ -2117,23 +2296,23 @@ mod tests {
     fn systemd_units_use_the_configured_listen() {
         let listen: SocketAddr = "127.0.0.1:10443".parse().unwrap();
         let material = CertificateMaterial {
-            cert: PathBuf::from("/home/a/.mycelium/gateway/server.pem"),
-            key: PathBuf::from("/home/a/.mycelium/gateway/server-key.pem"),
+            cert: PathBuf::from("/home/a/.mycelium/frontdoor/server.pem"),
+            key: PathBuf::from("/home/a/.mycelium/frontdoor/server-key.pem"),
             ca: None,
             generated: false,
         };
-        let gateway = render_gateway_unit(
-            Path::new("/home/a/.mycelium/gateway/usage.json"),
+        let frontdoor = render_frontdoor_unit(
+            Path::new("/home/a/.mycelium/frontdoor/usage.json"),
             listen,
-            Path::new("/home/a/.mycelium/bin/mycelium-gateway"),
-            Path::new("/home/a/.mycelium/gateway/routes.json"),
+            Path::new("/home/a/.mycelium/bin/mycelium-frontdoor"),
+            Path::new("/home/a/.mycelium/frontdoor/routes.json"),
             &material,
         )
         .unwrap();
-        assert!(gateway.contains("--listen 127.0.0.1:10443"));
-        assert!(gateway.contains("--usage \"/home/a/.mycelium/gateway/usage.json\""));
-        assert!(gateway.contains("Restart=on-failure"));
-        assert!(gateway.contains("mycelium-gateway"));
+        assert!(frontdoor.contains("--listen 127.0.0.1:10443"));
+        assert!(frontdoor.contains("--usage \"/home/a/.mycelium/frontdoor/usage.json\""));
+        assert!(frontdoor.contains("Restart=on-failure"));
+        assert!(frontdoor.contains("mycelium-frontdoor"));
         let socket = render_https_socket_unit();
         assert!(socket.contains("ListenStream=127.0.0.1:443"));
         assert!(socket.contains("Service=mycelium-https.service"));

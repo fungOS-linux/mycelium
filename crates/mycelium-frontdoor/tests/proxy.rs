@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::StreamExt;
-use mycelium_gateway::server;
+use mycelium_frontdoor::server;
 use reqwest::Client;
 use serde_json::json;
 use std::{fs, time::Duration};
@@ -15,15 +15,15 @@ fn temp_path(label: &str) -> std::path::PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "mycelium-gateway-{label}-{}-{id}.json",
+        "mycelium-frontdoor-{label}-{}-{id}.json",
         std::process::id()
     ))
 }
 
-async fn wait_health(gateway: &std::net::SocketAddr, client: &Client) -> bool {
+async fn wait_health(frontdoor: &std::net::SocketAddr, client: &Client) -> bool {
     for _ in 0..50 {
         if let Ok(response) = client
-            .get(format!("http://127.0.0.1:{}/healthz", gateway.port()))
+            .get(format!("http://127.0.0.1:{}/healthz", frontdoor.port()))
             .send()
             .await
         {
@@ -36,7 +36,7 @@ async fn wait_health(gateway: &std::net::SocketAddr, client: &Client) -> bool {
     false
 }
 
-async fn start_gateway(
+async fn start_frontdoor(
     route_path: std::path::PathBuf,
     token_path: Option<std::path::PathBuf>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
@@ -45,13 +45,13 @@ async fn start_gateway(
     drop(listener);
     let handle = tokio::spawn(async move {
         if let Err(error) = server::run(address, Some(route_path), token_path, 0).await {
-            panic!("gateway exited: {error}");
+            panic!("frontdoor exited: {error}");
         }
     });
     Ok((address, handle))
 }
 
-async fn start_gateway_tls(
+async fn start_frontdoor_tls(
     route_path: std::path::PathBuf,
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
@@ -69,7 +69,7 @@ async fn start_gateway_tls(
         )
         .await
         {
-            panic!("gateway exited: {error}");
+            panic!("frontdoor exited: {error}");
         }
     });
     Ok((address, handle))
@@ -110,24 +110,24 @@ async fn routes_by_host_and_requires_auth() -> Result<(), Box<dyn std::error::Er
         ),
     )?;
 
-    let (gateway_addr, gateway) =
-        start_gateway(route_path.clone(), Some(token_path.clone())).await?;
+    let (frontdoor_addr, frontdoor) =
+        start_frontdoor(route_path.clone(), Some(token_path.clone())).await?;
 
     let client = Client::new();
     assert!(
-        wait_health(&gateway_addr, &client).await,
-        "gateway did not become healthy"
+        wait_health(&frontdoor_addr, &client).await,
+        "frontdoor did not become healthy"
     );
 
     let denied = client
-        .get(format!("http://127.0.0.1:{}/hello", gateway_addr.port()))
+        .get(format!("http://127.0.0.1:{}/hello", frontdoor_addr.port()))
         .header("host", "ai.myc")
         .send()
         .await?;
     assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
     let allowed = client
-        .get(format!("http://127.0.0.1:{}/hello", gateway_addr.port()))
+        .get(format!("http://127.0.0.1:{}/hello", frontdoor_addr.port()))
         .header("host", "ai.myc")
         .header("authorization", format!("Bearer {token}"))
         .send()
@@ -137,7 +137,7 @@ async fn routes_by_host_and_requires_auth() -> Result<(), Box<dyn std::error::Er
     assert_eq!(backend["backend"], json!("ai"));
 
     let missing = client
-        .get(format!("http://127.0.0.1:{}/hello", gateway_addr.port()))
+        .get(format!("http://127.0.0.1:{}/hello", frontdoor_addr.port()))
         .header("host", "no-route.myc")
         .header("authorization", format!("Bearer {token}"))
         .send()
@@ -145,14 +145,14 @@ async fn routes_by_host_and_requires_auth() -> Result<(), Box<dyn std::error::Er
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
     let bad = client
-        .get(format!("http://127.0.0.1:{}/hello", gateway_addr.port()))
+        .get(format!("http://127.0.0.1:{}/hello", frontdoor_addr.port()))
         .header("host", "ai.myc")
         .header("authorization", "Bearer wrong")
         .send()
         .await?;
     assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
 
-    gateway.abort();
+    frontdoor.abort();
     upstream_handle.abort();
     let _ = fs::remove_file(token_path);
     let _ = fs::remove_file(route_path);
@@ -176,7 +176,7 @@ async fn health_reports_routes_and_auth() -> Result<(), Box<dyn std::error::Erro
         }"#,
     )?;
 
-    let (addr, gateway) = start_gateway(route_path.clone(), None).await?;
+    let (addr, frontdoor) = start_frontdoor(route_path.clone(), None).await?;
     let client = Client::new();
     let health = loop {
         if let Ok(response) = client
@@ -196,7 +196,7 @@ async fn health_reports_routes_and_auth() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(health["auth_required"], json!(false));
     assert_eq!(health["tls"], json!(false));
 
-    gateway.abort();
+    frontdoor.abort();
     let _ = fs::remove_file(route_path);
     Ok(())
 }
@@ -226,7 +226,7 @@ async fn refresh_keeps_previous_routes_on_bad_edit() -> Result<(), Box<dyn std::
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     drop(listener);
-    let gateway = tokio::spawn(server::run(addr, Some(route_path.clone()), None, 1));
+    let frontdoor = tokio::spawn(server::run(addr, Some(route_path.clone()), None, 1));
 
     let client = Client::new();
     assert!(wait_health(&addr, &client).await);
@@ -242,7 +242,7 @@ async fn refresh_keeps_previous_routes_on_bad_edit() -> Result<(), Box<dyn std::
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
 
-    gateway.abort();
+    frontdoor.abort();
     upstream_handle.abort();
     let _ = fs::remove_file(route_path);
     Ok(())
@@ -281,7 +281,7 @@ async fn streams_upstream_chunks_without_buffering() -> Result<(), Box<dyn std::
             upstream_addr.port()
         ),
     )?;
-    let (addr, gateway) = start_gateway(route_path.clone(), None).await?;
+    let (addr, frontdoor) = start_frontdoor(route_path.clone(), None).await?;
     let client = Client::new();
     assert!(wait_health(&addr, &client).await);
 
@@ -293,7 +293,7 @@ async fn streams_upstream_chunks_without_buffering() -> Result<(), Box<dyn std::
     let first = tokio::time::timeout(Duration::from_millis(300), response.chunk()).await??;
     assert_eq!(first.as_deref(), Some(&b"first"[..]));
 
-    gateway.abort();
+    frontdoor.abort();
     upstream_handle.abort();
     let _ = fs::remove_file(route_path);
     Ok(())
@@ -323,7 +323,7 @@ async fn serves_https_and_reports_the_forwarded_proto() -> Result<(), Box<dyn st
         .expect("upstream serve should succeed");
     });
 
-    let mut ca_params = CertificateParams::new(vec!["gateway-test-ca".into()])?;
+    let mut ca_params = CertificateParams::new(vec!["frontdoor-test-ca".into()])?;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca_key = KeyPair::generate()?;
     let ca = ca_params.self_signed(&ca_key)?;
@@ -346,8 +346,8 @@ async fn serves_https_and_reports_the_forwarded_proto() -> Result<(), Box<dyn st
         ),
     )?;
 
-    let (addr, gateway) =
-        start_gateway_tls(route_path.clone(), cert_path.clone(), key_path.clone()).await?;
+    let (addr, frontdoor) =
+        start_frontdoor_tls(route_path.clone(), cert_path.clone(), key_path.clone()).await?;
     let client = Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes())?)
         .build()?;
@@ -371,7 +371,7 @@ async fn serves_https_and_reports_the_forwarded_proto() -> Result<(), Box<dyn st
     let body: serde_json::Value = response.json().await?;
     assert_eq!(body["proto"], json!("https"));
 
-    gateway.abort();
+    frontdoor.abort();
     upstream_handle.abort();
     let _ = fs::remove_file(cert_path);
     let _ = fs::remove_file(key_path);
@@ -382,11 +382,11 @@ async fn serves_https_and_reports_the_forwarded_proto() -> Result<(), Box<dyn st
 #[tokio::test]
 async fn refuses_to_start_with_missing_inputs() {
     let address = "127.0.0.1:0".parse().unwrap();
-    let missing_token = std::env::temp_dir().join("mycelium-gateway-missing-token");
+    let missing_token = std::env::temp_dir().join("mycelium-frontdoor-missing-token");
     let result = server::run(address, None, Some(missing_token), 0).await;
     assert!(result.is_err());
 
-    let missing_config = std::env::temp_dir().join("mycelium-gateway-missing-routes");
+    let missing_config = std::env::temp_dir().join("mycelium-frontdoor-missing-routes");
     let result = server::run(address, Some(missing_config), None, 0).await;
     assert!(result.is_err());
 }
@@ -423,9 +423,13 @@ async fn falls_back_to_a_discovered_local_service() -> Result<(), Box<dyn std::e
     fs::write(
         &catalog,
         format!(
-            r#"{{"observations":[{{
+            r#"{{"schema_version": 1, "observations":[{{
+                "schema_version": 1,
+                "service_id": "service/ai-local",
+                "observed_at": 0,
                 "expires_at": {expires_at},
-                "provenance": {{"observer": "local"}},
+                "provenance": {{"provider": "local", "observer": "local"}},
+                "confidence": "strong",
                 "value": {{
                     "kind": "ai",
                     "endpoints": ["http://127.0.0.1:{}"],
@@ -468,7 +472,7 @@ esac
         ),
     )?;
 
-    let (addr, gateway) = start_gateway(route_path, None).await?;
+    let (addr, frontdoor) = start_frontdoor(route_path, None).await?;
     let client = Client::new();
     assert!(wait_health(&addr, &client).await);
     let response = client
@@ -480,7 +484,7 @@ esac
     let body: serde_json::Value = response.json().await?;
     assert_eq!(body["backend"], json!("discovered"));
 
-    gateway.abort();
+    frontdoor.abort();
     upstream_handle.abort();
     let _ = fs::remove_dir_all(dir);
     Ok(())

@@ -1,12 +1,12 @@
 [package]
-name = "mycelium-gateway"
+name = "mycelium-frontdoor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Loopback Host-routed gateway for fungOS .myc service names"
+description = "Loopback Host-routed frontdoor for fungOS .myc service names"
 
 [[bin]]
-name = "mycelium-gateway"
+name = "mycelium-frontdoor"
 path = "src/main.rs"
 
 [dependencies]

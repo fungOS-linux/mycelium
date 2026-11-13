@@ -52,7 +52,7 @@ and integration work is being migrated from this checkout's `fungOS/` directory.
 
 One installer builds the core binaries, enrolls the node, and prompts for the
 optional pieces (IPv6 VPN, VFS, Soil + `fungOS.app`, build offload, operator
-gateway). It supports macOS and systemd-based Linux; `fungOS.app` is macOS-only.
+frontdoor). It supports macOS and systemd-based Linux; `fungOS.app` is macOS-only.
 It is safe to re-run: binaries are backed up before replacement and existing
 enrollment is repaired in place. Use `--yes` for recommended defaults.
 
@@ -78,23 +78,23 @@ After installation, enrollment can be repeated explicitly with
 `mycelium setup --gateway https://sso.fpl.dev`.
 
 On a workstation that should expose local capability names such as `ai.myc`
-and `mcp.myc`, the operator component installs the loopback HTTPS gateway after
+and `mcp.myc`, the operator component installs the loopback HTTPS frontdoor after
 enrollment. The `--trust-cert` flag adds the generated local CA to the login
 keychain so the browser accepts the names. The same steps can be run directly:
 
 ```sh
-mycelium setup --claim "$CLAIM" --local-gateway --trust-cert
+mycelium setup --claim "$CLAIM" --local-frontdoor --trust-cert
 # or, on an already-enrolled workstation:
-mycelium gateway install --write --trust-cert
+mycelium frontdoor install --write --trust-cert
 mycelium doctor
 ```
 
-`mycelium doctor` checks the daemon, `.myc` resolution, the gateway services,
-the gateway listeners, certificate trust, HTTPS health, whether the installed
+`mycelium doctor` checks the daemon, `.myc` resolution, the frontdoor services,
+the frontdoor listeners, certificate trust, HTTPS health, whether the installed
 release is the latest signed release for the channel, and the macOS
 signature/notarization status. It exits non-zero when a check fails, so it can
 gate automation. `--json` is available for scripts; `--fix --trust-cert`
-repairs the local gateway installation. The lifecycle supports macOS
+repairs the local frontdoor installation. The lifecycle supports macOS
 LaunchAgents and Linux systemd units; on Linux the installer needs
 passwordless sudo. See [docs/releases.md](docs/releases.md).
 
@@ -104,8 +104,8 @@ UMIE lease on the mesh, then `https://ai.fpl.dev`, and counts tokens at that one
 hop so usage can be rolled up across the fleet:
 
 ```sh
-mycelium gateway usage          # this machine
-mycelium gateway usage --fleet  # gossiped totals from every peer
+mycelium frontdoor usage          # this machine
+mycelium frontdoor usage --fleet  # gossiped totals from every peer
 ```
 
 See [docs/ai-endpoint.md](docs/ai-endpoint.md) for the route, credential and
@@ -195,7 +195,7 @@ For a pinned checkout, build `mycelium-cli` as shown below and place
 ```sh
 git clone https://github.com/ajmwagar/mycelium.git
 cd mycelium
-cargo build --release -p mycelium-cli -p mycelium-gateway
+cargo build --release -p mycelium-cli -p mycelium-frontdoor
 
 # The CLI starts its local daemon on demand.
 ./target/release/mycelium drivers

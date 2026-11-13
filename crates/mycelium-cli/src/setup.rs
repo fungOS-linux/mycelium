@@ -9,13 +9,17 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     }
     let system_service = packaged || args.iter().any(|argument| argument == "--system-service");
     // A peer is only useful if its services are reachable: an enrolled node with
-    // no gateway answers no .myc name and reaches nothing on the mesh. So the
-    // local gateway is part of enrollment, not a follow-up step. Packaged
-    // installs own their units; --no-local-gateway opts out.
-    let local_gateway = !packaged && !args.iter().any(|argument| argument == "--no-local-gateway");
-    let trust_gateway = args.iter().any(|argument| argument == "--trust-cert");
-    if trust_gateway && !local_gateway {
-        return Err("--trust-cert requires a local gateway".into());
+    // no frontdoor answers no .myc name and reaches nothing on the mesh. So the
+    // local frontdoor is part of enrollment, not a follow-up step. Packaged
+    // installs own their units; --no-local-frontdoor opts out. The old
+    // --no-local-gateway spelling stays accepted for existing scripts.
+    let local_frontdoor = !packaged
+        && !args
+            .iter()
+            .any(|argument| argument == "--no-local-frontdoor" || argument == "--no-local-gateway");
+    let trust_frontdoor = args.iter().any(|argument| argument == "--trust-cert");
+    if trust_frontdoor && !local_frontdoor {
+        return Err("--trust-cert requires a local frontdoor".into());
     }
     let home = value(args, "--path").map(expand_home).unwrap_or_else(|| {
         if packaged {
@@ -30,7 +34,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     if args.iter().any(|argument| argument == "--repair") {
         let mut lines =
             crate::enroll::repair_peer_service(&home, value(args, "--site"), system_service)?;
-        lines.extend(install_local_gateway(local_gateway, &home, trust_gateway).await?);
+        lines.extend(install_local_frontdoor(local_frontdoor, &home, trust_frontdoor).await?);
         // DNS is optional by design, so a resolver that cannot start is
         // reported here rather than turning a good peer repair into a failure.
         match crate::dns::ensure(&home).await {
@@ -70,7 +74,7 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         .await;
         remove_consumed_claim(&result, claim_path.as_deref())?;
         let mut lines = result?;
-        lines.extend(install_local_gateway(local_gateway, &home, trust_gateway).await?);
+        lines.extend(install_local_frontdoor(local_frontdoor, &home, trust_frontdoor).await?);
         return Ok(lines);
     }
     let ssh_dir = user_home()?.join(".ssh");
@@ -138,19 +142,19 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
         certificate.display()
     ));
     remove_consumed_claim(&Ok(()), claim_path.as_deref())?;
-    lines.extend(install_local_gateway(local_gateway, &home, trust_gateway).await?);
+    lines.extend(install_local_frontdoor(local_frontdoor, &home, trust_frontdoor).await?);
     Ok(lines)
 }
 
-async fn install_local_gateway(
-    local_gateway: bool,
+async fn install_local_frontdoor(
+    local_frontdoor: bool,
     home: &Path,
     trust: bool,
 ) -> Result<Vec<String>, String> {
-    if !local_gateway {
+    if !local_frontdoor {
         return Ok(Vec::new());
     }
-    crate::gateway::install_default(home, trust).await
+    crate::frontdoor::install_default(home, trust).await
 }
 
 fn read_claim_file(path: &Path) -> Result<String, String> {

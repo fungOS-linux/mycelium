@@ -4,7 +4,7 @@ use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
-use mycelium_gateway::server;
+use mycelium_frontdoor::server;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -17,15 +17,15 @@ fn temp_path(label: &str) -> std::path::PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "mycelium-gateway-metering-{label}-{}-{id}.json",
+        "mycelium-frontdoor-metering-{label}-{}-{id}.json",
         std::process::id()
     ))
 }
 
-async fn wait_health(gateway: &std::net::SocketAddr, client: &Client) -> bool {
+async fn wait_health(frontdoor: &std::net::SocketAddr, client: &Client) -> bool {
     for _ in 0..50 {
         if let Ok(response) = client
-            .get(format!("http://127.0.0.1:{}/healthz", gateway.port()))
+            .get(format!("http://127.0.0.1:{}/healthz", frontdoor.port()))
             .send()
             .await
         {
@@ -39,7 +39,7 @@ async fn wait_health(gateway: &std::net::SocketAddr, client: &Client) -> bool {
 }
 
 async fn wait_for_requests(
-    gateway: &std::net::SocketAddr,
+    frontdoor: &std::net::SocketAddr,
     client: &Client,
     expected: u64,
 ) -> Value {
@@ -48,7 +48,7 @@ async fn wait_for_requests(
         if let Ok(response) = client
             .get(format!(
                 "http://127.0.0.1:{}/.mycelium/usage",
-                gateway.port()
+                frontdoor.port()
             ))
             .send()
             .await
@@ -110,7 +110,7 @@ async fn fake_upstream(stream: bool) -> FakeUpstream {
     }
 }
 
-async fn start_gateway(
+async fn start_frontdoor(
     upstreams: &[&str],
     usage_path: std::path::PathBuf,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -140,7 +140,7 @@ async fn start_gateway(
             Some(usage_path),
         )
         .await
-        .expect("gateway should run");
+        .expect("frontdoor should run");
     });
     (address, handle)
 }
@@ -148,18 +148,18 @@ async fn start_gateway(
 #[tokio::test]
 async fn counts_tokens_from_a_buffered_completion() {
     let upstream = fake_upstream(false).await;
-    let (gateway, _handle) = start_gateway(
+    let (frontdoor, _handle) = start_frontdoor(
         &[&format!("http://{}", upstream.address)],
         temp_path("usage"),
     )
     .await;
     let client = Client::new();
-    assert!(wait_health(&gateway, &client).await);
+    assert!(wait_health(&frontdoor, &client).await);
 
     let response = client
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
-            gateway.port()
+            frontdoor.port()
         ))
         .header("host", "ai.myc")
         .json(&json!({"model": "fpl/coder", "messages": []}))
@@ -170,7 +170,7 @@ async fn counts_tokens_from_a_buffered_completion() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], json!("hi"));
 
-    let usage = wait_for_requests(&gateway, &client, 1).await;
+    let usage = wait_for_requests(&frontdoor, &client, 1).await;
     assert_eq!(usage["totals"]["metered_requests"], json!(1));
     assert_eq!(usage["totals"]["prompt_tokens"], json!(11));
     assert_eq!(usage["totals"]["completion_tokens"], json!(3));
@@ -183,18 +183,18 @@ async fn counts_tokens_from_a_buffered_completion() {
 #[tokio::test]
 async fn streaming_requests_ask_for_usage_and_count_it() {
     let upstream = fake_upstream(true).await;
-    let (gateway, _handle) = start_gateway(
+    let (frontdoor, _handle) = start_frontdoor(
         &[&format!("http://{}", upstream.address)],
         temp_path("usage-stream"),
     )
     .await;
     let client = Client::new();
-    assert!(wait_health(&gateway, &client).await);
+    assert!(wait_health(&frontdoor, &client).await);
 
     let body = client
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
-            gateway.port()
+            frontdoor.port()
         ))
         .header("host", "ai.myc")
         .json(&json!({"model": "fpl/coder", "stream": true, "messages": []}))
@@ -210,7 +210,7 @@ async fn streaming_requests_ask_for_usage_and_count_it() {
         json!(true)
     );
 
-    let usage = wait_for_requests(&gateway, &client, 1).await;
+    let usage = wait_for_requests(&frontdoor, &client, 1).await;
     assert_eq!(usage["totals"]["prompt_tokens"], json!(7));
     assert_eq!(usage["totals"]["completion_tokens"], json!(5));
     upstream.handle.abort();
@@ -222,7 +222,7 @@ async fn an_unreachable_first_upstream_falls_through_to_the_next() {
     let closed_address = closed.local_addr().unwrap();
     drop(closed);
     let upstream = fake_upstream(false).await;
-    let (gateway, _handle) = start_gateway(
+    let (frontdoor, _handle) = start_frontdoor(
         &[
             &format!("http://{}", closed_address),
             &format!("http://{}", upstream.address),
@@ -231,12 +231,12 @@ async fn an_unreachable_first_upstream_falls_through_to_the_next() {
     )
     .await;
     let client = Client::new();
-    assert!(wait_health(&gateway, &client).await);
+    assert!(wait_health(&frontdoor, &client).await);
 
     let response = client
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
-            gateway.port()
+            frontdoor.port()
         ))
         .header("host", "ai.myc")
         .json(&json!({"model": "fpl/coder", "messages": []}))

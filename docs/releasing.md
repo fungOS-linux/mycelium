@@ -17,7 +17,7 @@ The current installer surface is:
 ```text
 mycelium
 myceliumd
-mycelium-gateway
+mycelium-frontdoor
 mycelium-https-forwarder
 mycelium-dns-resolver
 geoded

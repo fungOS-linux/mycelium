@@ -10,7 +10,7 @@ mod completions;
 mod dns;
 mod doctor;
 mod enroll;
-mod gateway;
+mod frontdoor;
 mod host_access;
 mod host_supervisor;
 mod invite;
@@ -120,11 +120,11 @@ usage:
   mycelium sync enable --write | export [--qr] | join <rendezvous.json> --write
   mycelium sync relays enable|disable --write
   mycelium pair --kind peer --iroh --qr --name NAME --site SITE [--public-relays] [--ttl 15m]
-  mycelium setup [--gateway HTTPS-URL] [--claim CODE|--claim-file PATH] [--system-service] [--local-gateway] [--trust-cert] [--ttl 8h] [--key PATH] [--certificate PATH]
-  mycelium setup --repair [--site SITE] [--path MYCELIUM-HOME] [--system-service] [--local-gateway] [--trust-cert]
+  mycelium setup [--gateway HTTPS-URL] [--claim CODE|--claim-file PATH] [--system-service] [--local-frontdoor] [--trust-cert] [--ttl 8h] [--key PATH] [--certificate PATH]
+  mycelium setup --repair [--site SITE] [--path MYCELIUM-HOME] [--system-service] [--local-frontdoor] [--trust-cert]
   mycelium setup --packaged --claim-file PATH | --packaged --repair
-  mycelium gateway status [--json]
-  mycelium gateway usage [--json] [--fleet]
+  mycelium frontdoor status [--json]
+  mycelium frontdoor usage [--json] [--fleet]
   mycelium ca backup --key PATH [--bundle FILE] [--shares DIR] [--threshold N] [--share-count N] [--phrase-out FILE] --write
   mycelium ca restore --bundle FILE --out PATH --phrase-file FILE [--force] --write
   mycelium ca restore --bundle FILE --out PATH --share FILE --share FILE --share FILE [--force] --write
@@ -135,8 +135,9 @@ usage:
   mycelium pulse remove ID --write
   mycelium pulse toggle ID --write
   mycelium pulse runs [ID] [--limit N] [--json]
-  mycelium gateway install [--write|--dry-run] [--trust-cert] [--routes PATH] [--cert PATH --key PATH] [--gateway-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]
-  mycelium gateway uninstall [--write|--dry-run]
+  mycelium frontdoor install [--write|--dry-run] [--trust-cert] [--routes PATH] [--cert PATH --key PATH] [--frontdoor-bin PATH] [--forwarder-bin PATH] [--path MYCELIUM-HOME]
+  mycelium frontdoor uninstall [--write|--dry-run]
+  (the deprecated `mycelium gateway` alias still works)
   mycelium doctor [--json] [--fix] [--trust-cert]
   mycelium pair --kind access --name NAME --unix-user USER... [--role ROLE]... [--listen ADDR] [--advertise URL] [--ca PATH] [--ttl 15m] [--credential-ttl 8h]
   mycelium pair --kind peer --name NAME --site SITE --peer HOST:PORT... [--unix-user USER --role ROLE]... [--ca PATH] [--enrollment-ca DIR] [--listen ADDR] [--advertise URL] [--ttl 15m]
@@ -546,7 +547,11 @@ fn parse_flags(args: &[String]) -> Flags {
 async fn run(cmd: &str, args: &[String]) -> Result<Vec<String>, ClientError> {
     match cmd {
         "setup" => setup::run(args).await.map_err(access_error),
-        "gateway" => gateway::run(args).await.map_err(access_error),
+        "frontdoor" => frontdoor::run(args).await.map_err(access_error),
+        "gateway" => {
+            eprintln!("warning: `mycelium gateway` is deprecated; use `mycelium frontdoor`");
+            frontdoor::run(args).await.map_err(access_error)
+        }
         "doctor" => doctor::run(args).await.map_err(access_error),
         "pair" => pair::run(args).await.map_err(access_error),
         "sync" => sync::run(args).map_err(access_error),

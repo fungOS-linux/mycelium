@@ -2814,7 +2814,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mycelium-gateway"
+name = "mycelium-frontdoor"
 version = "0.1.0"
 dependencies = [
  "axum",

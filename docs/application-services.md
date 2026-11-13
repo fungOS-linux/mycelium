@@ -28,7 +28,7 @@ publishes the catalog, so a lease can never claim a name in another zone.
 The zone's `service_aliases` table (written with the resolver settings) overrides a
 declared label for that kind, which is how a desktop renames a service it installed
 without editing the owner's lease. The daemon publishes composed names in
-`mycelium services --json`; DNS and the gateway both read them, so a name never
+`mycelium services --json`; DNS and the frontdoor both read them, so a name never
 resolves without routing and never routes without resolving.
 
 Conflicts are not resolved silently:

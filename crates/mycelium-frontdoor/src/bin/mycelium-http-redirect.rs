@@ -1,6 +1,6 @@
-//! Plain-HTTP redirect to the TLS `*.myc` gateway.
+//! Plain-HTTP redirect to the TLS `*.myc` frontdoor.
 //!
-//! The gateway is intentionally TLS-only. This listener exists so a browser or
+//! The frontdoor is intentionally TLS-only. This listener exists so a browser or
 //! a `curl http://ai.myc/...` lands on the same URL over HTTPS instead of a
 //! connection refused. It never proxies a request: it only returns 301.
 //!

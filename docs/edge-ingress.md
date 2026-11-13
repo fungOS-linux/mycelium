@@ -146,12 +146,12 @@ otherwise:
 ## Order of work
 
 The edge does not have to be built before it is useful. The local loopback
-gateway is already an edge; everything else is an outer ring.
+frontdoor is already an edge; everything else is an outer ring.
 
 1. **Names come from the catalog.** A lease publishes its labels in
    `value.names`; the daemon composes them with the zone suffix and every consumer
-   reads that one projection, so the gateway derives its host table from the
-   catalog instead of `~/.mycelium/gateway/routes.json`. `routes.json` stays only
+   reads that one projection, so the frontdoor derives its host table from the
+   catalog instead of `~/.mycelium/frontdoor/routes.json`. `routes.json` stays only
    for overrides that no service can express, such as a public fallback upstream
    or a per-route token. Until this lands, every node needs a hand-edited route
    file, which is the opposite of anycast.

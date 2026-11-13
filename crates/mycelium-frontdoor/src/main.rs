@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 fn main() {
     if let Err(error) = run_sync() {
-        eprintln!("mycelium-gateway: {error}");
+        eprintln!("mycelium-frontdoor: {error}");
         std::process::exit(1);
     }
 }
@@ -13,7 +13,7 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(mycelium_gateway::server::run_with_options(
+    runtime.block_on(mycelium_frontdoor::server::run_with_options(
         vec![config.listen],
         config.routes,
         config.token_file,
@@ -126,7 +126,7 @@ mod args {
 
     fn print_usage() {
         println!(
-            "mycelium-gateway --listen 127.0.0.1:8080 [--routes gateway.json] \
+            "mycelium-frontdoor --listen 127.0.0.1:8080 [--routes frontdoor.json] \
              [--token-file TOKEN] [--reload-secs 1] [--usage usage.json] \
              [--tls-cert CERT --tls-key KEY]"
         );
@@ -173,10 +173,10 @@ mod tests {
 
     #[test]
     fn records_usage_only_when_asked() {
-        let config = parse(&["--usage", "/home/u/.mycelium/gateway/usage.json"]).unwrap();
+        let config = parse(&["--usage", "/home/u/.mycelium/frontdoor/usage.json"]).unwrap();
         assert_eq!(
             config.usage,
-            Some(PathBuf::from("/home/u/.mycelium/gateway/usage.json"))
+            Some(PathBuf::from("/home/u/.mycelium/frontdoor/usage.json"))
         );
         assert!(parse(&["--usage"]).is_err());
     }

@@ -43,8 +43,8 @@ if they must start before a login session exists.
 
 | Component | What it does |
 |---|---|
-| Core (always) | Builds `mycelium`, `myceliumd`, the gateway, the DNS resolver and `geoded`; installs them under `~/.mycelium/bin` and `~/.local/bin`; enrolls or repairs the node. |
-| Operator (default) | Installs the loopback HTTPS gateway and CA trust, agent skills, and shell completion. |
+| Core (always) | Builds `mycelium`, `myceliumd`, the frontdoor, the DNS resolver and `geoded`; installs them under `~/.mycelium/bin` and `~/.local/bin`; enrolls or repairs the node. |
+| Operator (default) | Installs the loopback HTTPS frontdoor and CA trust, agent skills, and shell completion. |
 | VPN (default) | Builds `iroh-tun`, assigns an IPv6 overlay prefix, and installs a root-owned LaunchDaemon (macOS) or systemd unit (Linux). |
 | VFS (default) | Builds `fungos-vfs` and its provider/fetch/FUSE binaries, creates the content root and mount point, and installs user services when their prerequisites exist. |
 | Soil (default) | Builds the `soil` CLI, creates the fungOS data directories, installs `fungOS.app` on macOS when a bundle is supplied or present, and installs `soil-home`/`soil-store` as LaunchAgents or systemd user units when the runtime binaries are available. A failed CLI build is reported but does not block the app or runtime setup. |

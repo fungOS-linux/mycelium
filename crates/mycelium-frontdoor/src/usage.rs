@@ -1,14 +1,15 @@
 //! Token accounting for the AI route.
 //!
-//! The gateway is the one choke point every client talks to, so it is the one
+//! The frontdoor is the one choke point every client talks to, so it is the one
 //! place that can count tokens regardless of which backend answered. It reads
 //! the OpenAI `usage` object the upstream already reports, in a JSON body or in
 //! the final SSE event, and records it per route and model. Requests whose
 //! upstream reports nothing are counted as unattributed rather than guessed at:
 //! an estimate that looks exact is worse than a visible gap.
 
-use mycelium_peer_protocol::gateway_usage::{
-    GatewayUsageSnapshot, TokenCounts, GATEWAY_USAGE_SCHEMA_VERSION, GATEWAY_USAGE_WINDOW_SECONDS,
+use mycelium_peer_protocol::frontdoor_usage::{
+    FrontdoorUsageSnapshot, TokenCounts, FRONTDOOR_USAGE_SCHEMA_VERSION,
+    FRONTDOOR_USAGE_WINDOW_SECONDS,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -30,7 +31,7 @@ pub struct ReportedUsage {
     pub cached_tokens: u64,
 }
 
-/// What the gateway decided to do with one request before forwarding it.
+/// What the frontdoor decided to do with one request before forwarding it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Metering {
     /// Not an AI completion request; the response passes through untouched.
@@ -51,7 +52,7 @@ impl Metering {
 }
 
 /// Decide from the request path and body whether the response can be counted.
-/// Parsing the body is also how the gateway learns the model; a body that is not
+/// Parsing the body is also how the frontdoor learns the model; a body that is not
 /// JSON is forwarded unmetered instead of failing the request.
 pub fn classify(path: &str, body: &[u8]) -> Metering {
     if !path.ends_with("/completions") {
@@ -71,7 +72,7 @@ pub fn classify(path: &str, body: &[u8]) -> Metering {
     }
 }
 
-/// Ask a streaming upstream to close with a usage event. Without it the gateway
+/// Ask a streaming upstream to close with a usage event. Without it the frontdoor
 /// sees generated text but no token counts. An explicit client choice is kept.
 pub fn with_stream_usage(body: &[u8]) -> Option<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(body).ok()?;
@@ -212,7 +213,7 @@ impl UsageMeter {
         }
         let second = now();
         self.buckets.entry(second).or_default().add(&counts);
-        let oldest = second.saturating_sub(GATEWAY_USAGE_WINDOW_SECONDS);
+        let oldest = second.saturating_sub(FRONTDOOR_USAGE_WINDOW_SECONDS);
         while self.buckets.keys().next().is_some_and(|at| *at < oldest) {
             let key = *self.buckets.keys().next().unwrap();
             self.buckets.remove(&key);
@@ -220,19 +221,19 @@ impl UsageMeter {
         self.dirty = true;
     }
 
-    fn snapshot(&self) -> GatewayUsageSnapshot {
+    fn snapshot(&self) -> FrontdoorUsageSnapshot {
         let second = now();
-        let oldest = second.saturating_sub(GATEWAY_USAGE_WINDOW_SECONDS);
+        let oldest = second.saturating_sub(FRONTDOOR_USAGE_WINDOW_SECONDS);
         let mut window = TokenCounts::default();
         for (at, counts) in &self.buckets {
             if *at >= oldest {
                 window.add(counts);
             }
         }
-        GatewayUsageSnapshot {
-            schema_version: GATEWAY_USAGE_SCHEMA_VERSION,
+        FrontdoorUsageSnapshot {
+            schema_version: FRONTDOOR_USAGE_SCHEMA_VERSION,
             generated_at: second,
-            window_seconds: GATEWAY_USAGE_WINDOW_SECONDS,
+            window_seconds: FRONTDOOR_USAGE_WINDOW_SECONDS,
             totals: self.totals,
             window,
             routes: self.routes.clone(),
@@ -248,7 +249,7 @@ pub struct UsageStore {
 }
 
 impl UsageStore {
-    /// Continue from the totals a previous gateway process left on disk. The
+    /// Continue from the totals a previous frontdoor process left on disk. The
     /// throughput window starts empty: a restart is not current traffic.
     pub fn open(path: Option<PathBuf>) -> Self {
         let meter = path
@@ -280,7 +281,7 @@ impl UsageStore {
             .record(route, model, usage, elapsed);
     }
 
-    pub fn snapshot(&self) -> GatewayUsageSnapshot {
+    pub fn snapshot(&self) -> FrontdoorUsageSnapshot {
         self.meter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -311,10 +312,10 @@ impl UsageStore {
     }
 }
 
-fn read_snapshot(path: &Path) -> Option<GatewayUsageSnapshot> {
+fn read_snapshot(path: &Path) -> Option<FrontdoorUsageSnapshot> {
     let bytes = std::fs::read(path).ok()?;
-    let snapshot: GatewayUsageSnapshot = serde_json::from_slice(&bytes).ok()?;
-    (snapshot.schema_version == GATEWAY_USAGE_SCHEMA_VERSION).then_some(snapshot)
+    let snapshot: FrontdoorUsageSnapshot = serde_json::from_slice(&bytes).ok()?;
+    (snapshot.schema_version == FRONTDOOR_USAGE_SCHEMA_VERSION).then_some(snapshot)
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -449,7 +450,7 @@ mod tests {
         assert_eq!(snapshot.routes["ai"].requests, 2);
         assert_eq!(snapshot.models["fpl/coder"].requests, 2);
         assert_eq!(snapshot.window.requests, 2);
-        assert_eq!(snapshot.schema_version, GATEWAY_USAGE_SCHEMA_VERSION);
+        assert_eq!(snapshot.schema_version, FRONTDOOR_USAGE_SCHEMA_VERSION);
     }
 
     #[test]

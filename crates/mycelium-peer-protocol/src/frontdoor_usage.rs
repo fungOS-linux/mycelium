@@ -1,8 +1,8 @@
-//! Token accounting that the local `mycelium-gateway` writes to
-//! `$MYCELIUM_HOME/gateway/usage.json` and `myceliumd` republishes in gossiped
+//! Token accounting that the local `mycelium-frontdoor` writes to
+//! `$MYCELIUM_HOME/frontdoor/usage.json` and `myceliumd` republishes in gossiped
 //! `platform_metrics`.
 //!
-//! One definition, three readers: the gateway fills it in, the daemon flattens
+//! One definition, three readers: the frontdoor fills it in, the daemon flattens
 //! it into peer-visible metrics, and the CLI aggregates it across the fleet. The
 //! schema is versioned because a rolled-back binary must not misread counters
 //! written by a newer one.
@@ -11,15 +11,15 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const GATEWAY_USAGE_SCHEMA_VERSION: u16 = 1;
+pub const FRONTDOOR_USAGE_SCHEMA_VERSION: u16 = 1;
 
 /// Window used for throughput. Long enough to stop a single slow request from
 /// looking like idle, short enough to answer "what is the fleet doing now".
-pub const GATEWAY_USAGE_WINDOW_SECONDS: u64 = 60;
+pub const FRONTDOOR_USAGE_WINDOW_SECONDS: u64 = 60;
 
 /// A usage snapshot older than this is no longer presented as current. A
 /// gateway that stopped running must not look like a fleet that went quiet.
-pub const GATEWAY_USAGE_MAX_AGE_SECONDS: u64 = 600;
+pub const FRONTDOOR_USAGE_MAX_AGE_SECONDS: u64 = 600;
 
 pub const METRIC_PREFIX: &str = "mycelium_ai.";
 
@@ -74,10 +74,10 @@ impl TokenCounts {
     }
 }
 
-/// What one gateway published about its own machine.
+/// What one frontdoor published about its own machine.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
-pub struct GatewayUsageSnapshot {
+pub struct FrontdoorUsageSnapshot {
     pub schema_version: u16,
     pub generated_at: u64,
     pub window_seconds: u64,
@@ -91,15 +91,15 @@ pub struct GatewayUsageSnapshot {
 /// per-route maps that would grow the topology.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
-pub struct GatewayUsageMetrics {
+pub struct FrontdoorUsageMetrics {
     pub updated_at: u64,
     pub window_seconds: u64,
     pub totals: TokenCounts,
     pub window: TokenCounts,
 }
 
-impl GatewayUsageMetrics {
-    pub fn from_snapshot(snapshot: &GatewayUsageSnapshot) -> Self {
+impl FrontdoorUsageMetrics {
+    pub fn from_snapshot(snapshot: &FrontdoorUsageSnapshot) -> Self {
         Self {
             updated_at: snapshot.generated_at,
             window_seconds: snapshot.window_seconds,
@@ -116,9 +116,10 @@ impl GatewayUsageMetrics {
         self.window.generation_tokens_per_second()
     }
 
-    /// True when the numbers still describe a running gateway.
+    /// True when the numbers still describe a running frontdoor.
     pub fn is_fresh(&self, now: u64) -> bool {
-        self.updated_at != 0 && now.saturating_sub(self.updated_at) <= GATEWAY_USAGE_MAX_AGE_SECONDS
+        self.updated_at != 0
+            && now.saturating_sub(self.updated_at) <= FRONTDOOR_USAGE_MAX_AGE_SECONDS
     }
 
     pub fn to_platform_metrics(&self) -> BTreeMap<String, String> {
@@ -147,7 +148,7 @@ impl GatewayUsageMetrics {
     }
 
     /// Rebuild metrics from one peer's `platform_metrics`. Returns `None` when
-    /// the peer runs no gateway or gossiped nothing this schema understands.
+    /// the peer runs no frontdoor or gossiped nothing this schema understands.
     pub fn from_platform_metrics(metrics: &BTreeMap<String, String>) -> Option<Self> {
         let read = |suffix: &str| -> u64 {
             metrics
@@ -193,7 +194,7 @@ mod tests {
 
     #[test]
     fn metrics_round_trip_through_gossip_strings() {
-        let metrics = GatewayUsageMetrics {
+        let metrics = FrontdoorUsageMetrics {
             updated_at: 1_700_000_000,
             window_seconds: 60,
             totals: counts(),
@@ -207,16 +208,16 @@ mod tests {
             Some("120")
         );
         assert_eq!(
-            GatewayUsageMetrics::from_platform_metrics(&gossiped),
+            FrontdoorUsageMetrics::from_platform_metrics(&gossiped),
             Some(metrics)
         );
     }
 
     #[test]
-    fn hosts_without_a_gateway_report_nothing() {
+    fn hosts_without_a_frontdoor_report_nothing() {
         let mut metrics = BTreeMap::new();
         metrics.insert("pressure_cpu".into(), "some cpu=avg10=0".into());
-        assert_eq!(GatewayUsageMetrics::from_platform_metrics(&metrics), None);
+        assert_eq!(FrontdoorUsageMetrics::from_platform_metrics(&metrics), None);
     }
 
     #[test]
@@ -238,13 +239,13 @@ mod tests {
 
     #[test]
     fn stale_snapshots_are_not_current() {
-        let metrics = GatewayUsageMetrics {
+        let metrics = FrontdoorUsageMetrics {
             updated_at: 100,
             window_seconds: 60,
-            ..GatewayUsageMetrics::default()
+            ..FrontdoorUsageMetrics::default()
         };
         assert!(metrics.is_fresh(200));
-        assert!(!metrics.is_fresh(100 + GATEWAY_USAGE_MAX_AGE_SECONDS + 1));
-        assert!(!GatewayUsageMetrics::default().is_fresh(100));
+        assert!(!metrics.is_fresh(100 + FRONTDOOR_USAGE_MAX_AGE_SECONDS + 1));
+        assert!(!FrontdoorUsageMetrics::default().is_fresh(100));
     }
 }
