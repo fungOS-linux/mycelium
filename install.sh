@@ -60,6 +60,8 @@ APP_BUNDLE=
 APP_URL=
 SOIL_RUNTIME=
 SOIL_SOURCE=
+SPORES_SOURCE=
+TERMINAL_HOST_BIN=
 BOB_SRC=
 SCHEDULER_URL=${FPL_BOB_SCHEDULER_URL:-}
 CLIENT_TOKEN=${FPL_BOB_CLIENT_TOKEN:-}
@@ -112,6 +114,8 @@ Component inputs:
   --app PATH             fungOS.app bundle to install
   --app-url URL          .zip containing fungOS.app
   --soil-runtime DIR     soil-home/soil-store/soil-spore/files-serve binaries
+  --spores-src DIR       Spores checkout (contains spores/ and terminal-host/)
+  --terminal-host PATH   prebuilt terminal-host binary (built from --spores-src if omitted)
   --vfs-config PATH      Unibus client config for the VFS content service
   --vfs-root PATH        VFS content root (default ~/fungos-node)
   --vfs-mount PATH       FUSE mount point (default ~/fungOS)
@@ -1016,11 +1020,31 @@ install_soil_spores() {
                 || warn "could not initialize the Soil spores submodule"
         fi
     fi
+    # A standalone Spores checkout is newer than the submodule pinned in Soil;
+    # prefer it when the caller points at one.
+    SPORES_SRC=
+    SPORES_ROOT=
+    if [ -n "$SPORES_SOURCE" ]; then
+        if [ -d "$SPORES_SOURCE/spores" ]; then
+            SPORES_ROOT=$SPORES_SOURCE
+            SPORES_SRC=$SPORES_SOURCE/spores
+        elif [ -d "$SPORES_SOURCE/terminal" ]; then
+            SPORES_SRC=$SPORES_SOURCE
+            SPORES_ROOT=$(dirname "$SPORES_SOURCE")
+        else
+            warn "--spores-src $SPORES_SOURCE has neither spores/ nor terminal/"
+        fi
+    fi
+    if [ -z "$SPORES_SRC" ]; then
+        SPORES_ROOT=$src/spores-public
+        SPORES_SRC=$SPORES_ROOT/spores
+    fi
     if [ "$DRY_RUN" = 1 ]; then
         note "would install baseline Spores under $root"
         if [ "$(uname -s)" = Darwin ]; then
             note "would link $HOME/Library/Application Support/fungOS/spores to $root"
         fi
+        install_terminal_host
         return 0
     fi
     mkdir_p "$root"
@@ -1045,9 +1069,10 @@ install_soil_spores() {
             note "linked app Spore catalog to $root"
         fi
     fi
-    spores_src=$src/spores-public/spores
+    spores_src=$SPORES_SRC
     if [ ! -d "$spores_src" ]; then
         warn "no Spore source tree at $spores_src; the launcher will stay empty until a Spore is installed"
+        install_terminal_host
         return 0
     fi
     for package in "$spores_src"/*; do
@@ -1060,10 +1085,11 @@ install_soil_spores() {
         if [ "$name" = launcher ]; then
             continue
         fi
-        # This is the Canvas host: a Spore with no canvas surface cannot be
-        # opened here, so shipping it would only add a row that fails.
-        if ! spore_has_canvas "$package/spore.toml"; then
-            note "Spore $name has no canvas surface; skipped"
+        # This app opens a Spore on a canvas surface or through the native
+        # host the package names. A Spore that offers neither would only add
+        # a row that fails.
+        if ! spore_has_app_surface "$package/spore.toml"; then
+            note "Spore $name has no canvas or native surface; skipped"
             continue
         fi
         if [ -f "$root/$name/spore.toml" ]; then
@@ -1075,18 +1101,64 @@ install_soil_spores() {
         mkdir_p "$root/$name"
         if cp -R "$package/." "$root/$name/"; then
             note "installed Spore $name"
+            if [ "$name" = terminal ] && ! grep -q '^[[:space:]]*native[[:space:]]*=' "$root/$name/spore.toml"; then
+                warn "the $package terminal package predates [launch] native; pass --spores-src to a newer Spores checkout"
+            fi
         else
             warn "could not install Spore $name"
         fi
     done
+    install_terminal_host
 }
 
-spore_has_canvas() {
-    awk '
+spore_has_app_surface() {
+    if awk '
         /^\[launch\]/ { launch = 1; next }
         /^\[/ { launch = 0 }
         launch && /^[[:space:]]*surfaces[[:space:]]*=/ { print; exit }
-    ' "$1" | grep -q '"canvas"'
+    ' "$1" | grep -q '"canvas"'; then
+        return 0
+    fi
+    # A native-only Spore is launchable only when it names the host that
+    # presents it; otherwise the app has nothing to run.
+    grep -q '^[[:space:]]*native[[:space:]]*=' "$1"
+}
+
+install_terminal_host() {
+    host=$HOME/.local/share/fungos/bin/terminal-host
+    if [ "$DRY_RUN" = 1 ]; then
+        note "would install terminal-host for the terminal Spore"
+        return 0
+    fi
+    if [ -n "$TERMINAL_HOST_BIN" ]; then
+        if [ -x "$TERMINAL_HOST_BIN" ]; then
+            install_atomic "$TERMINAL_HOST_BIN" "$host"
+            note "installed terminal-host from $TERMINAL_HOST_BIN"
+        else
+            warn "--terminal-host $TERMINAL_HOST_BIN is not executable"
+        fi
+        return 0
+    fi
+    if [ -x "$BIN_SRC/terminal-host" ]; then
+        install_atomic "$BIN_SRC/terminal-host" "$host"
+        note "installed terminal-host from $BIN_SRC"
+        return 0
+    fi
+    if [ ! -f "$SPORES_ROOT/Cargo.toml" ] || [ ! -d "$SPORES_SRC/terminal-host" ]; then
+        warn "terminal-host is not available; the terminal Spore will not open"
+        return 0
+    fi
+    if ! ensure_rust; then
+        warn "Rust is unavailable; terminal-host was not built"
+        return 0
+    fi
+    say "Building terminal-host"
+    if ! ( cd "$SPORES_ROOT" && run cargo build --release --locked -p terminal-host ); then
+        warn "terminal-host build failed; the terminal Spore will not open"
+        return 0
+    fi
+    install_atomic "$SPORES_ROOT/target/release/terminal-host" "$host"
+    note "installed terminal-host"
 }
 
 install_soil() {
@@ -1318,6 +1390,8 @@ parse_args() {
             --app) [ $# -ge 2 ] || die "--app needs a bundle path"; APP_BUNDLE=$2; shift 2 ;;
             --app-url) [ $# -ge 2 ] || die "--app-url needs a URL"; APP_URL=$2; shift 2 ;;
             --soil-runtime) [ $# -ge 2 ] || die "--soil-runtime needs a directory"; SOIL_RUNTIME=$2; shift 2 ;;
+            --spores-src) [ $# -ge 2 ] || die "--spores-src needs a directory"; SPORES_SOURCE=$2; shift 2 ;;
+            --terminal-host) [ $# -ge 2 ] || die "--terminal-host needs a path"; TERMINAL_HOST_BIN=$2; shift 2 ;;
             --vfs-config) [ $# -ge 2 ] || die "--vfs-config needs a path"; VFS_CONFIG=$2; shift 2 ;;
             --vfs-root) [ $# -ge 2 ] || die "--vfs-root needs a path"; VFS_ROOT=$2; shift 2 ;;
             --vfs-mount) [ $# -ge 2 ] || die "--vfs-mount needs a path"; VFS_MOUNT=$2; shift 2 ;;
