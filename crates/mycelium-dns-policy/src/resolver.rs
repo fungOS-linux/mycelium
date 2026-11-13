@@ -271,13 +271,6 @@ impl ResolverConfig {
         for server in &self.upstreams {
             config.push_str(&format!("server={}#{}\n", server.ip(), server.port()));
         }
-        // A localhost-only resolver is the bootstrap for local capability
-        // gateways: an unknown `.myc` name means "use the local gateway", while
-        // explicit host records stay more specific. A LAN or fleet resolver must
-        // never hand its own loopback to a client.
-        if self.mode == ResolverMode::LocalhostOnly {
-            config.push_str(&format!("address=/.{}/127.0.0.1\n", self.suffix));
-        }
         // The forwarder is the only default upstream when it is configured.
         if let Some(doh) = &self.doh {
             config.push_str(&format!(
@@ -406,7 +399,13 @@ mod tests {
         let mut flat = remote_record("lab", "neo.myc", "neo");
         flat.address = "fd7a:115c:a1e0::6".parse().unwrap();
         let text = c.render(vec![flat]).unwrap();
-        assert!(text.contains("address=/.myc/127.0.0.1\n"), "{text}");
+        // One rule for the bootstrap: the catch-all is emitted exactly once, so
+        // a reader can point at the single line that answers unknown names.
+        assert_eq!(
+            text.matches("address=/.myc/127.0.0.1\n").count(),
+            1,
+            "{text}"
+        );
         assert!(text.contains("local=/neo.myc/\n"), "{text}");
         assert!(text.contains("host-record=neo.myc,fd7a:115c:a1e0::6\n"));
 
