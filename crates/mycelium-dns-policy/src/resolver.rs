@@ -330,9 +330,27 @@ impl ResolverConfig {
                 config.push_str(&format!("address=/{namespace}/{address}\n"));
             }
         }
+        // The local-gateway bootstrap answers A for every name under the suffix.
+        // A published name with no IPv4 address of its own would then hand a
+        // client 127.0.0.1 — a node name that reaches the local host instead of
+        // the node (an AAAA-only flat name, or a site name whose IPv4 is outside
+        // the declared scopes). A more specific `local=` wins over the broader
+        // `address=`, so A gets no answer while the AAAA record still answers.
+        let mut bootstrap_exclusions = String::new();
+        if self.mode == ResolverMode::LocalhostOnly {
+            let mut names = std::collections::BTreeMap::<&str, bool>::new();
+            for record in &admitted_records {
+                let has_v4 = names.entry(record.name.as_str()).or_insert(false);
+                *has_v4 |= record.address.is_ipv4();
+            }
+            for (name, _) in names.iter().filter(|(_, has_v4)| !**has_v4) {
+                bootstrap_exclusions.push_str(&format!("local=/{name}/\n"));
+            }
+        }
         for additional_zone in additional_zones {
             config.push_str(&additional_zone.dnsmasq);
         }
+        config.push_str(&bootstrap_exclusions);
         Ok(config)
     }
 
@@ -381,6 +399,26 @@ mod tests {
             address: "192.0.2.20".parse().unwrap(),
         }
     }
+    #[test]
+    fn an_ipv6_only_name_does_not_inherit_the_gateway_bootstrap() {
+        let mut c = config();
+        // AAAA-only: the bootstrap must not answer A with loopback.
+        let mut flat = remote_record("lab", "neo.myc", "neo");
+        flat.address = "fd7a:115c:a1e0::6".parse().unwrap();
+        let text = c.render(vec![flat]).unwrap();
+        assert!(text.contains("address=/.myc/127.0.0.1\n"), "{text}");
+        assert!(text.contains("local=/neo.myc/\n"), "{text}");
+        assert!(text.contains("host-record=neo.myc,fd7a:115c:a1e0::6\n"));
+
+        // Dual-stack: the A record answers, so the name needs no suppression.
+        let mut both = remote_record("lab", "neo.lab.myc", "neo");
+        both.address = "fd7a:115c:a1e0::6".parse().unwrap();
+        let text = c
+            .render(vec![both, remote_record("lab", "neo.lab.myc", "neo")])
+            .unwrap();
+        assert!(!text.contains("local=/neo.lab.myc/\n"), "{text}");
+    }
+
     #[test]
     fn owned_namespace_uses_only_validated_admitted_remote_site() {
         let mut c = config();

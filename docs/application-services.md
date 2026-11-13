@@ -67,6 +67,12 @@ ULA space always publishes, everything else only inside a scope the installed
 policy declares reachable (`reachable_prefixes`). `mycelium dns zone --reachable
 CIDR...` previews an ad-hoc scope on a host with no installed resolver.
 
+A localhost-only resolver keeps its local-gateway bootstrap (`address=/.myc/127.0.0.1`
+for unknown names), but every published name that has no IPv4 address of its own
+gets a more specific `local=/<name>/` in front of it. Without that, an A query for
+an AAAA-only flat name would inherit `127.0.0.1` and a client would reach the local
+host instead of the node.
+
 A service name resolves to the address of the host record it is projected onto,
 not an address of its own (`project_service_records`). Services project onto site
 records only: a flat service name would collide across sites, and a service is an
