@@ -48,6 +48,25 @@ if they must start before a login session exists.
 | Geode (opt-in) | Installs the `geoded` broker and a user service with a private store under `~/.geode`. Re-run with `--geode` to upgrade it; omitting the flag leaves an existing service alone. |
 | Build offload (default) | Builds `fpl-bob`, writes the sccache client configuration, and records the optional sccache-dist scheduler and remote build hosts. |
 
+## Prebuilt releases
+
+`--release` installs a published release archive instead of building the
+workspace:
+
+```sh
+./install.sh --release latest
+./install.sh --release 0.2.0
+./install.sh --release 0.2.0 --release-base https://mirror.example/mycelium
+```
+
+The installer reads `release-metadata.json` from the release, selects the
+archive for this platform (musl or gnu on Linux), and requires the archive to
+match both the metadata `sha256` and the aggregate `SHA256SUMS` before unpacking
+anything. `--release` cannot be combined with `--source` or `--bin-dir`; if the
+release or the platform archive is missing, the install stops instead of
+silently falling back to a source build. `--release latest` follows the newest
+published release; pin a version for reproducible installs.
+
 ## Joining a principal or fleet
 
 A join code is minted by an authority and redeemed by the installer. The code
@@ -131,6 +150,9 @@ sudo rm -rf /usr/local/libexec/mycelium /var/run/mycelium
 
 # Use prebuilt binaries instead of building
 ./install.sh --bin-dir target/release
+
+# Download a published release instead of building
+./install.sh --release latest
 
 # Core and DNS only, no enrollment
 ./install.sh --no-enroll --no-vpn --no-vfs --no-soil --no-bob --no-operator

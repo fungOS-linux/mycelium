@@ -31,6 +31,10 @@ SITE=${MYCELIUM_SITE:-}
 ROOT_LIBEXEC=${MYCELIUM_ROOT_LIBEXEC:-/usr/local/libexec/mycelium}
 
 MYCELIUM_REPO=${MYCELIUM_REPO:-https://github.com/fungOS-linux/mycelium.git}
+RELEASE_REPO=${MYCELIUM_RELEASE_REPO:-fungOS-linux/mycelium}
+RELEASE_VERSION=
+RELEASE_BASE=
+RELEASE_DIR=
 IROH_TUN_REPO=${IROH_TUN_REPO:-https://github.com/ajmwagar/iroh-tun.git}
 VFS_REPO=${VFS_REPO:-https://github.com/fungOS-linux/fungos-vfs.git}
 SOIL_REPO=${SOIL_REPO:-https://github.com/fungOS-linux/soil.git}
@@ -97,6 +101,8 @@ Core:
   --enable-updates       keep automatic updates enabled (default: disable for a local build)
   --source DIR           build Mycelium from this checkout
   --bin-dir DIR          install prebuilt binaries from DIR instead of building
+  --release TAG          download published release binaries (TAG, or latest)
+  --release-base URL     override the release download base (mirror or local test dir)
   --prefix DIR           install user binaries under DIR/bin (default ~/.local)
   --force                rebuild iroh-tun instead of reusing the installed binary
 
@@ -306,9 +312,78 @@ mycelium_source() {
     printf '%s' "$cache"
 }
 
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# Release targets to try, most portable first. Releases may carry musl or gnu
+# Linux archives; pick whichever the metadata actually offers.
+release_targets() {
+    case "$(uname -s)/$(uname -m)" in
+        Darwin/arm64) printf 'aarch64-apple-darwin\n' ;;
+        Darwin/x86_64) printf 'x86_64-apple-darwin\n' ;;
+        Linux/x86_64) printf 'x86_64-unknown-linux-musl\nx86_64-unknown-linux-gnu\n' ;;
+        Linux/aarch64|Linux/arm64) printf 'aarch64-unknown-linux-musl\naarch64-unknown-linux-gnu\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+# Download a published release and verify it against the checksum in its
+# release-metadata.json and SHA256SUMS before any binary is installed.
+fetch_release() {
+    command -v curl >/dev/null 2>&1 || die "curl is required to download a release"
+    [ -n "$RELEASE_VERSION" ] || die "--release needs a tag"
+    targets=$(release_targets) || die "no prebuilt Mycelium release for $(uname -s)/$(uname -m)"
+    base=${RELEASE_BASE%/}
+    if [ -z "$base" ]; then
+        case "$RELEASE_VERSION" in
+            latest) base="https://github.com/$RELEASE_REPO/releases/latest/download" ;;
+            v*) base="https://github.com/$RELEASE_REPO/releases/download/$RELEASE_VERSION" ;;
+            *) base="https://github.com/$RELEASE_REPO/releases/download/v$RELEASE_VERSION" ;;
+        esac
+    fi
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/mycelium-release.XXXXXX")
+    RELEASE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mycelium-release.XXXXXX")
+    meta=$tmp/release-metadata.json
+    curl -fsSL "$base/release-metadata.json" -o "$meta" \
+        || die "no release metadata at $base"
+    version=$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$meta" | head -1)
+    line=
+    for target in $targets; do
+        line=$(grep -F "\"target\": \"$target\"" "$meta" | head -1)
+        [ -z "$line" ] || break
+    done
+    archive=$(printf '%s' "$line" | sed -n 's/.*"archive": "\([^"]*\)".*/\1/p')
+    expected=$(printf '%s' "$line" | sed -n 's/.*"sha256": "\([^"]*\)".*/\1/p')
+    [ -n "$version" ] && [ -n "$archive" ] && [ -n "$expected" ] \
+        || die "release metadata has no archive for $(uname -s)/$(uname -m)"
+    say "Downloading Mycelium $version for $target"
+    curl -fsSL "$base/$archive" -o "$tmp/$archive" \
+        || die "could not download $archive"
+    curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" \
+        || die "release is missing SHA256SUMS"
+    sums=$(awk -v name="$archive" '$2 == name { print $1 }' "$tmp/SHA256SUMS" | head -1)
+    [ -n "$sums" ] || die "SHA256SUMS has no entry for $archive"
+    [ "$sums" = "$expected" ] \
+        || die "release metadata and SHA256SUMS disagree for $archive"
+    actual=$(sha256_file "$tmp/$archive")
+    [ "$actual" = "$expected" ] \
+        || die "checksum mismatch for $archive (expected $expected, got $actual)"
+    tar -C "$RELEASE_DIR" -xzf "$tmp/$archive" || die "could not unpack $archive"
+    rm -rf "$tmp"
+    BIN_SRC=$RELEASE_DIR
+    note "verified $archive (sha256 ${expected:0:12})"
+}
+
 install_mycelium() {
     if [ "$DRY_RUN" = 1 ]; then
-        if [ -n "$BIN_SRC" ]; then
+        if [ -n "$RELEASE_VERSION" ]; then
+            note "would download Mycelium release $RELEASE_VERSION for $(uname -s)/$(uname -m)"
+        elif [ -n "$BIN_SRC" ]; then
             note "would install prebuilt binaries from $BIN_SRC"
         else
             note "would build Mycelium from ${SRC:-the checkout or $MYCELIUM_REPO}"
@@ -316,7 +391,9 @@ install_mycelium() {
         note "would install to $BIN_DIR and $LOCAL_BIN"
         return 0
     fi
-    if [ -n "$BIN_SRC" ]; then
+    if [ -n "$RELEASE_VERSION" ]; then
+        fetch_release
+    elif [ -n "$BIN_SRC" ]; then
         [ -d "$BIN_SRC" ] || die "prebuilt directory does not exist: $BIN_SRC"
         note "using prebuilt binaries from $BIN_SRC"
     else
@@ -347,6 +424,10 @@ install_mycelium() {
     done
     if [ -f "$BIN_SRC/mycelium-dns-resolver" ] && [ ! -L "$LOCAL_BIN/mycelium-dns-resolver" ]; then
         install_atomic "$BIN_SRC/mycelium-dns-resolver" "$LOCAL_BIN/mycelium-dns-resolver"
+    fi
+    if [ -n "$RELEASE_DIR" ]; then
+        rm -rf "$RELEASE_DIR"
+        RELEASE_DIR=
     fi
 }
 
@@ -1388,6 +1469,8 @@ parse_args() {
             --claim-file) [ $# -ge 2 ] || die "--claim-file needs a path"; CLAIM_FILE=$2; shift 2 ;;
             --source) [ $# -ge 2 ] || die "--source needs a directory"; SRC=$2; shift 2 ;;
             --bin-dir) [ $# -ge 2 ] || die "--bin-dir needs a directory"; BIN_SRC=$2; shift 2 ;;
+            --release) [ $# -ge 2 ] || die "--release needs a tag"; RELEASE_VERSION=$2; shift 2 ;;
+            --release-base) [ $# -ge 2 ] || die "--release-base needs a URL"; RELEASE_BASE=$2; shift 2 ;;
             --prefix) [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX=$2; LOCAL_BIN=$PREFIX/bin; shift 2 ;;
             --overlay) [ $# -ge 2 ] || die "--overlay needs a CIDR"; OVERLAY=$2; shift 2 ;;
             --tun) [ $# -ge 2 ] || die "--tun needs an interface"; TUN=$2; shift 2 ;;
@@ -1470,6 +1553,10 @@ resume_updater() {
 
 main() {
     parse_args "$@"
+    if [ -n "$RELEASE_VERSION" ]; then
+        [ -z "$BIN_SRC" ] || die "--release and --bin-dir are mutually exclusive"
+        [ -z "$SRC" ] || die "--release and --source are mutually exclusive"
+    fi
     # A join code is meant to be consumed without a conversation. `curl | bash`
     # leaves stdin as a pipe while /dev/tty still exists, so test stdin: piping
     # the installer with a code selects the documented component defaults
@@ -1523,4 +1610,7 @@ main() {
     final_check
 }
 
-main "$@"
+# Unit tests source the helpers without running an install.
+if [ "${MYCELIUM_INSTALL_LIB:-0}" != 1 ]; then
+    main "$@"
+fi

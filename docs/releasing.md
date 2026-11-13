@@ -92,6 +92,12 @@ when replacing a bad asset deliberately.
 `--draft` creates a draft release for multi-host collection. Finish it with
 `gh release edit v0.2.0 --draft=false` after every target has uploaded.
 
+Publishing also enables the installer's `--release` path. The installer reads
+`release-metadata.json`, selects the archive for the platform, and requires it to
+match both the metadata `sha256` and the aggregate `SHA256SUMS` before unpacking
+anything. Keep both assets in every release: `--release` refuses to install a
+release that is missing either.
+
 ## Remote Linux builds
 
 A macOS release host can send Linux builds to an x86_64 Linux worker through
