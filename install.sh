@@ -59,6 +59,7 @@ STATUS_PATH=
 APP_BUNDLE=
 APP_URL=
 SOIL_RUNTIME=
+SOIL_SOURCE=
 BOB_SRC=
 SCHEDULER_URL=${FPL_BOB_SCHEDULER_URL:-}
 CLIENT_TOKEN=${FPL_BOB_CLIENT_TOKEN:-}
@@ -978,10 +979,14 @@ install_user_unit() {
 build_soil_cli() {
     if [ -x "$BIN_SRC/soil" ]; then
         install_atomic "$BIN_SRC/soil" "$LOCAL_BIN/soil"
+        # Spores still come from a source tree; a prebuilt CLI does not carry
+        # them. Prefer the checkout this machine already has.
+        SOIL_SOURCE=${SOIL_SRC:-$HOME/Documents/src/fungOS-linux/soil}
         return
     fi
     ensure_rust || return 1
     src=${SOIL_SRC:-${XDG_CACHE_HOME:-$HOME/.cache}/mycelium/install-src/soil}
+    SOIL_SOURCE=$src
     mkdir_p "$(dirname "$src")"
     if [ -d "$src/.git" ]; then
         run git -C "$src" fetch --depth 1 origin || return 1
@@ -994,8 +999,99 @@ build_soil_cli() {
     install_atomic "$src/target/release/soil" "$LOCAL_BIN/soil"
 }
 
+install_soil_spores() {
+    root=$HOME/.local/share/fungos/spores
+    src=$SOIL_SOURCE
+    if [ -z "$src" ] || [ ! -d "$src" ]; then
+        src=$HOME/Documents/src/fungOS-linux/soil
+    fi
+    if [ ! -d "$src" ]; then
+        src=${XDG_CACHE_HOME:-$HOME/.cache}/mycelium/install-src/soil
+    fi
+    if [ -d "$src/.git" ] && [ ! -d "$src/spores-public/spores" ]; then
+        if [ "$DRY_RUN" = 1 ]; then
+            note "would initialize the Soil spores submodule"
+        else
+            run git -C "$src" submodule update --init --depth 1 spores-public \
+                || warn "could not initialize the Soil spores submodule"
+        fi
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        note "would install baseline Spores under $root"
+        if [ "$(uname -s)" = Darwin ]; then
+            note "would link $HOME/Library/Application Support/fungOS/spores to $root"
+        fi
+        return 0
+    fi
+    mkdir_p "$root"
+    if [ "$(uname -s)" = Darwin ]; then
+        app_support="$HOME/Library/Application Support/fungOS"
+        app_root=$app_support/spores
+        mkdir_p "$app_support"
+        if [ -L "$app_root" ]; then
+            :
+        elif [ -d "$app_root" ]; then
+            # Preserve a catalog created by an older app, then make the
+            # installer-managed store the single source of truth.
+            for entry in "$app_root"/*; do
+                [ -e "$entry" ] || continue
+                cp -R "$entry" "$root/" || warn "could not merge $entry"
+            done
+            mv "$app_root" "$app_root.pre-$TS"
+            ln -s "$root" "$app_root"
+            note "linked app Spore catalog to $root (previous catalog moved aside)"
+        else
+            ln -s "$root" "$app_root"
+            note "linked app Spore catalog to $root"
+        fi
+    fi
+    spores_src=$src/spores-public/spores
+    if [ ! -d "$spores_src" ]; then
+        warn "no Spore source tree at $spores_src; the launcher will stay empty until a Spore is installed"
+        return 0
+    fi
+    for package in "$spores_src"/*; do
+        name=$(basename "$package")
+        if [ ! -d "$package" ] || [ ! -f "$package/spore.toml" ] \
+            || [ ! -f "$package/module.wasm" ]; then
+            continue
+        fi
+        # The launcher is the app itself, not an app in its own catalogue.
+        if [ "$name" = launcher ]; then
+            continue
+        fi
+        # This is the Canvas host: a Spore with no canvas surface cannot be
+        # opened here, so shipping it would only add a row that fails.
+        if ! spore_has_canvas "$package/spore.toml"; then
+            note "Spore $name has no canvas surface; skipped"
+            continue
+        fi
+        if [ -f "$root/$name/spore.toml" ]; then
+            note "Spore $name is already installed"
+            continue
+        fi
+        # Copy the whole package, not a guessed asset list: the manifest names
+        # what a Spore needs, and a new kind of asset must not silently vanish.
+        mkdir_p "$root/$name"
+        if cp -R "$package/." "$root/$name/"; then
+            note "installed Spore $name"
+        else
+            warn "could not install Spore $name"
+        fi
+    done
+}
+
+spore_has_canvas() {
+    awk '
+        /^\[launch\]/ { launch = 1; next }
+        /^\[/ { launch = 0 }
+        launch && /^[[:space:]]*surfaces[[:space:]]*=/ { print; exit }
+    ' "$1" | grep -q '"canvas"'
+}
+
 install_soil() {
     if [ "$DRY_RUN" = 1 ]; then
+        install_soil_spores
         if [ "$(uname -s)" = Darwin ]; then
             note "would build Soil, install fungOS.app, and set up the runtime"
         else
@@ -1010,6 +1106,7 @@ install_soil() {
     else
         warn "soil CLI build failed; continuing with the runtime and fungOS.app"
     fi
+    install_soil_spores
     mkdir_p "$HOME/.local/share/fungos/bin" "$HOME/.local/share/fungos/store" \
         "$HOME/.local/share/fungos/spores" "$HOME/.local/share/fungos/packages" \
         "$HOME/.local/share/fungos/media" "$HOME/.local/share/fungos/records" \
