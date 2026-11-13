@@ -114,8 +114,8 @@ Component inputs:
   --app PATH             fungOS.app bundle to install
   --app-url URL          .zip containing fungOS.app
   --soil-runtime DIR     soil-home/soil-store/soil-spore/files-serve binaries
-  --spores-src DIR       Spores checkout (contains spores/ and terminal-host/)
-  --terminal-host PATH   prebuilt terminal-host binary (built from --spores-src if omitted)
+  --spores-src DIR       Spores checkout (contains spores/)
+  --terminal-host PATH   prebuilt terminal-host binary (built from the Soil checkout if omitted)
   --vfs-config PATH      Unibus client config for the VFS content service
   --vfs-root PATH        VFS content root (default ~/fungos-node)
   --vfs-mount PATH       FUSE mount point (default ~/fungOS)
@@ -1044,7 +1044,7 @@ install_soil_spores() {
         if [ "$(uname -s)" = Darwin ]; then
             note "would link $HOME/Library/Application Support/fungOS/spores to $root"
         fi
-        install_terminal_host
+        install_terminal_host "$src"
         return 0
     fi
     mkdir_p "$root"
@@ -1108,7 +1108,7 @@ install_soil_spores() {
             warn "could not install Spore $name"
         fi
     done
-    install_terminal_host
+    install_terminal_host "$src"
 }
 
 spore_has_app_surface() {
@@ -1126,6 +1126,9 @@ spore_has_app_surface() {
 
 install_terminal_host() {
     host=$HOME/.local/share/fungos/bin/terminal-host
+    # `terminal-host` is a Soil crate: it implements `soil:mycelium` and the
+    # terminal surface, so it builds from the Soil checkout, not Spores.
+    src=${1:-$SOIL_SOURCE}
     if [ "$DRY_RUN" = 1 ]; then
         note "would install terminal-host for the terminal Spore"
         return 0
@@ -1144,7 +1147,7 @@ install_terminal_host() {
         note "installed terminal-host from $BIN_SRC"
         return 0
     fi
-    if [ ! -f "$SPORES_ROOT/Cargo.toml" ] || [ ! -d "$SPORES_SRC/terminal-host" ]; then
+    if [ -z "$src" ] || [ ! -d "$src/crates/terminal-host" ]; then
         warn "terminal-host is not available; the terminal Spore will not open"
         return 0
     fi
@@ -1153,11 +1156,11 @@ install_terminal_host() {
         return 0
     fi
     say "Building terminal-host"
-    if ! ( cd "$SPORES_ROOT" && run cargo build --release --locked -p terminal-host ); then
+    if ! ( cd "$src" && run cargo build --release --locked -p terminal-host ); then
         warn "terminal-host build failed; the terminal Spore will not open"
         return 0
     fi
-    install_atomic "$SPORES_ROOT/target/release/terminal-host" "$host"
+    install_atomic "$src/target/release/terminal-host" "$host"
     note "installed terminal-host"
 }
 
