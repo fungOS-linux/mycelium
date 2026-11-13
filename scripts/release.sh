@@ -30,6 +30,7 @@ GH_REPO=${GH_REPO:-}
 SIGNING_KEY=${MYCELIUM_RELEASE_SIGNING_KEY:-}
 APPLE_IDENTITY=${APPLE_SIGNING_IDENTITY:-}
 REMOTE_HOST=${MYCELIUM_RELEASE_REMOTE_HOST:-}
+REMOTE_MAC_HOST=${MYCELIUM_RELEASE_REMOTE_MAC_HOST:-}
 REMOTE_CLEAN=0
 REMOTE_SESSION_PREFIX=${MYCELIUM_RELEASE_SESSION_PREFIX:-mycelium-release}
 FPL_BOB=${MYCELIUM_RELEASE_FPL_BOB:-fpl-bob}
@@ -71,8 +72,9 @@ Targets:
                                 armv7-unknown-linux-gnueabihf,
                                 x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 
-Remote Linux builds:
+Remote builds:
   --remote-host HOST     build Linux targets on HOST through `fpl-bob remote`
+  --remote-mac-host HOST build macOS targets on HOST through `fpl-bob remote`
   --remote-clean         remove the remote workspace after copy-back
   --remote-session NAME  remote session prefix (default mycelium-release)
 
@@ -116,6 +118,7 @@ while [ $# -gt 0 ]; do
         --mesh) MESH=1; shift ;;
         --signing-key) [ $# -ge 2 ] || die "--signing-key needs a path"; SIGNING_KEY=$2; shift 2 ;;
         --remote-host) [ $# -ge 2 ] || die "--remote-host needs a host"; REMOTE_HOST=$2; shift 2 ;;
+        --remote-mac-host) [ $# -ge 2 ] || die "--remote-mac-host needs a host"; REMOTE_MAC_HOST=$2; shift 2 ;;
         --remote-clean) REMOTE_CLEAN=1; shift ;;
         --remote-session) [ $# -ge 2 ] || die "--remote-session needs a name"; REMOTE_SESSION_PREFIX=$2; shift 2 ;;
         --watch) WATCH=1; PUBLISH=1; shift ;;
@@ -215,13 +218,17 @@ build_target() {
             -p mycelium-cli --features mycelium-cli/iroh-sync
             -p mycelium-frontdoor -p mycelium-driver-dnsmasq -p geoded -p myceliumd)
     fi
-    local remote=0
+    local remote=0 remote_host=
     if [ -n "$REMOTE_HOST" ] && [[ "$target" == *-linux-* ]]; then
         remote=1
+        remote_host=$REMOTE_HOST
+    elif [ -n "$REMOTE_MAC_HOST" ] && [[ "$target" == *-apple-darwin ]]; then
+        remote=1
+        remote_host=$REMOTE_MAC_HOST
     fi
     if [ "$remote" = 1 ]; then
         command -v "$FPL_BOB" >/dev/null 2>&1 \
-            || die "--remote-host needs fpl-bob on PATH (or set MYCELIUM_RELEASE_FPL_BOB)"
+            || die "remote builds need fpl-bob on PATH (or set MYCELIUM_RELEASE_FPL_BOB)"
         # The remote host must already have the target installed and, for the
         # GNU ARM target, the matching cross linker. agora-one currently has
         # aarch64-unknown-linux-gnu and aarch64-linux-gnu-gcc.
@@ -237,10 +244,10 @@ build_target() {
         fi
         local session="${REMOTE_SESSION_PREFIX}-${VERSION}-${target}"
         session=$(printf '%s' "$session" | tr -c 'A-Za-z0-9_.-' '-')
-        local bob_args=(remote --host "$REMOTE_HOST" --session "$session" \
+        local bob_args=(remote --host "$remote_host" --session "$session" \
             --back "target/$target/release")
         [ "$REMOTE_CLEAN" = 1 ] && bob_args+=(--clean)
-        say "Building $target on $REMOTE_HOST through fpl-bob remote"
+        say "Building $target on $remote_host through fpl-bob remote"
         if [ "$DRY_RUN" = 1 ]; then
             note "+ $FPL_BOB ${bob_args[*]} -- ${remote_build[*]}"
             note "would stage $stage"
@@ -433,6 +440,7 @@ watch_tags() {
             [ -n "$GH_REPO" ] && args+=(--repo "$GH_REPO")
             [ -n "$APPLE_IDENTITY" ] && args+=(--apple-identity "$APPLE_IDENTITY")
             [ -n "$REMOTE_HOST" ] && args+=(--remote-host "$REMOTE_HOST" --remote-session "$REMOTE_SESSION_PREFIX")
+            [ -n "$REMOTE_MAC_HOST" ] && args+=(--remote-mac-host "$REMOTE_MAC_HOST")
             [ "$REMOTE_CLEAN" = 1 ] && args+=(--remote-clean)
             [ "$MESH" = 1 ] && args+=(--mesh --signing-key "$SIGNING_KEY")
             if ( cd "$worktree" && "$worktree/scripts/release.sh" "${args[@]}" ); then

@@ -98,7 +98,19 @@ match both the metadata `sha256` and the aggregate `SHA256SUMS` before unpacking
 anything. Keep both assets in every release: `--release` refuses to install a
 release that is missing either.
 
-## Remote Linux builds
+## Remote builds
+
+Both sides can use a build host through `fpl-bob remote`: `--remote-host` for
+Linux targets, `--remote-mac-host` for macOS targets. The host needs `fpl bob
+setup` and the requested Rust target installed.
+
+```sh
+# macOS targets on a studio Mac
+scripts/release.sh --version 0.1.0 \
+  --target aarch64-apple-darwin \
+  --remote-mac-host studio \
+  --publish --draft
+```
 
 A macOS release host can send Linux builds to an x86_64 Linux worker through
 `fpl-bob remote`. The worker needs a Rust toolchain, the requested targets, and
