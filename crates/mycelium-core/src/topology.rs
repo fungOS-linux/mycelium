@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 pub struct VlanId(pub u16);
 
 /// How an address was observed, for trust ranking and provenance.
-#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct Origin {
     pub device: String,
     pub source: String,
@@ -121,7 +121,7 @@ pub struct Segment {
     pub origins: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LeaseRecord {
     pub ip: IpAddr,
     pub mac: MacAddress,
@@ -568,8 +568,13 @@ impl Topology {
                 }
             }
         }
+        let mut known: std::collections::HashSet<LeaseRecord> =
+            self.leases.iter().cloned().collect();
         for lease in other.leases {
-            if !self.leases.contains(&lease) {
+            // A linear `contains` per lease made every merge O(n^2) memcmp over
+            // the whole table. A peer that keeps resending one large topology
+            // snapshot then pins every runtime thread in this loop.
+            if known.insert(lease.clone()) {
                 self.leases.push(lease);
             }
         }
@@ -591,8 +596,10 @@ impl Topology {
                 self.conflicts.push(conflict);
             }
         }
+        let mut known_origins: std::collections::HashSet<Origin> =
+            self.updated_from.iter().cloned().collect();
         for origin in other.updated_from {
-            if !self.updated_from.contains(&origin) {
+            if known_origins.insert(origin.clone()) {
                 self.updated_from.push(origin);
             }
         }
