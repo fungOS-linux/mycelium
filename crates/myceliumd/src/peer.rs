@@ -2214,6 +2214,24 @@ fn is_public_mac(value: &str) -> bool {
     value != "00:00:00:00:00:00" && value.split(':').count() == 6
 }
 
+/// Addresses this host actually holds on the overlay interface.
+///
+/// An overlay attachment is only real where the kernel holds an address for it.
+/// Reporting nothing before the WireGuard configuration is applied is the honest
+/// answer; inventing an address from the credential would publish a name no
+/// packet can reach.
+pub(crate) fn local_overlay_addresses(interface: &str) -> Vec<IpAddr> {
+    overlay_addresses(&collect_interfaces(), interface)
+}
+
+fn overlay_addresses(observed: &[PeerInterface], interface: &str) -> Vec<IpAddr> {
+    observed
+        .iter()
+        .filter(|candidate| candidate.name == interface)
+        .flat_map(|candidate| candidate.addresses.iter().copied())
+        .collect()
+}
+
 /// Interfaces whose addresses describe where a node can be reached.
 ///
 /// Container, VM, and tunnel bridges can number in the hundreds on a busy
@@ -3001,6 +3019,31 @@ fn parse_darwin_swap(text: &str) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_addresses_come_from_the_named_interface_only() {
+        let observed = vec![
+            PeerInterface {
+                name: "en0".into(),
+                mac: None,
+                addresses: vec!["192.168.2.3".parse().unwrap()],
+            },
+            PeerInterface {
+                name: "mycelium0".into(),
+                mac: None,
+                addresses: vec!["10.9.0.1".parse().unwrap(), "fd00:9::1".parse().unwrap()],
+            },
+        ];
+        assert_eq!(
+            overlay_addresses(&observed, "mycelium0"),
+            vec![
+                "10.9.0.1".parse::<IpAddr>().unwrap(),
+                "fd00:9::1".parse().unwrap()
+            ]
+        );
+        // No interface means no address; the attachment is not claimed yet.
+        assert!(overlay_addresses(&observed, "utun9").is_empty());
+    }
 
     #[test]
     fn container_and_tunnel_bridges_are_not_advertised() {

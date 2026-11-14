@@ -474,10 +474,12 @@ impl Daemon {
                     .unwrap_or_else(|| binding.hostname.clone());
                 Observation::OverlaySelf {
                     device,
-                    ips: Vec::new(),
+                    // The address a peer dials is the one the kernel holds, not
+                    // one the credential implies.
+                    ips: crate::peer::local_overlay_addresses(crate::OVERLAY_INTERFACE),
                     hostname: binding.hostname.clone(),
                     record: OverlayPeerRecord {
-                        network: "mycelium0".into(),
+                        network: crate::OVERLAY_INTERFACE.into(),
                         protocol: MeshProtocol::WireGuard,
                         control_plane: MeshControlPlane {
                             coordinator: MeshCoordinator::Custom,

@@ -223,6 +223,12 @@ pub fn wireguard_dir() -> PathBuf {
     home_dir().join("wireguard")
 }
 
+/// The interface a WireGuard overlay attaches to.
+///
+/// Overlay records are keyed by this network name, so the daemon's own record
+/// and the peers that read it must agree on one spelling.
+pub const OVERLAY_INTERFACE: &str = "mycelium0";
+
 pub fn wireguard_private_key_path() -> PathBuf {
     wireguard_dir().join("private.key")
 }
