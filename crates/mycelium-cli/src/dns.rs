@@ -149,6 +149,9 @@ pub(crate) async fn live_prefixes(site: &str) -> Result<Vec<String>, String> {
             continue;
         }
         for address in node.ips.keys() {
+            if is_foreign_overlay(address) {
+                continue;
+            }
             if let Some(prefix) = covering_prefix(*address) {
                 prefixes.insert(prefix);
             }
@@ -166,6 +169,23 @@ pub(crate) async fn live_prefixes(site: &str) -> Result<Vec<String>, String> {
         ));
     }
     Ok(prefixes.into_iter().collect())
+}
+
+/// Another mesh's unique-local address is not a network this site routes.
+///
+/// Our own overlay publishes by identity, and anything else in `fc00::/7`
+/// belongs to a mesh we do not control. Treating it as a reachable scope made
+/// `.myc` records depend on that mesh: on this fleet every site picked up
+/// Tailscale's `fd7a:115c:a1e0::/48` and published tailnet addresses as if they
+/// were ours.
+fn is_foreign_overlay(address: &std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xfe00) == 0xfc00
+                && !mycelium_dns_policy::addresses::is_overlay(*address)
+        }
+        std::net::IpAddr::V4(_) => false,
+    }
 }
 
 /// Container bridges and hypervisor NAT ranges are reported by every host that
@@ -337,5 +357,17 @@ mod tests {
         std::fs::write(&path, "node.myc\n").unwrap();
         assert!(blocklist(&args(&["plan", "--source", &source])).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn another_meshs_overlay_is_not_a_reachable_scope() {
+        // Tailscale hands its nodes unique-local addresses; they are a mesh we
+        // do not control, not a network this site routes.
+        for foreign in ["fd7a:115c:a1e0::6", "fd00::1"] {
+            assert!(is_foreign_overlay(&foreign.parse().unwrap()), "{foreign}");
+        }
+        assert!(!is_foreign_overlay(&"fd7a:115c:a1f0::6".parse().unwrap()));
+        assert!(!is_foreign_overlay(&"192.168.10.30".parse().unwrap()));
+        assert!(!is_foreign_overlay(&"2001:db8::30".parse().unwrap()));
     }
 }
