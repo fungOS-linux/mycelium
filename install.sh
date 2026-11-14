@@ -52,6 +52,7 @@ SOIL=ask
 BOB=ask
 OPERATOR=ask
 GEODE=ask
+FRONTDOOR=ask
 TRUST_CERT=ask
 PROFILE=full
 VFS_ROLE=full
@@ -81,6 +82,7 @@ VFS_CONFIG=
 VFS_ROOT=${MYCELIUM_VFS_ROOT:-$HOME/fungos-node}
 VFS_MOUNT=${MYCELIUM_VFS_MOUNT:-$HOME/fungOS}
 FAILED=
+UNSTARTED=
 SUDO=
 LOG=
 UPDATER_PAUSED=0
@@ -117,6 +119,10 @@ Components:
   --operator / --no-operator
                          frontdoor, skills, completions, update policy (default yes)
   --geode / --no-geode   optional geode credential broker (default no)
+  --frontdoor / --no-frontdoor
+                         loopback HTTPS frontdoor plus its ingress services
+                         (default yes; runs on its own service so a node profile
+                         keeps the ingress without the operator surface)
 
 Profiles:
   --profile NAME         preset components: full (default), canvas, node, flash,
@@ -616,18 +622,29 @@ install_dns() {
         "$ROOT_LIBEXEC/mycelium" dns resolver system-install --config "$cfg" --write
 }
 
+install_frontdoor() {
+    MYC="$LOCAL_BIN/mycelium"
+    if [ "$DRY_RUN" = 1 ]; then
+        note "would install the loopback frontdoor and its ingress services"
+        return 0
+    fi
+    [ -x "$MYC" ] || die "mycelium was not installed"
+    # `frontdoor install` writes the frontdoor plus the ingress HTTPS/HTTP
+    # service definitions and loads them; the ingress is what publishes the
+    # .myc names, so it is not optional once this component runs.
+    if [ "$TRUST_CERT" = yes ] \
+        || { [ "$TRUST_CERT" = ask ] && ask_yes "Trust the generated frontdoor CA in your login keychain?" yes; }; then
+        run "$MYC" frontdoor install --write --trust-cert
+    else
+        run "$MYC" frontdoor install --write
+    fi
+}
+
 install_operator() {
     MYC="$LOCAL_BIN/mycelium"
     if [ "$DRY_RUN" = 1 ]; then
-        note "would install the frontdoor, agent skills, shell completions, and update policy"
+        note "would install agent skills, shell completions, and the update policy"
         return 0
-    fi
-    if ask_yes "Install the local HTTPS frontdoor (ai.myc, mcp.myc)?" yes; then
-        if [ "$TRUST_CERT" = yes ] || { [ "$TRUST_CERT" = ask ] && ask_yes "Trust the generated frontdoor CA in your login keychain?" yes; }; then
-            run "$MYC" frontdoor install --write --trust-cert
-        else
-            run "$MYC" frontdoor install --write
-        fi
     fi
     if ask_yes "Install Mycelium agent skills?" yes; then
         target=""
@@ -1433,11 +1450,79 @@ install_bob_from() {
     install_atomic "$src/target/release/fpl-bob" "$LOCAL_BIN/fpl-bob"
 }
 
+# A unit file that exists but is not running is the failure this installer cares
+# about: the component installed and was never started.
+unit_running() { # label unit
+    if [ "$(uname -s)" = Darwin ]; then
+        launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1
+        return
+    fi
+    systemctl --user is-active --quiet "$2.service" 2>/dev/null
+}
+
+check_service() { # label unit human
+    if [ "$(uname -s)" = Darwin ]; then
+        [ -f "$HOME/Library/LaunchAgents/$1.plist" ] || return 0
+    else
+        [ -f "$HOME/.config/systemd/user/$2.service" ] || return 0
+    fi
+    if unit_running "$1" "$2"; then
+        note "$3 is running"
+    else
+        warn "$3 is installed but not running"
+        UNSTARTED="$UNSTARTED $3"
+    fi
+}
+
+check_ingress() {
+    for label in dev.fpl.mycelium-ingress-https dev.fpl.mycelium-ingress-http; do
+        check_service "$label" "${label#dev.fpl.}" "$label"
+    done
+    if [ "$(uname -s)" = Linux ]; then
+        # On Linux these are socket units: the service is inactive until a
+        # connection arrives, so the socket is what has to be enabled.
+        for unit in mycelium-ingress-https mycelium-ingress-http; do
+            path="$HOME/.config/systemd/user/$unit.socket"
+            [ -f "$path" ] || continue
+            if systemctl --user is-active --quiet "$unit.socket" 2>/dev/null; then
+                note "$unit.socket is listening"
+            else
+                warn "$unit.socket is installed but not listening"
+                UNSTARTED="$UNSTARTED $unit.socket"
+            fi
+        done
+    fi
+}
+
 final_check() {
     MYC="$LOCAL_BIN/mycelium"
     if [ "$DRY_RUN" = 1 ]; then
         note "dry run complete; no files or services were changed"
         return 0
+    fi
+    UNSTARTED=
+    if [ "$START" = 1 ]; then
+        say "Checking that installed services are running"
+        check_service dev.fpl.mycelium mycelium myceliumd
+        if [ "$FRONTDOOR" = yes ]; then
+            check_service dev.fpl.mycelium-frontdoor mycelium-frontdoor the-frontdoor
+            check_ingress
+        fi
+        if [ "$VFS" = yes ]; then
+            check_service dev.fungos.vfs-fuse fungos-vfs-fuse the-VFS-mount
+        fi
+        if [ "$SOIL" = yes ]; then
+            check_service dev.fungos.soil-store dev.fungos.soil-store the-Spore-store
+        fi
+        if [ "$VPN" = yes ] && [ -x "$MYC" ]; then
+            if "$MYC" iroh-tun status --json 2>/dev/null \
+                | grep -Eq '"publishing"[[:space:]]*:[[:space:]]*true'; then
+                note "iroh-tun is publishing"
+            else
+                warn "iroh-tun is installed but not publishing"
+                UNSTARTED="$UNSTARTED iroh-tun"
+            fi
+        fi
     fi
     if [ "$START" = 1 ] && [ -x "$MYC" ]; then
         say "Checking the installation"
@@ -1446,6 +1531,10 @@ final_check() {
         else
             warn "doctor reported a problem; see $MYCELIUM_HOME/install-doctor.json"
         fi
+    fi
+    if [ -n "$UNSTARTED" ]; then
+        warn "services that are installed but not running:$UNSTARTED"
+        warn "start them with launchctl bootstrap (macOS) or systemctl --user enable --now (Linux)"
     fi
     if [ -n "$FAILED" ]; then
         warn "components that need attention:$FAILED"
@@ -1479,12 +1568,14 @@ apply_profile() {
             want VFS yes
             want BOB no
             want GEODE no
+            want FRONTDOOR yes
             ;;
         node)
             want SOIL yes
             want BOB no
             want OPERATOR no
             want GEODE no
+            want FRONTDOOR yes
             ;;
         flash)
             want SOIL yes
@@ -1492,6 +1583,7 @@ apply_profile() {
             want BOB no
             want OPERATOR no
             want GEODE no
+            want FRONTDOOR yes
             want VFS_ROLE cache
             ;;
         minimal)
@@ -1501,11 +1593,12 @@ apply_profile() {
             want BOB no
             want OPERATOR no
             want GEODE no
+            want FRONTDOOR no
             ;;
         *) die "unknown profile: $PROFILE (full, canvas, node, flash, minimal)" ;;
     esac
     if [ "$PROFILE" != full ]; then
-        note "profile $PROFILE: vpn=$VPN vfs=$VFS role=$VFS_ROLE soil=$SOIL bob=$BOB operator=$OPERATOR geode=$GEODE"
+        note "profile $PROFILE: vpn=$VPN vfs=$VFS role=$VFS_ROLE soil=$SOIL bob=$BOB operator=$OPERATOR frontdoor=$FRONTDOOR geode=$GEODE"
     fi
 }
 
@@ -1531,6 +1624,8 @@ parse_args() {
             --no-operator) OPERATOR=no; declared OPERATOR; shift ;;
             --geode) GEODE=yes; declared GEODE; shift ;;
             --no-geode) GEODE=no; declared GEODE; shift ;;
+            --frontdoor) FRONTDOOR=yes; declared FRONTDOOR; shift ;;
+            --no-frontdoor) FRONTDOOR=no; declared FRONTDOOR; shift ;;
             --profile) [ $# -ge 2 ] || die "--profile needs a name"; PROFILE=$2; shift 2 ;;
             --vfs-role) [ $# -ge 2 ] || die "--vfs-role needs full or cache"; VFS_ROLE=$2; declared VFS_ROLE; shift 2 ;;
             --trust-cert) TRUST_CERT=yes; shift ;;
@@ -1659,7 +1754,8 @@ main() {
     choose VFS yes "Install the content VFS (fungos-vfs + FUSE/LaunchAgent)?"
     choose SOIL yes "Install Soil and fungOS.app?"
     choose BOB yes "Install build offload (fpl-bob + sccache)?"
-    choose OPERATOR yes "Configure the operator surface (frontdoor, skills, completions)?"
+    choose OPERATOR yes "Configure the operator surface (skills, completions, update policy)?"
+    choose FRONTDOOR yes "Install the loopback frontdoor and its ingress services?"
     choose GEODE no "Install the optional geode credential broker?"
     if [ "$ENROLL" = ask ]; then
         if ask_yes "Enroll or repair this node's fleet membership?" yes; then ENROLL=yes; else ENROLL=no; fi
@@ -1675,6 +1771,7 @@ main() {
     setup_node
     if [ "$VPN" = yes ]; then run_component vpn install_vpn; fi
     run_component dns install_dns
+    if [ "$FRONTDOOR" = yes ]; then run_component frontdoor install_frontdoor; fi
     if [ "$OPERATOR" = yes ]; then run_component operator install_operator; fi
     if [ "$GEODE" = yes ]; then run_component geode install_geode; fi
     if [ "$VFS" = yes ]; then run_component vfs install_vfs; fi
