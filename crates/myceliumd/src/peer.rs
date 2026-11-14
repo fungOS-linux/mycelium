@@ -1282,6 +1282,13 @@ impl Mesh {
             if matches!(envelope.event, PeerEvent::Unknown) {
                 continue;
             }
+            if let Some(bytes) = observation_too_large(&envelope) {
+                eprintln!(
+                    "myceliumd: rejecting oversized {} byte observation from {}",
+                    bytes, envelope.origin
+                );
+                continue;
+            }
             let authorized = envelope.origin == self.hello.node_id
                 || self
                     .allowed_origins
@@ -1706,6 +1713,15 @@ impl Drop for TcpRegistration<'_> {
     }
 }
 
+/// Observations that cannot fit one gossip message can never be delivered: the
+/// sender drops them, the store keeps them, and every digest repeats the work
+/// against a peer that is permanently behind on that entry. Measure once and
+/// refuse them at every entry point instead.
+fn observation_too_large(envelope: &SignedEnvelope) -> Option<usize> {
+    let bytes = serde_json::to_vec(envelope).ok()?.len();
+    (bytes > MAX_OBSERVATION_MESSAGE_BYTES).then_some(bytes)
+}
+
 fn observation_batches(
     observations: Vec<SignedEnvelope>,
 ) -> Result<Vec<Vec<SignedEnvelope>>, AnyError> {
@@ -1715,10 +1731,9 @@ fn observation_batches(
     for observation in observations {
         let bytes = serde_json::to_vec(&observation)?.len() + 1;
         if bytes > MAX_OBSERVATION_MESSAGE_BYTES {
-            eprintln!(
-                "myceliumd: skipping oversized {} byte observation from {}",
-                bytes, observation.origin
-            );
+            // Ingest rejects these, so reaching here means a store written by an
+            // older version still holds one. Skip it without logging: this runs
+            // on every digest and a log line here is a busy loop.
             continue;
         }
         if !current.is_empty()
@@ -1885,6 +1900,7 @@ fn validated_observations(
         .into_iter()
         .filter(|envelope| {
             !matches!(envelope.event, PeerEvent::Unknown)
+                && observation_too_large(envelope).is_none()
                 && envelope.verify().is_ok()
                 && event_origin_matches(envelope)
                 && (envelope.origin == local_node_id
@@ -3231,6 +3247,40 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 1);
         assert!(matches!(batches[0][0].event, PeerEvent::Hello(_)));
+    }
+
+    #[test]
+    fn oversized_observation_is_refused_at_ingest() {
+        let key = SigningKey::from_bytes(&[33; 32]);
+        let oversized = SignedEnvelope::sign(
+            &key,
+            1,
+            1,
+            PeerEvent::Topology(TopologySnapshot {
+                schema_version: 1,
+                topology: serde_json::json!({"payload": "x".repeat(MAX_OBSERVATION_MESSAGE_BYTES)}),
+            }),
+        )
+        .unwrap();
+        let hello =
+            SignedEnvelope::sign(&key, 2, 2, PeerEvent::Hello(test_hello(&key))).unwrap();
+
+        assert!(observation_too_large(&oversized).is_some());
+        assert!(observation_too_large(&hello).is_none());
+
+        // The store must never hold an entry the gossip sender will always drop,
+        // or every digest re-measures it and the daemon spins.
+        let node_id = encode_hex(key.verifying_key().as_bytes());
+        let accepted = validated_observations(
+            vec![oversized, hello.clone()],
+            &node_id,
+            None,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(accepted.len(), 1, "only the deliverable observation is kept");
+        assert!(accepted.contains_key(&event_key(&hello)));
     }
 
     fn test_hello(key: &SigningKey) -> PeerHello {
