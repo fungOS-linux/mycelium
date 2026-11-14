@@ -541,7 +541,7 @@ fn xml(value: &str) -> String {
 /// state directory never collides with the user's `~/.mycelium/dns`.
 fn daemon_plist(executable: &Path, config: &Path, home: &Path, mesh: &Path, log: &Path) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{DAEMON_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>dns</string><string>resolver</string><string>run</string><string>--config</string><string>{}</string><string>--write</string></array>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>MYCELIUM_HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{DAEMON_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>dns</string><string>resolver</string><string>run</string><string>--config</string><string>{}</string><string>--write</string></array>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>MYCELIUM_HOME</key><string>{}</string><key>MYCELIUM_NO_AUTOSTART</key><string>1</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
         xml(&executable.to_string_lossy()),
         xml(&config.to_string_lossy()),
         xml(&home.to_string_lossy()),
@@ -567,7 +567,7 @@ fn launch_plist(executable: &Path, config: &Path, directory: &Path) -> String {
         .map(|a| format!("<string>{}</string>", xml(a)))
         .collect::<String>();
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array>{args}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>15</integer><key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array>{args}</array><key>EnvironmentVariables</key><dict><key>MYCELIUM_NO_AUTOSTART</key><string>1</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>15</integer><key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
         xml(&directory.join("resolver.log").display().to_string()),
         xml(&directory.join("resolver.log").display().to_string())
     )
@@ -1679,6 +1679,9 @@ mod tests {
         assert!(p.contains("A &amp; B"));
         assert!(p.contains("<string>resolver</string>"));
         assert!(!p.contains("/bin/sh"));
+        // The companion asks the daemon for records; spawning one here would
+        // race launchd's peer for the socket.
+        assert!(p.contains("<key>MYCELIUM_NO_AUTOSTART</key><string>1</string>"));
     }
     #[test]
     fn truncated_dns_names_fail_without_panicking() {
@@ -1843,6 +1846,7 @@ mod tests {
         );
         assert!(plist.contains("<string>/x/mycelium</string>"));
         assert!(plist.contains("<string>--config</string>"));
+        assert!(plist.contains("<key>MYCELIUM_NO_AUTOSTART</key><string>1</string>"));
         assert!(plist.contains("<key>HOME</key><string>/var/db/mycelium-dns</string>"));
         // Observations come from the user's daemon socket, not root's state.
         assert!(plist.contains("<key>MYCELIUM_HOME</key><string>/Users/a/.mycelium</string>"));
