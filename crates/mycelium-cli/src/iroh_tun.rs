@@ -15,10 +15,33 @@ pub async fn run(args: &[String]) -> Result<Vec<String>, String> {
     match args.first().map(String::as_str).unwrap_or("status") {
         "status" => status(&args[1..]).await,
         "config" => config(&args[1..]).await,
+        "address" => address(&args[1..]).await,
         other => Err(format!(
-            "unknown iroh-tun action `{other}`; try `status` or `config`"
+            "unknown iroh-tun action `{other}`; try `status`, `config` or `address`"
         )),
     }
+}
+
+/// The overlay address this node owns, derived from its identity.
+///
+/// The installer needs it before any interface exists (it is what the tunnel
+/// assigns), so it must come from identity alone and not from the kernel.
+async fn address(args: &[String]) -> Result<Vec<String>, String> {
+    let json = args.iter().any(|argument| argument == "--json");
+    if let Some(other) = args.iter().find(|argument| argument.as_str() != "--json") {
+        return Err(format!("unknown iroh-tun address argument `{other}`"));
+    }
+    let mut client = crate::connect().await.map_err(access)?;
+    let value = client.call(&Request::IrohTunStatus).await.map_err(access)?;
+    let node = value["node"].as_str().unwrap_or_default();
+    let address = mycelium_dns_policy::addresses::overlay_address(node)
+        .ok_or("the daemon did not report a node identity")?;
+    if json {
+        return Ok(vec![
+            serde_json::json!({"address": format!("{address}/128"), "node": node}).to_string(),
+        ]);
+    }
+    Ok(vec![format!("{address}/128")])
 }
 
 async fn status(args: &[String]) -> Result<Vec<String>, String> {

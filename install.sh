@@ -707,17 +707,11 @@ detect_host_label() {
 }
 
 detect_overlay() {
-    host=$(detect_host_label)
-    json=$("$LOCAL_BIN/mycelium" dns zone --zone flat --suffix "$SUFFIX" --json 2>/dev/null || true)
-    candidate=""
-    if [ -n "$json" ] && command -v jq >/dev/null 2>&1; then
-        candidate=$(printf '%s' "$json" | jq -r --arg n "$host.$SUFFIX" '.[] | select(.name==$n) | .address' 2>/dev/null | grep ':' | head -1 || true)
-    elif [ -n "$json" ]; then
-        candidate=$(printf '%s' "$json" | tr '}' '\n' | grep "\"name\":\"$host.$SUFFIX\"" | grep -o '"address":"[^"]*"' | cut -d'"' -f4 | grep ':' | head -1 || true)
-    fi
-    if [ -n "$candidate" ]; then
-        case "$candidate" in */*) printf '%s' "$candidate" ;; *) printf '%s/128' "$candidate" ;; esac
-    fi
+    # The overlay address derives from the node identity, so it is knowable
+    # before any interface exists. Scraping the published zone used to return
+    # whatever mesh happened to be installed -- on this fleet, Tailscale's
+    # address -- and the tunnel then tried to own an address it could not have.
+    "$LOCAL_BIN/mycelium" iroh-tun address 2>/dev/null || true
 }
 
 detect_tun() {
@@ -727,10 +721,10 @@ detect_tun() {
         done
         printf 'utun220'
     else
-        for n in 0 1 2 3 4 5 6 7 8 9; do
-            if ! ip link show "tun$n" >/dev/null 2>&1; then printf 'tun%s' "$n"; return; fi
-        done
-        printf 'tun0'
+        # One name on every host: the daemon publishes whatever address the
+        # kernel holds on `mycelium0`, so a per-host `tunN` would never be
+        # published and `.myc` would keep pointing somewhere else.
+        printf 'mycelium0'
     fi
 }
 
@@ -888,11 +882,28 @@ set -eu
 export MYCELIUM_HOME='$MYCELIUM_HOME'
 export MYCELIUM_NO_AUTOSTART=1
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-exec '$ROOT_LIBEXEC/iroh-tun' \\
+'$ROOT_LIBEXEC/iroh-tun' \\
   --tun '$tun' --mtu 1280 --refresh-secs 15 \\
   --secret "\$(cat '$key')" \\
   --status-file '$STATUS_PATH' \\
-  --mycelium '$ROOT_LIBEXEC/mycelium'
+  --mycelium '$ROOT_LIBEXEC/mycelium' &
+child=\$!
+# The tunnel owns the device; the address is this node's identity, so give it
+# to the interface as soon as it exists, then stay in the foreground so the
+# service manager still sees one process tree.
+if [ '$(uname -s)' = Linux ]; then
+  i=0
+  while [ \$i -lt 100 ]; do
+    if /usr/sbin/ip link show '$tun' >/dev/null 2>&1 \\
+      || /sbin/ip link show '$tun' >/dev/null 2>&1; then
+      /usr/sbin/ip -6 addr replace '$overlay' dev '$tun' >/dev/null 2>&1 \\
+        || /sbin/ip -6 addr replace '$overlay' dev '$tun' >/dev/null 2>&1 || true
+      break
+    fi
+    i=\$((i+1)); sleep 0.1
+  done
+fi
+wait \$child
 EOF
     root_own "$ROOT_LIBEXEC/iroh-tun-root"
     run_sudo chmod 755 "$ROOT_LIBEXEC/iroh-tun-root"
