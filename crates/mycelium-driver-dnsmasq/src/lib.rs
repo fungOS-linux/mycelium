@@ -1646,7 +1646,7 @@ mod tests {
     fn overlay_addresses_publish_without_a_declared_scope() {
         let mut remote = peer("neo", 999);
         remote["hello"]["interfaces"] = json!([{
-            "addresses": ["fd7a:115c:a1e0::6", "10.9.9.9", "fe80::1"]
+            "addresses": ["fd7a:115c:a1f0::6", "fd7a:115c:a1e0::6", "10.9.9.9", "fe80::1"]
         }]);
         let records = project(&settings(), &json!([remote]), 1000).unwrap();
         let addresses = records
@@ -1655,8 +1655,9 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             addresses,
-            BTreeSet::from(["fd7a:115c:a1e0::6".to_owned()]),
-            "only the overlay address publishes; the LAN address needs its scope and link-local never publishes"
+            BTreeSet::from(["fd7a:115c:a1f0::6".to_owned()]),
+            "only mycelium's overlay address publishes; another mesh's ULA, the LAN \
+             address and link-local all need a declared scope"
         );
         assert_eq!(records[0].name, "gpu.lab.myc");
     }
