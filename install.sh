@@ -53,6 +53,9 @@ BOB=ask
 OPERATOR=ask
 GEODE=ask
 TRUST_CERT=ask
+PROFILE=full
+VFS_ROLE=full
+DECLARED=
 CLAIM=
 CLAIM_FILE=
 LOCAL_FRONTDOOR=0
@@ -114,6 +117,18 @@ Components:
   --operator / --no-operator
                          frontdoor, skills, completions, update policy (default yes)
   --geode / --no-geode   optional geode credential broker (default no)
+
+Profiles:
+  --profile NAME         preset components: full (default), canvas, node, flash,
+                         minimal. Explicit component flags always win; a profile
+                         only fills the ones you did not pass.
+                           canvas   Soil + VFS for a desktop launcher
+                           node     Soil; no build offload, operator or geode
+                           flash    node with a read-mostly VFS cache
+                           minimal  Mycelium only
+  --vfs-role full|cache  VFS mount role (default full). cache keeps writes on the
+                         authority and pulls content into a local cache, which is
+                         what a flash-backed node wants.
 
 Component inputs:
   --overlay CIDR         IPv6 prefix this node owns (detected when possible)
@@ -967,7 +982,7 @@ install_geode() {
 
 install_vfs() {
     if [ "$DRY_RUN" = 1 ]; then
-        note "would build/install fungos-vfs and its user services"
+        note "would build/install fungos-vfs and its user services (role $VFS_ROLE)"
         return 0
     fi
     vfs_bin=""
@@ -1000,7 +1015,7 @@ install_vfs() {
             warn "macFUSE is not installed; the VFS CLI is installed but the mount is skipped"
         elif [ -x "$LOCAL_BIN/fungos-vfs-fuse" ]; then
             install_launch_agent dev.fungos.vfs-fuse "$LOCAL_BIN/fungos-vfs-fuse" "$HOME/Library/Logs/fungOS/fuse.log" \
-                --root "$VFS_ROOT" --mount "$VFS_MOUNT"
+                --root "$VFS_ROOT" --mount "$VFS_MOUNT" --role "$VFS_ROLE"
         else
             warn "fungos-vfs-fuse is unavailable; the mount service is skipped"
         fi
@@ -1017,7 +1032,7 @@ install_vfs() {
             warn "/dev/fuse is unavailable; the VFS CLI is installed but the mount is skipped"
         elif [ -x "$LOCAL_BIN/fungos-vfs-fuse" ]; then
             install_user_unit fungos-vfs-fuse "$LOCAL_BIN/fungos-vfs-fuse" \
-                --root "$VFS_ROOT" --mount "$VFS_MOUNT"
+                --root "$VFS_ROOT" --mount "$VFS_MOUNT" --role "$VFS_ROLE"
         else
             warn "fungos-vfs-fuse is unavailable; the mount service is skipped"
         fi
@@ -1439,6 +1454,61 @@ final_check() {
     say "Installation complete"
 }
 
+# Component flags record that they were passed explicitly. A profile only fills
+# the components the command line left alone.
+declared() { DECLARED="$DECLARED $1"; }
+
+want() { # VAR VALUE
+    case " $DECLARED " in
+        *" $1 "*) return 0 ;;
+    esac
+    eval "$1=\$2"
+}
+
+# A profile picks the components this machine should have. Explicit flags always
+# win; the profile only fills what the command line did not decide.
+apply_profile() {
+    case "$VFS_ROLE" in
+        full|cache) ;;
+        *) die "--vfs-role must be full or cache, not $VFS_ROLE" ;;
+    esac
+    case "$PROFILE" in
+        full) ;;
+        canvas)
+            want SOIL yes
+            want VFS yes
+            want BOB no
+            want GEODE no
+            ;;
+        node)
+            want SOIL yes
+            want BOB no
+            want OPERATOR no
+            want GEODE no
+            ;;
+        flash)
+            want SOIL yes
+            want VFS yes
+            want BOB no
+            want OPERATOR no
+            want GEODE no
+            want VFS_ROLE cache
+            ;;
+        minimal)
+            want VPN no
+            want SOIL no
+            want VFS no
+            want BOB no
+            want OPERATOR no
+            want GEODE no
+            ;;
+        *) die "unknown profile: $PROFILE (full, canvas, node, flash, minimal)" ;;
+    esac
+    if [ "$PROFILE" != full ]; then
+        note "profile $PROFILE: vpn=$VPN vfs=$VFS role=$VFS_ROLE soil=$SOIL bob=$BOB operator=$OPERATOR geode=$GEODE"
+    fi
+}
+
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1449,18 +1519,20 @@ parse_args() {
             --enable-updates) ENABLE_UPDATES=1; shift ;;
             --no-enroll) ENROLL=no; shift ;;
             --enroll) ENROLL=yes; shift ;;
-            --vpn) VPN=yes; shift ;;
-            --no-vpn) VPN=no; shift ;;
-            --vfs) VFS=yes; shift ;;
-            --no-vfs) VFS=no; shift ;;
-            --soil) SOIL=yes; shift ;;
-            --no-soil) SOIL=no; shift ;;
-            --bob) BOB=yes; shift ;;
-            --no-bob) BOB=no; shift ;;
-            --operator) OPERATOR=yes; shift ;;
-            --no-operator) OPERATOR=no; shift ;;
-            --geode) GEODE=yes; shift ;;
-            --no-geode) GEODE=no; shift ;;
+            --vpn) VPN=yes; declared VPN; shift ;;
+            --no-vpn) VPN=no; declared VPN; shift ;;
+            --vfs) VFS=yes; declared VFS; shift ;;
+            --no-vfs) VFS=no; declared VFS; shift ;;
+            --soil) SOIL=yes; declared SOIL; shift ;;
+            --no-soil) SOIL=no; declared SOIL; shift ;;
+            --bob) BOB=yes; declared BOB; shift ;;
+            --no-bob) BOB=no; declared BOB; shift ;;
+            --operator) OPERATOR=yes; declared OPERATOR; shift ;;
+            --no-operator) OPERATOR=no; declared OPERATOR; shift ;;
+            --geode) GEODE=yes; declared GEODE; shift ;;
+            --no-geode) GEODE=no; declared GEODE; shift ;;
+            --profile) [ $# -ge 2 ] || die "--profile needs a name"; PROFILE=$2; shift 2 ;;
+            --vfs-role) [ $# -ge 2 ] || die "--vfs-role needs full or cache"; VFS_ROLE=$2; declared VFS_ROLE; shift 2 ;;
             --trust-cert) TRUST_CERT=yes; shift ;;
             --no-trust-cert) TRUST_CERT=no; shift ;;
             --local-frontdoor|--local-gateway) LOCAL_FRONTDOOR=1; shift ;;
@@ -1553,6 +1625,7 @@ resume_updater() {
 
 main() {
     parse_args "$@"
+    apply_profile
     if [ -n "$RELEASE_VERSION" ]; then
         [ -z "$BIN_SRC" ] || die "--release and --bin-dir are mutually exclusive"
         [ -z "$SRC" ] || die "--release and --source are mutually exclusive"
