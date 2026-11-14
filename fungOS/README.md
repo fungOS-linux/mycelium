@@ -3,7 +3,7 @@
 Bootable Debian-based nodes with Mycelium enrollment and signed software delivery.
 The optional edge profile adds Unibus and the native Canvas Wayland compositor.
 
-![fungOS edge running Canvas with two Wayland terminals in QEMU](https://raw.githubusercontent.com/ajmwagar/fungos-web/main/dist/assets/fungos-workspace.png)
+![fungOS edge running Canvas with two Wayland terminals in QEMU](https://raw.githubusercontent.com/mycelium-linux/fungos-web/main/dist/assets/fungos-workspace.png)
 
 Actual QEMU framebuffer capture, 6 October 2026—not a mockup. The desktop uses
 the original procedural Undergrowth background; the applications are Weston
@@ -11,25 +11,25 @@ Wayland terminals. These are development builds, not a stable distribution relea
 
 ## Source layout
 
-- The public [distribution repository](https://github.com/ajmwagar/fungos) owns
+- The public [distribution repository](https://github.com/mycelium-linux/fungos) owns
   the generic base builder and profile declarations. This directory still holds
   integration and qualification work awaiting migration:
   [base](base/README.md), [edge](edge/README.md), and [packages](packages/README.md).
-- [ajmwagar/fungos-web](https://github.com/ajmwagar/fungos-web) owns the public
+- [mycelium-linux/fungos-web](https://github.com/mycelium-linux/fungos-web) owns the public
   website, documentation pages and screenshot assets. See [fungos.dev](https://fungos.dev).
 - Mycelium, Unibus, Canvas and the compute components remain separately owned
   projects—not copies of their implementations inside an OS repository.
 
-The public distribution repository is [ajmwagar/fungos](https://github.com/ajmwagar/fungos),
+The public distribution repository is [mycelium-linux/fungos](https://github.com/mycelium-linux/fungos),
 licensed `MIT OR Apache-2.0`. Its first import contains the generic base builder,
 profile declarations and real desktop captures; other integration work remains here.
 `fungos-web` is the website, not the OS build repository.
 
 ## Desktop
 
-![fungOS edge desktop with the Undergrowth background](https://raw.githubusercontent.com/ajmwagar/fungos-web/main/dist/assets/fungos-desktop.png)
+![fungOS edge desktop with the Undergrowth background](https://raw.githubusercontent.com/mycelium-linux/fungos-web/main/dist/assets/fungos-desktop.png)
 
-The public website repository retains the [capture provenance and asset notices](https://github.com/ajmwagar/fungos-web/blob/main/ASSET-NOTICES.md).
+The public website repository retains the [capture provenance and asset notices](https://github.com/mycelium-linux/fungos-web/blob/main/ASSET-NOTICES.md).
 
 ## Development notes
 

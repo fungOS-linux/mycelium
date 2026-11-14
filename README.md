@@ -43,9 +43,9 @@ supported host build.
 
 Mycelium is also the enrollment and update layer for [fungOS](fungOS/README.md),
 a Debian-based distribution integration with optional Canvas/Unibus edge profiles.
-The [public website repository](https://github.com/ajmwagar/fungos-web) contains
+The [public website repository](https://github.com/mycelium-linux/fungos-web) contains
 the real QEMU desktop captures. The distribution source now lives in
-[ajmwagar/fungos](https://github.com/ajmwagar/fungos); remaining qualification
+[mycelium-linux/fungos](https://github.com/mycelium-linux/fungos); remaining qualification
 and integration work is being migrated from this checkout's `fungOS/` directory.
 
 ## Quick start
@@ -58,7 +58,7 @@ enrollment is repaired in place. Use `--yes` for recommended defaults.
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsS \
-  https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh | bash
+  https://raw.githubusercontent.com/mycelium-linux/mycelium/master/install.sh | bash
 ```
 
 After you accept the VPN component, the installer asks for sudo before the core
@@ -140,7 +140,7 @@ mycelium pair --name buddy --unix-user operator \
 
 # New user machine:
 curl --proto '=https' --tlsv1.2 -fsS \
-  https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh | \
+  https://raw.githubusercontent.com/mycelium-linux/mycelium/master/install.sh | \
   bash -s -- --yes --claim MYC1-REPLACE-WITH-THE-PAIRING-CLAIM
 ```
 
@@ -184,7 +184,7 @@ the drivers you choose (for example OpenSSH and SNMP utilities).
 Install directly from GitHub:
 
 ```sh
-cargo install --git https://github.com/ajmwagar/mycelium.git \
+cargo install --git https://github.com/mycelium-linux/mycelium.git \
   mycelium-cli --locked
 mycelium drivers
 ```
@@ -193,7 +193,7 @@ For a pinned checkout, build `mycelium-cli` as shown below and place
 `target/release/mycelium` on `PATH`.
 
 ```sh
-git clone https://github.com/ajmwagar/mycelium.git
+git clone https://github.com/mycelium-linux/mycelium.git
 cd mycelium
 cargo build --release -p mycelium-cli -p mycelium-frontdoor
 

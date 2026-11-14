@@ -1,6 +1,6 @@
 # Signed APT package qualification
 
-The maintained publisher now lives in [`ajmwagar/fungos/packages`](https://github.com/ajmwagar/fungos/tree/main/packages).
+The maintained publisher now lives in [`mycelium-linux/fungos/packages`](https://github.com/mycelium-linux/fungos/tree/main/packages).
 Its migration and signed-generation improvements are committed locally as
 `470591d` in that repository, pending push. This directory retains historical
 qualification tooling and evidence; do not extend this legacy publisher in

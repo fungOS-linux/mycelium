@@ -2,7 +2,7 @@
 
 **Status:** design + inventory, 2026-10-26; implementation moved 2026-11-01.
 The BLE host, canonical `soil:ble@1.0.0` WIT and the COLMI ring Spore now live
-in `fungOS-linux/soil` (`crates/soil-ble-host`, `wit/soil-ble.wit`,
+in `mycelium-linux/soil` (`crates/soil-ble-host`, `wit/soil-ble.wit`,
 `spores/colmi-ring`). This document remains the design and provenance record.
 **Scope:** one plan for the streams that were being designed separately:
 
@@ -28,10 +28,10 @@ This document is the missing consumer-side design and links back to both.
 
 | Prefix | Checkout | Mutability here |
 |---|---|---|
-| *(none)* | `ajmwagar/mycelium`, branch `pi/fungos-wasm-host` | this unit's only write target |
+| *(none)* | `mycelium-linux/mycelium`, branch `pi/fungos-wasm-host` | this unit's only write target |
 | `canvas:` | `~/src/fpl/canvas-current-workspace` @ `61cce16` (and its `.worktrees/`) | read-only |
 | `neo:` | `averys-macbook-neo:~/Documents/src/reversal/colmi` | read-only over ssh (research only; BLE code moved) |
-| `soil:` | `fungOS-linux/soil` | canonical `soil:*` WIT + BLE host/Spore |
+| `soil:` | `mycelium-linux/soil` | canonical `soil:*` WIT + BLE host/Spore |
 
 Unibus references (`DESIGN.md`, `crates/unibus/...`) are `~/src/fpl/unibus`,
 also read-only here.
@@ -324,7 +324,7 @@ already owns is cheaper. A case that only consumes Unibus `ring.*` events needs
    `soil:app@1` runner world exists. Putting `run` in the capability package
    would make every BLE consumer export the ring's entry point.
 
-The canonical WIT is now `wit/soil-ble.wit` in `fungOS-linux/soil`. WIT
+The canonical WIT is now `wit/soil-ble.wit` in `mycelium-linux/soil`. WIT
 variant cases carry one type, not named fields, so the review sketch above uses
 a `notification` record; the canonical file does the same.
 

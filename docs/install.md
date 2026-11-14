@@ -5,7 +5,7 @@ installs the core binaries, enrolls the node, and then asks which optional
 components to install:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mycelium-linux/mycelium/master/install.sh | bash
 ```
 
 Use `--yes` for the recommended defaults, or answer the component prompts. The
@@ -82,7 +82,7 @@ mycelium pair --kind peer --name sandbox-7 --site lab \
   --peer 100.120.101.5:7443 --ttl 10m --credential-ttl 2h
 
 # Joining machine: one line, no prompts
-curl -fsSL https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/mycelium-linux/mycelium/master/install.sh \
   | bash -s -- --code "MYC1-..."
 ```
 
@@ -167,7 +167,7 @@ sudo rm -rf /usr/local/libexec/mycelium /var/run/mycelium
 ./install.sh --geode
 
 # Non-interactive join with a code
-curl -fsSL https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh \
+curl -fsSL https://raw.githubusercontent.com/mycelium-linux/mycelium/master/install.sh \
   | bash -s -- --code MYC1-...
 
 # See the plan without changing the machine

@@ -31,7 +31,7 @@ should be a Spore where the runtime already provides the capability.
 
 | Artifact | Source | Installer role | Required | Boundary | Notes |
 |---|---|---|---|---|---|
-| `fungos-vfs` | `fungOS-linux/fungos-vfs` | Content CLI | VFS | filesystem, CID store | Keep native. |
+| `fungos-vfs` | `mycelium-linux/fungos-vfs` | Content CLI | VFS | filesystem, CID store | Keep native. |
 | `fungos-vfs-provider` | same | Unibus content provider | VFS | Unibus client, file store | Candidate to fold into `fungos-vfs` as a subcommand. |
 | `fungos-vfs-fetch` | same | Content fetch helper | VFS | network, file store | Candidate to fold into `fungos-vfs` as a subcommand. |
 | `fungos-vfs-fuse` | same | FUSE mount | VFS with mount | kernel FUSE | Must stay native. |
@@ -40,7 +40,7 @@ should be a Spore where the runtime already provides the capability.
 
 | Artifact | Source | Installer role | Required | Boundary | Notes |
 |---|---|---|---|---|---|
-| `soil` (`soil-shell`) | `fungOS-linux/soil` | CLI/shell | Soil | host process, VFS, terminal | Keep native as the host shell. |
+| `soil` (`soil-shell`) | `mycelium-linux/soil` | CLI/shell | Soil | host process, VFS, terminal | Keep native as the host shell. |
 | `soil-home` | soil runtime artifact | Home/namespace web view | Soil | HTTP + route file | Strong Spore candidate: rendering and route presentation can run in `soil-http-host`; the host grants file/route access. |
 | `soil-store` | soil runtime artifact | Spore storefront and package verifier | Soil | HTTP + package files + signing | Split: storefront/listing can become a Spore; key custody, signing, and install approval stay native. |
 | `soil-spore` | soil | Spore pack/sign/verify CLI | build tool | filesystem, signing keys | Keep native: it is the packaging/signing boundary. |

@@ -23,11 +23,11 @@ See [asset notices](ASSET-NOTICES.md) for capture details and attribution.
 
 This repository owns the fungOS website and its documentation and screenshot
 assets. It is **not** the OS image builder. The public distribution repository,
-[ajmwagar/fungos](https://github.com/ajmwagar/fungos), contains the dual-licensed
+[mycelium-linux/fungos](https://github.com/mycelium-linux/fungos), contains the dual-licensed
 base builder and profile declarations. Remaining qualification and integration
 work is being migrated from the Mycelium development checkout's `fungOS/` directory.
 
-[Mycelium](https://github.com/ajmwagar/mycelium) handles topology, discovery,
+[Mycelium](https://github.com/mycelium-linux/mycelium) handles topology, discovery,
 enrollment, access and trusted updates. Unibus provides discovery integration
 and transport for the optional edge applications. The components remain
 independently usable.

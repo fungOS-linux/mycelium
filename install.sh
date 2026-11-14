@@ -3,7 +3,7 @@
 #
 # One command, then prompts:
 #
-#   curl -fsSL https://raw.githubusercontent.com/fungOS-linux/mycelium/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/mycelium-linux/mycelium/master/install.sh | bash
 #
 # Components are asked for in order. Every prompt can be answered up front:
 #
@@ -30,14 +30,14 @@ SUFFIX=${MYCELIUM_DNS_SUFFIX:-myc}
 SITE=${MYCELIUM_SITE:-}
 ROOT_LIBEXEC=${MYCELIUM_ROOT_LIBEXEC:-/usr/local/libexec/mycelium}
 
-MYCELIUM_REPO=${MYCELIUM_REPO:-https://github.com/fungOS-linux/mycelium.git}
-RELEASE_REPO=${MYCELIUM_RELEASE_REPO:-fungOS-linux/mycelium}
+MYCELIUM_REPO=${MYCELIUM_REPO:-https://github.com/mycelium-linux/mycelium.git}
+RELEASE_REPO=${MYCELIUM_RELEASE_REPO:-mycelium-linux/mycelium}
 RELEASE_VERSION=
 RELEASE_BASE=
 RELEASE_DIR=
 IROH_TUN_REPO=${IROH_TUN_REPO:-https://github.com/ajmwagar/iroh-tun.git}
-VFS_REPO=${VFS_REPO:-https://github.com/fungOS-linux/fungos-vfs.git}
-SOIL_REPO=${SOIL_REPO:-https://github.com/fungOS-linux/soil.git}
+VFS_REPO=${VFS_REPO:-https://github.com/mycelium-linux/fungos-vfs.git}
+SOIL_REPO=${SOIL_REPO:-https://github.com/mycelium-linux/soil.git}
 BOB_REPO=${BOB_REPO:-https://github.com/FuturePresentLabs/bob.git}
 
 DRY_RUN=0

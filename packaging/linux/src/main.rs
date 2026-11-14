@@ -170,7 +170,7 @@ fn build(
             CONTACT_UNIT.as_bytes(),
             0o644,
         )?;
-        let copyright = format!("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\nUpstream-Name: Mycelium\nSource: https://github.com/ajmwagar/mycelium/tree/{source}\n\nFiles: usr/lib/* usr/share/doc/mycelium/LICENSE* usr/share/doc/mycelium/build-inputs\nCopyright: Mycelium contributors\nLicense: MIT or Apache-2.0\n See LICENSE and LICENSE-APACHE in this directory.\n\nFiles: usr/bin/mycelium usr/share/doc/mycelium/third-party-notices/*\nCopyright: Mycelium contributors and respective dependency authors\nLicense: multiple\n First-party Mycelium code is MIT or Apache-2.0. Statically embedded\n dependencies retain their individual licenses; see third-party-notices.\n Missing third-party notices make this a qualification-only package.\n Corresponding source must accompany the complete release source bundle;\n this notice does not relicense dependencies or assert legal clearance.\n");
+        let copyright = format!("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\nUpstream-Name: Mycelium\nSource: https://github.com/mycelium-linux/mycelium/tree/{source}\n\nFiles: usr/lib/* usr/share/doc/mycelium/LICENSE* usr/share/doc/mycelium/build-inputs\nCopyright: Mycelium contributors\nLicense: MIT or Apache-2.0\n See LICENSE and LICENSE-APACHE in this directory.\n\nFiles: usr/bin/mycelium usr/share/doc/mycelium/third-party-notices/*\nCopyright: Mycelium contributors and respective dependency authors\nLicense: multiple\n First-party Mycelium code is MIT or Apache-2.0. Statically embedded\n dependencies retain their individual licenses; see third-party-notices.\n Missing third-party notices make this a qualification-only package.\n Corresponding source must accompany the complete release source bundle;\n this notice does not relicense dependencies or assert legal clearance.\n");
         write(
             &root,
             "usr/share/doc/mycelium/copyright",
@@ -189,7 +189,7 @@ fn build(
             APACHE.as_bytes(),
             0o644,
         )?;
-        let mut provenance = format!("source_url=https://github.com/ajmwagar/mycelium\nsource_commit={source}\npackager_source_commit={}\nartifact_version={artifact_version}\nworkspace_binary_version={workspace_version}\narchitecture={architecture}\nbinary_sha256={digest}\nupdate_owner=apt\nlegal_clearance=not-asserted\n", packager_source.unwrap_or("unrecorded"));
+        let mut provenance = format!("source_url=https://github.com/mycelium-linux/mycelium\nsource_commit={source}\npackager_source_commit={}\nartifact_version={artifact_version}\nworkspace_binary_version={workspace_version}\narchitecture={architecture}\nbinary_sha256={digest}\nupdate_owner=apt\nlegal_clearance=not-asserted\n", packager_source.unwrap_or("unrecorded"));
         if let Some(notices) = &third_party {
             provenance.push_str(&format!("third_party_coverage=reviewed-complete\nthird_party_inventory_sha256={}\ncargo_lock_sha256={}\n", notices.inventory_sha256, notices.lock_sha256));
             for (relative, bytes) in &notices.files {
