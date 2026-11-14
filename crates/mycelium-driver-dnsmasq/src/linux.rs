@@ -25,7 +25,11 @@ fn unit(executable: &Path, config: &Path) -> Result<String, String> {
     } else {
         " dns resolver"
     };
-    Ok(format!("{MARKER}[Unit]\nDescription=Mycelium local DNS companion\n[Service]\nExecStart={}{} run --config {} --write\nRestart=on-failure\nRestartSec=15\n[Install]\nWantedBy=default.target\n", argument(executable)?, prefix, argument(config)?))
+    // The companion asks the daemon for records, so without this every unit
+    // restart would spawn a second peer from `executable` and race
+    // `mycelium.service` for `myceliumd.sock`; the loser exits with "a
+    // myceliumd is already listening". A companion must never own the daemon.
+    Ok(format!("{MARKER}[Unit]\nDescription=Mycelium local DNS companion\n[Service]\nEnvironment=MYCELIUM_NO_AUTOSTART=1\nExecStart={}{} run --config {} --write\nRestart=on-failure\nRestartSec=15\n[Install]\nWantedBy=default.target\n", argument(executable)?, prefix, argument(config)?))
 }
 fn control(args: &[&str]) -> Result<(), String> {
     let output = Command::new("systemctl")
@@ -174,6 +178,18 @@ mod tests {
         assert!(legacy.contains("/home/a/bin/mycelium-dns-resolver\" run"));
     }
     #[test]
+    fn unit_never_autostarts_a_second_peer() {
+        let rendered = unit(
+            Path::new("/home/a/bin/mycelium"),
+            Path::new("/home/a/dns.json"),
+        )
+        .unwrap();
+        // The companion consults the daemon; if it also spawned one it would
+        // race mycelium.service for the socket and one of the two would exit
+        // with "a myceliumd is already listening".
+        assert!(rendered.contains("Environment=MYCELIUM_NO_AUTOSTART=1"));
+    }
+    #[test]
     fn stub_takes_port_53_and_moves_the_forwarder() {
         let mut settings = crate::tests::settings();
         settings.resolver.doh = Some(mycelium_dns_policy::resolver::DohUpstream {
@@ -199,6 +215,7 @@ mod tests {
         )
         .unwrap();
         assert!(unit.contains("dns resolver run"));
+        assert!(unit.contains("Environment=MYCELIUM_NO_AUTOSTART=1"));
         assert!(unit.contains("Environment=HOME=\"/var/lib/mycelium-dns\""));
         assert!(unit.contains("Environment=MYCELIUM_HOME=\"/home/a/.mycelium\""));
         assert!(unit.contains("WantedBy=multi-user.target"));
@@ -256,8 +273,12 @@ fn stub_settings(settings: &Settings) -> Result<Settings, String> {
 }
 
 fn stub_unit(binary: &Path, config: &Path, mesh: &Path) -> Result<String, String> {
+    // Root runs this stub with the user's MYCELIUM_HOME, so an implicit spawn
+    // would start a root-owned peer that serves the user's identity: two
+    // daemons, one socket each, both publishing the same node. Never let the
+    // stub own a daemon.
     Ok(format!(
-        "{MARKER}[Unit]\nDescription=Mycelium system DNS stub\n[Service]\nExecStart={} dns resolver run --config {} --write\nEnvironment=HOME={}\nEnvironment=MYCELIUM_HOME={}\nRestart=on-failure\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n",
+        "{MARKER}[Unit]\nDescription=Mycelium system DNS stub\n[Service]\nEnvironment=MYCELIUM_NO_AUTOSTART=1\nExecStart={} dns resolver run --config {} --write\nEnvironment=HOME={}\nEnvironment=MYCELIUM_HOME={}\nRestart=on-failure\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n",
         argument(binary)?,
         argument(config)?,
         argument(Path::new(STUB_HOME))?,

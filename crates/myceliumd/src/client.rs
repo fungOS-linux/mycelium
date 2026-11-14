@@ -66,6 +66,14 @@ impl Client {
         {
             return Err(ClientError::Spawn("package-owned Mycelium must run through its enrolled systemd service; use sudo mycelium setup --packaged, not an unmanaged daemon".into()));
         }
+        // systemd sets INVOCATION_ID for every process it starts. A unit that
+        // reaches this point forgot `MYCELIUM_NO_AUTOSTART`, so spawning here
+        // would fork a daemon nothing supervises -- and whatever unit got there
+        // first wins `myceliumd.sock`, leaving the real service crash-looping on
+        // "a myceliumd is already listening". Refuse instead of racing.
+        if cfg!(target_os = "linux") && std::env::var_os("INVOCATION_ID").is_some() {
+            return Err(ClientError::Spawn("refusing to spawn an unsupervised daemon from inside a systemd unit; set MYCELIUM_NO_AUTOSTART=1 and start mycelium.service instead".into()));
+        }
         let home = crate::home_dir();
         std::fs::create_dir_all(&home).map_err(|e| ClientError::Spawn(e.to_string()))?;
         let log = std::fs::OpenOptions::new()
