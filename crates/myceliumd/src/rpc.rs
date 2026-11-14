@@ -141,6 +141,9 @@ pub struct Daemon {
     recognizers: Vec<Arc<AdvertisementRecognizer>>,
     pub topology: Mutex<Topology>,
     topology_feed: Mutex<crate::topology_feed::TopologyFeed>,
+    /// Content address of the last peer topology snapshot merged, by origin.
+    /// A resend of the same snapshot then costs nothing.
+    applied_topology: Mutex<BTreeMap<String, String>>,
     saved: Mutex<BTreeMap<DeviceId, SavedDevice>>,
     credential_rules: Mutex<BTreeMap<String, crate::credential_map::CredentialRule>>,
     discovery_scopes: Mutex<BTreeMap<String, DiscoveryScope>>,
@@ -326,6 +329,7 @@ impl Daemon {
             recognizers,
             topology: Mutex::new(topology),
             topology_feed: Mutex::new(topology_feed),
+            applied_topology: Mutex::new(BTreeMap::new()),
             saved: Mutex::new(saved_map),
             credential_rules: Mutex::new(credential_rules),
             discovery_scopes: Mutex::new(discovery_scopes),
@@ -405,15 +409,26 @@ impl Daemon {
 
     async fn converged_topology(&self) -> Result<Topology> {
         let mut topology = self.topology.lock().await.clone();
-        for snapshot in self.mesh.topology_snapshots().await {
+        for (origin, snapshot) in self.mesh.topology_snapshots().await {
             if snapshot.schema_version != 1 {
                 continue;
             }
+            let already_applied = {
+                let applied = self.applied_topology.lock().await;
+                !should_merge_snapshot(&applied, &origin, &snapshot.digest)
+            };
+            if already_applied {
+                continue;
+            }
+            let digest = snapshot.digest;
             let remote =
                 serde_json::from_value::<Topology>(snapshot.topology).map_err(|error| {
                     MyceliumError::Parse(format!("peer topology snapshot: {error}"))
                 })?;
             topology.merge_snapshot(remote);
+            if !digest.is_empty() {
+                self.applied_topology.lock().await.insert(origin, digest);
+            }
         }
         let peer_identity_observations = self
             .mesh
@@ -3524,6 +3539,17 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) {
     }
 }
 
+/// A peer topology snapshot whose content address this node already merged
+/// needs no merge. An empty digest comes from a peer that predates the field,
+/// so those keep the old behaviour.
+fn should_merge_snapshot(
+    applied: &BTreeMap<String, String>,
+    origin: &str,
+    digest: &str,
+) -> bool {
+    digest.is_empty() || applied.get(origin).map(String::as_str) != Some(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3679,6 +3705,7 @@ mod tests {
                 .map(|(_, source)| Arc::new(AdvertisementRecognizer::load(*source).unwrap()))
                 .collect(),
             topology: Mutex::new(Topology::empty()),
+            applied_topology: Mutex::new(BTreeMap::new()),
             topology_feed: Mutex::new(
                 crate::topology_feed::TopologyFeed::load(std::env::temp_dir().join(format!(
                     "mycelium-rpc-topology-feed-{}-{}.json",
@@ -4114,5 +4141,22 @@ mod tests {
         .await;
         let saved = std::fs::read_to_string(home.join("devices.json")).unwrap();
         assert!(!saved.contains("fake-1"));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_digest_tests {
+    use super::*;
+
+    #[test]
+    fn applies_a_snapshot_once_per_origin() {
+        let mut applied = BTreeMap::new();
+        assert!(should_merge_snapshot(&applied, "a:topology", "d1"));
+        applied.insert("a:topology".to_string(), "d1".to_string());
+        assert!(!should_merge_snapshot(&applied, "a:topology", "d1"));
+        assert!(should_merge_snapshot(&applied, "a:topology", "d2"));
+        assert!(should_merge_snapshot(&applied, "b:topology", "d1"));
+        // A peer that sends no digest is never skipped.
+        assert!(should_merge_snapshot(&applied, "a:topology", ""));
     }
 }

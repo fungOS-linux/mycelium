@@ -101,6 +101,9 @@ pub struct Mesh {
     hello: PeerHello,
     sequence: AtomicU64,
     observations: Mutex<BTreeMap<String, SignedEnvelope>>,
+    /// Digest of the last topology snapshot this node published. A periodic
+    /// scan that changes nothing then costs nothing.
+    last_topology_digest: Mutex<Option<String>>,
     allowed_origins: Option<BTreeSet<String>>,
     authority_roots: BTreeSet<String>,
     trusted_release_keys: BTreeSet<String>,
@@ -195,6 +198,7 @@ impl Mesh {
             },
             sequence: AtomicU64::new(0),
             observations: Mutex::new(BTreeMap::new()),
+            last_topology_digest: Mutex::new(None),
             allowed_origins: None,
             authority_roots: BTreeSet::new(),
             trusted_release_keys: BTreeSet::new(),
@@ -307,6 +311,7 @@ impl Mesh {
             hello,
             sequence: AtomicU64::new(sequence),
             observations: Mutex::new(observations),
+            last_topology_digest: Mutex::new(None),
             allowed_origins,
             authority_roots,
             trusted_release_keys,
@@ -658,14 +663,16 @@ impl Mesh {
         Ok(binding)
     }
 
-    pub async fn topology_snapshots(&self) -> Vec<TopologySnapshot> {
+    pub async fn topology_snapshots(&self) -> Vec<(String, TopologySnapshot)> {
         self.observations
             .lock()
             .await
             .values()
             .filter(|envelope| envelope.origin != self.hello.node_id)
             .filter_map(|envelope| match &envelope.event {
-                PeerEvent::Topology(snapshot) => Some(snapshot.clone()),
+                PeerEvent::Topology(snapshot) => {
+                    Some((envelope.origin.clone(), snapshot.clone()))
+                }
                 _ => None,
             })
             .collect()
@@ -675,11 +682,21 @@ impl Mesh {
         &self,
         topology: &mycelium_core::Topology,
     ) -> Result<(), AnyError> {
+        let value = serde_json::to_value(topology)?;
+        let digest = mycelium_peer_protocol::sha256_hex(serde_json::to_vec(&value)?.as_slice());
+        // Republishing an unchanged snapshot replaces the stored value, bumps
+        // the sequence, and makes every peer re-merge a megabyte for nothing.
+        if self.last_topology_digest.lock().await.as_deref() == Some(digest.as_str()) {
+            return Ok(());
+        }
         self.publish(PeerEvent::Topology(TopologySnapshot {
             schema_version: 1,
-            topology: serde_json::to_value(topology)?,
+            digest: digest.clone(),
+            topology: value,
         }))
-        .await
+        .await?;
+        *self.last_topology_digest.lock().await = Some(digest);
+        Ok(())
     }
 
     /// First byte of the node key, used to derive a stable startup offset for
@@ -3213,6 +3230,7 @@ mod tests {
                     sequence,
                     PeerEvent::Topology(TopologySnapshot {
                         schema_version: 1,
+                        digest: String::new(),
                         topology: serde_json::json!({"payload": "x".repeat(480_000)}),
                     }),
                 )
@@ -3238,6 +3256,7 @@ mod tests {
             1,
             PeerEvent::Topology(TopologySnapshot {
                 schema_version: 1,
+                digest: String::new(),
                 topology: serde_json::json!({"payload": "x".repeat(MAX_OBSERVATION_MESSAGE_BYTES)}),
             }),
         )
@@ -3258,6 +3277,7 @@ mod tests {
             1,
             PeerEvent::Topology(TopologySnapshot {
                 schema_version: 1,
+                digest: String::new(),
                 topology: serde_json::json!({"payload": "x".repeat(MAX_OBSERVATION_MESSAGE_BYTES)}),
             }),
         )

@@ -544,6 +544,10 @@ impl WireGuardBinding {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TopologySnapshot {
     pub schema_version: u16,
+    /// Content address of `topology`. A peer that already merged this snapshot
+    /// can skip it; empty when the sender predates the field.
+    #[serde(default)]
+    pub digest: String,
     pub topology: serde_json::Value,
 }
 
@@ -1251,6 +1255,7 @@ mod tests {
             2,
             PeerEvent::Topology(TopologySnapshot {
                 schema_version: 1,
+                digest: String::new(),
                 topology: serde_json::json!({"nodes": {}}),
             }),
         )
