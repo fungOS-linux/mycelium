@@ -10,8 +10,9 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to the daemon; if the socket is dead/absent, spawn
-    /// `myceliumd` detached (unless disabled) and wait for it to answer.
+    /// Connect to the daemon; if the socket is dead/absent, bring it up --
+    /// through the host's supervisor when this host has one -- and wait for it
+    /// to answer.
     pub async fn connect() -> Result<Self, ClientError> {
         match Self::try_connect().await {
             Ok(c) => Ok(c),
@@ -19,8 +20,12 @@ impl Client {
                 if std::env::var_os("MYCELIUM_NO_AUTOSTART").is_some() {
                     return Err(e);
                 }
-                Self::spawn_daemon()?;
-                let deadline = Instant::now() + Duration::from_secs(5);
+                if let Some(started) = start_supervised() {
+                    started?;
+                } else {
+                    Self::spawn_daemon()?;
+                }
+                let deadline = Instant::now() + Duration::from_secs(15);
                 loop {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     match Self::try_connect().await {
@@ -154,6 +159,69 @@ impl Client {
     }
 }
 
+/// Ask the host's service manager to start the peer, when this host has one.
+///
+/// An enrolled host already has a supervised peer. A client that forks its own
+/// daemon races that supervisor for `myceliumd.sock`: the loser exits and the
+/// supervisor restarts it on a timer, so every CLI call re-runs the contest and
+/// one of the two units sits in a restart loop. Starting the unit is the only
+/// path that leaves exactly one daemon owning the socket.
+fn start_supervised() -> Option<Result<(), ClientError>> {
+    if cfg!(target_os = "linux") {
+        let loaded = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "mycelium",
+                "--property=LoadState",
+                "--value",
+            ])
+            .output()
+            .ok()?;
+        if String::from_utf8_lossy(&loaded.stdout).trim() != "loaded" {
+            return None;
+        }
+        return Some(system_ok(
+            std::process::Command::new("systemctl")
+                .args(["--user", "start", "mycelium"])
+                .output(),
+        ));
+    }
+    if cfg!(target_os = "macos") {
+        let uid = uid()?;
+        let domain = format!("gui/{uid}/dev.fpl.mycelium");
+        let present = std::process::Command::new("launchctl")
+            .args(["print", &domain])
+            .output()
+            .ok()?;
+        if !present.status.success() {
+            return None;
+        }
+        return Some(system_ok(
+            std::process::Command::new("launchctl")
+                .args(["kickstart", "-k", &domain])
+                .output(),
+        ));
+    }
+    None
+}
+
+fn uid() -> Option<String> {
+    let out = std::process::Command::new("id").arg("-u").output().ok()?;
+    let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!uid.is_empty()).then_some(uid)
+}
+
+fn system_ok(output: std::io::Result<std::process::Output>) -> Result<(), ClientError> {
+    let output = output.map_err(|e| ClientError::Spawn(e.to_string()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(ClientError::Spawn(
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +244,20 @@ mod tests {
             .request_with_deadline(&Request::Hello, Duration::from_millis(20))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn a_failed_supervisor_command_reports_its_stderr() {
+        let failed = std::process::Command::new("sh")
+            .args(["-c", "echo nope >&2; exit 3"])
+            .output()
+            .unwrap();
+        match system_ok(Ok(failed)) {
+            Err(ClientError::Spawn(message)) => assert_eq!(message, "nope"),
+            other => panic!("expected a spawn error, got {other:?}"),
+        }
+        let ok = std::process::Command::new("true").output().unwrap();
+        assert!(system_ok(Ok(ok)).is_ok());
     }
 }
 
