@@ -892,16 +892,25 @@ child=\$!
 # to the interface as soon as it exists, then stay in the foreground so the
 # service manager still sees one process tree.
 if [ '$(uname -s)' = Linux ]; then
+  ipbin=/usr/sbin/ip
+  [ -x "\$ipbin" ] || ipbin=/sbin/ip
+  assigned=0
   i=0
-  while [ \$i -lt 100 ]; do
-    if /usr/sbin/ip link show '$tun' >/dev/null 2>&1 \\
-      || /sbin/ip link show '$tun' >/dev/null 2>&1; then
-      /usr/sbin/ip -6 addr replace '$overlay' dev '$tun' >/dev/null 2>&1 \\
-        || /sbin/ip -6 addr replace '$overlay' dev '$tun' >/dev/null 2>&1 || true
+  while [ \$i -lt 150 ]; do
+    if "\$ipbin" link show '$tun' >/dev/null 2>&1 \\
+      && "\$ipbin" -6 addr replace '$overlay' dev '$tun' >/dev/null 2>&1; then
+      assigned=1
       break
     fi
     i=\$((i+1)); sleep 0.1
   done
+  if [ \$assigned -ne 1 ]; then
+    # Running without the identity address would publish nothing and the zone
+    # would quietly lose this node, so fail and let the service manager retry.
+    echo "iroh-tun: could not assign $overlay to $tun" >&2
+    kill \$child 2>/dev/null || true
+    exit 1
+  fi
 fi
 wait \$child
 EOF
