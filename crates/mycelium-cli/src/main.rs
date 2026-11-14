@@ -4998,7 +4998,15 @@ async fn plan(args: &[String]) -> Result<Vec<String>, ClientError> {
 }
 
 async fn daemon(args: &[String]) -> Result<Vec<String>, ClientError> {
-    let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+    // A verb is required. A unit whose ExecStart is a bare `daemon` prints
+    // status and exits zero, so with Restart=always the service restarts once a
+    // second and floods the console with something that looks like success.
+    // Fail loudly at the call site instead.
+    let Some(sub) = args.first().map(String::as_str) else {
+        return Err(err_usage(
+            "mycelium daemon needs status, start or stop; a bare `daemon` exits immediately and Restart=always turns that into a restart loop",
+        ));
+    };
     match sub {
         "start" => {
             match Client::try_connect().await {
