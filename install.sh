@@ -203,7 +203,11 @@ need_root() {
     if [ "$(id -u)" -eq 0 ]; then return 0; fi
     if [ "$DRY_RUN" = 1 ]; then note "would request sudo to $1"; return 0; fi
     say "Root is required to $1"
-    "$SUDO" -v || die "sudo was not granted; privileged setup was not started"
+    # `sudo -v` is a validation request, not a command, so a host that allows
+    # every command with NOPASSWD can still refuse it against a password rule.
+    # Probe with a real command first, and only fall back to interactive -v.
+    "$SUDO" -n true 2>/dev/null || "$SUDO" -v \
+        || die "sudo was not granted; privileged setup was not started"
 }
 
 have_tty() {
