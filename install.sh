@@ -1493,7 +1493,20 @@ check_service() { # label unit human
     if unit_running "$1" "$2"; then
         note "$3 is running"
     else
-        warn "$3 is installed but not running"
+        detail=""
+        if [ "$(uname -s)" = Linux ]; then
+            # "activating (auto-restart)" is a crash loop, not a stopped
+            # service: the unit starts, exits and is restarted on a timer. That
+            # reads as console noise long before anyone checks a status, so say
+            # it here with the reason.
+            state=$(systemctl --user show -p SubState --value "$2.service" 2>/dev/null)
+            if [ "$state" = auto-restart ]; then
+                restarts=$(systemctl --user show -p NRestarts --value "$2.service" 2>/dev/null)
+                code=$(systemctl --user show -p ExecMainStatus --value "$2.service" 2>/dev/null)
+                detail=" (crash-looping: $restarts restarts, last exit $code)"
+            fi
+        fi
+        warn "$3 is installed but not running$detail"
         UNSTARTED="$UNSTARTED $3"
     fi
 }
