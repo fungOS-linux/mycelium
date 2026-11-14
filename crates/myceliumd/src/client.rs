@@ -199,7 +199,10 @@ fn start_supervised() -> Option<Result<(), ClientError>> {
         }
         return Some(system_ok(
             std::process::Command::new("launchctl")
-                .args(["kickstart", "-k", &domain])
+                // No `-k`: this only starts a job that is not running. Killing a
+                // peer that is still binding its socket makes clients restart it
+                // in a loop, which is the race this function exists to end.
+                .args(["kickstart", &domain])
                 .output(),
         ));
     }
